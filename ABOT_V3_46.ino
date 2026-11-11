@@ -1,33 +1,21 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.47.3 — DUAL CORE + AUDIO + STT GROQ
+   OJOL ASSISTEN (ABOT) V3.48.4 — VOICE AI CHATBOT + VOICE QUIZ (OLED FIX)
   ============================================================================
-   Fungsi    : Display navigasi + lyric slide + AI companion untuk driver ojol
+   Fungsi    : Display navigasi + lyric slide + AI companion + voice chat
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
    Display   : U8g2 full buffer (HW I2C) + FluxGarage RoboEyes
    Link      : JSON lines via Serial / MQTT (dari HP driver)
-   Audio     : Mic INMP441 (I2S) + Amp MAX98357A (I2S), volume awal KECIL
-   Wajib     : secrets.h  →  WIFI_SSID_STR, WIFI_PASS_STR,
-                            NVIDIA_API_KEY_STR, GROQ_API_KEY_STR
-   Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient
+   Audio     : Mic INMP441 (i2s_std, port 0) + Speaker MAX98357A (audioI2S, port 1)
+   Voice AI  : Groq Whisper (STT) + Groq GPT-OSS (LLM) + Google Translate TTS
+   Wajib     : secrets.h  ->  WIFI_SSID_STR, WIFI_PASS_STR, GROQ_API_KEY_STR
+   Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
+               ESP32-audioI2S
 
-   Arsitektur:
-     • Core 1 : displayRenderTask  → render ~60 FPS, pegang stateMutex
-     • Core 0 : loop()             → logic + I/O jaringan + input tombol
-     • Core 0 : audioTask          → I2S mic/speaker + rekaman
-     • Core 0 : voiceTask          → STT (Groq Whisper), spawn setelah WiFi
-     • stateMutex : recursive mutex penjaga state & buffer OLED
-
-   V3.47.3 CATATAN AUDIO:
-     • Tidak ada mode simulasi suara. VOICE_ECHO_PLAYBACK dihapus.
-     • TALK (tahan) = rekam via mic INMP441.
-     • Step 2: rekaman dikirim ke Groq Whisper (STT). Transkrip muncul
-       di Serial Monitor dan dikirim ke HP:
-         {"t":"stt_result","ok":1,"text":"..."}
-     • Language "id" dulu, fallback ke auto-detect kalau gagal.
-     • voiceTask di-spawn setelah WiFi connected (hindari heap internal OOM).
-     • TTS + LLM menyusul di Step 3/4.
-     • Mic mati → TALK tidak memulai listening (eyes confused).
+   V3.48.4 PERUBAHAN:
+     • Perbaikan OLED saat TTS memutar teks panjang (tidak stuck/macet).
+     • Teks panjang otomatis bergulir (scroll) ke atas.
+     • Model LLM openai/gpt-oss-120b (tersedia di Groq).
   ============================================================================
 */
 
@@ -62,8 +50,9 @@ enum DestinationStage       : unsigned char;
 #include <esp_task_wdt.h>
 #include <Update.h>
 #include <freertos/semphr.h>
-#include <driver/i2s.h>
+#include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
+#include <Audio.h>
 
 #include "secrets.h"
 #include <FluxGarage_RoboEyes.h>
@@ -72,10 +61,8 @@ enum DestinationStage       : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.47.3"
+#define FW_VERSION "3.48.4"
 
-// 1 = OTA disimulasikan (aman untuk Wokwi, tidak menulis flash)
-// 0 = OTA firmware sungguhan (hanya di perangkat fisik)
 #define OTA_SIMULATION_MODE 1
 
 // ---------------------------------------------------------------------------
@@ -92,15 +79,10 @@ struct StateLock {
 // Forward decls
 // ---------------------------------------------------------------------------
 void linkSend(const String& json);
-
-// voiceTaskHandle dipakai audioReportRecordingStats() dan audioBegin()
-// sebelum blok state global → harus dideklarasi lebih awal.
 extern TaskHandle_t voiceTaskHandle;
 
 // ---------------------------------------------------------------------------
-// MultiPartStream: gabungan head (String) + body (buffer) + tail (String)
-// sebagai satu Stream untuk HTTPClient::sendRequest().
-// Menghindari alokasi String 256 KB untuk upload WAV ke Groq.
+// MultiPartStream
 // ---------------------------------------------------------------------------
 class MultiPartStream : public Stream {
  public:
@@ -132,13 +114,10 @@ class MultiPartStream : public Stream {
   }
 
   void flush() override {}
-
-  size_t write(uint8_t) override { return 0; }   // read-only
+  size_t write(uint8_t) override { return 0; }
 
  private:
-  size_t position() const {
-    return headPos_ + bodyPos_ + tailPos_;
-  }
+  size_t position() const { return headPos_ + bodyPos_ + tailPos_; }
 
   String         head_;
   const uint8_t* body_;
@@ -170,11 +149,8 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
     U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 // ===========================================================================
-//  AUDIO: MIC INMP441 (I2S RX) + AMPLIFIER MAX98357A (I2S TX)
+//  AUDIO HARDWARE
 // ===========================================================================
-// Mic     : SCK GPIO5 / WS GPIO4 / SD GPIO6   (pin L/R -> GND = channel kiri)
-// Speaker : BCLK GPIO15 / LRC GPIO16 / DIN GPIO17
-
 constexpr int MIC_SCK  = 5;
 constexpr int MIC_WS   = 4;
 constexpr int MIC_SD   = 6;
@@ -184,33 +160,29 @@ constexpr int SPK_DIN  = 17;
 
 constexpr int AUDIO_SAMPLE_RATE = 16000;
 constexpr i2s_port_t AUDIO_MIC_PORT = I2S_NUM_0;
-constexpr i2s_port_t AUDIO_SPK_PORT = I2S_NUM_1;
 
-constexpr i2s_channel_fmt_t AUDIO_MIC_CHANNEL = I2S_CHANNEL_FMT_ONLY_LEFT;
+constexpr int MIC_GAIN          = 8;
+constexpr int REC_SECONDS_PSRAM = 20;
+constexpr int REC_SECONDS_HEAP  = 2;
 
-constexpr int           MIC_GAIN                  = 16;
-constexpr int           REC_SECONDS_PSRAM         = 8;
-constexpr int           REC_SECONDS_HEAP          = 2;
-
-// --- STT (Groq Whisper) ---
+// --- Groq API ---
 #ifndef GROQ_API_KEY_STR
 #error "GROQ_API_KEY_STR wajib ada di secrets.h (ambil gratis di console.groq.com/keys)"
 #endif
-const char* GROQ_STT_URL    = "https://api.groq.com/openai/v1/audio/transcriptions";
-const char* GROQ_STT_MODEL  = "whisper-large-v3-turbo";
-const unsigned long STT_TIMEOUT_MS = 15000;
-const size_t        STT_MIN_BYTES  = 3200;
+const char* GROQ_STT_URL      = "https://api.groq.com/openai/v1/audio/transcriptions";
+const char* GROQ_STT_MODEL    = "whisper-large-v3-turbo";
+const char* GROQ_CHAT_URL     = "https://api.groq.com/openai/v1/chat/completions";
+const char* GROQ_CHAT_MODEL   = "openai/gpt-oss-120b"; 
+const char* GROQ_CHAT_MODEL_2 = "qwen/qwen3.8-27b";      
 
-// Level volume 0..5 (0 = mute)
-constexpr int VOLUME_LEVEL_MAX = 5;
-const int     VOLUME_PEAK[VOLUME_LEVEL_MAX + 1] = {0, 350, 800, 1800, 4000, 9000};
-constexpr int DEFAULT_VOLUME_LEVEL = 1;
+const unsigned long STT_TIMEOUT_MS  = 15000;
+const unsigned long CHAT_TIMEOUT_MS = 10000;
+const size_t        STT_MIN_BYTES   = 3200;
 
-enum AudioCmdType : unsigned char { ACMD_SFX = 1, ACMD_REC_START, ACMD_REC_STOP };
-enum SfxId : unsigned char {
-  SFX_TICK, SFX_BOOT, SFX_CONNECT, SFX_HUD, SFX_ARRIVE,
-  SFX_OK, SFX_BAD, SFX_UNKNOWN, SFX_TEST
-};
+static int sttLastCode = 0;
+static int lastLlmHttp = 0;
+
+enum AudioCmdType : unsigned char { ACMD_REC_START = 1, ACMD_REC_STOP };
 
 struct AudioCmd {
   uint8_t type;
@@ -219,13 +191,13 @@ struct AudioCmd {
 
 QueueHandle_t audioQueue    = nullptr;
 volatile bool audioMicReady = false;
-volatile bool audioSpkReady = false;
 volatile int  audioPending  = 0;
 volatile bool audioRecording= false;
 volatile int  audioMicBars  = 0;
 
-int volumeLevel      = DEFAULT_VOLUME_LEVEL;
-int volumeBeforeMute = DEFAULT_VOLUME_LEVEL;
+int volumeLevel      = 3;
+int volumeBeforeMute = 3;
+constexpr int VOLUME_LEVEL_MAX = 5;
 
 int16_t* recBuf      = nullptr;
 size_t   recCapacity = 0;
@@ -233,85 +205,52 @@ size_t   recLength   = 0;
 int      recPeak     = 0;
 bool     recAutoFinished = false;
 
+// Audio I2S channel (mic)
+i2s_chan_handle_t micRxHandle = nullptr;
+
+// TTS object
+Audio audioI2S(I2S_NUM_1);
+volatile bool ttsActive           = false;
+volatile bool voicePipelineActive = false;
+volatile bool ttsEof              = false;
+volatile bool ttsStop             = false;
+
+void audio_info(const char* info)       { Serial.printf("[AUDIO] %s\n", info); }
+void audio_eof_speech(const char* info) { ttsEof = true; }
+
+// ===========================================================================
+//  I2S DRIVER INIT (MIC — driver baru i2s_std)
+// ===========================================================================
 static bool audioMicDriverBegin() {
-  i2s_config_t c;
-  memset(&c, 0, sizeof(c));
-  c.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-  c.sample_rate          = AUDIO_SAMPLE_RATE;
-  c.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
-  c.channel_format       = AUDIO_MIC_CHANNEL;
-  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  c.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-  c.dma_buf_count        = 6;
-  c.dma_buf_len          = 256;
+  i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(AUDIO_MIC_PORT, I2S_ROLE_MASTER);
+  chanCfg.dma_desc_num  = 6;
+  chanCfg.dma_frame_num = 256;
+  chanCfg.auto_clear    = true;
 
-  if (i2s_driver_install(AUDIO_MIC_PORT, &c, 0, NULL) != ESP_OK) return false;
+  if (i2s_new_channel(&chanCfg, NULL, &micRxHandle) != ESP_OK) return false;
 
-  i2s_pin_config_t p;
-  memset(&p, 0, sizeof(p));
-  p.mck_io_num   = I2S_PIN_NO_CHANGE;
-  p.bck_io_num   = MIC_SCK;
-  p.ws_io_num    = MIC_WS;
-  p.data_out_num = I2S_PIN_NO_CHANGE;
-  p.data_in_num  = MIC_SD;
-  return i2s_set_pin(AUDIO_MIC_PORT, &p) == ESP_OK;
+  i2s_std_config_t stdCfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+    .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)MIC_SCK,
+      .ws   = (gpio_num_t)MIC_WS,
+      .dout = I2S_GPIO_UNUSED,
+      .din  = (gpio_num_t)MIC_SD,
+      .invert_flags = { false, false, false },
+    },
+  };
+  stdCfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+  if (i2s_channel_init_std_mode(micRxHandle, &stdCfg) != ESP_OK) return false;
+  if (i2s_channel_enable(micRxHandle) != ESP_OK) return false;
+  return true;
 }
 
-static bool audioSpkDriverBegin() {
-  i2s_config_t c;
-  memset(&c, 0, sizeof(c));
-  c.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  c.sample_rate          = AUDIO_SAMPLE_RATE;
-  c.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
-  c.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  c.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-  c.dma_buf_count        = 6;
-  c.dma_buf_len          = 256;
-  c.tx_desc_auto_clear   = true;
-
-  if (i2s_driver_install(AUDIO_SPK_PORT, &c, 0, NULL) != ESP_OK) return false;
-
-  i2s_pin_config_t p;
-  memset(&p, 0, sizeof(p));
-  p.mck_io_num   = I2S_PIN_NO_CHANGE;
-  p.bck_io_num   = SPK_BCLK;
-  p.ws_io_num    = SPK_LRC;
-  p.data_out_num = SPK_DIN;
-  p.data_in_num  = I2S_PIN_NO_CHANGE;
-  return i2s_set_pin(AUDIO_SPK_PORT, &p) == ESP_OK;
-}
-
-// --- Output ---------------------------------------------------------------
-static void audioWriteMono(const int16_t* mono, int n, float scale) {
-  int16_t stereo[512];
-  int done = 0;
-  while (done < n) {
-    int c = (n - done < 256) ? (n - done) : 256;
-    for (int i = 0; i < c; i++) {
-      int32_t v = (int32_t)(mono[done + i] * scale);
-      if (v > 32767)  v = 32767;
-      if (v < -32768) v = -32768;
-      stereo[2 * i]     = (int16_t)v;
-      stereo[2 * i + 1] = (int16_t)v;
-    }
-    size_t written = 0;
-    i2s_write(AUDIO_SPK_PORT, stereo, c * 2 * sizeof(int16_t), &written, portMAX_DELAY);
-    done += c;
-  }
-}
-
-static void audioWriteSilence(int frames) {
-  int16_t zeros[256];
-  memset(zeros, 0, sizeof(zeros));
-  while (frames > 0) {
-    int c = (frames < 256) ? frames : 256;
-    audioWriteMono(zeros, c, 1.0f);
-    frames -= c;
-  }
-}
-
-// Tulis WAV header 44 byte untuk PCM mono 16-bit.
+// ===========================================================================
+//  STT (Groq Whisper)
+// ===========================================================================
 static void writeWavHeader(uint8_t* out, size_t pcmBytes, int sampleRate) {
   const uint32_t chunkSize    = 36 + pcmBytes;
   const uint32_t subchunk2    = pcmBytes;
@@ -337,69 +276,6 @@ static void writeWavHeader(uint8_t* out, size_t pcmBytes, int sampleRate) {
   memcpy(out + 40, &subchunk2,   4);
 }
 
-static void audioPlayTone(uint16_t freq, uint16_t ms, int amp) {
-  const int BLOCK = 256;
-  int16_t mono[BLOCK];
-  const int total = AUDIO_SAMPLE_RATE * ms / 1000;
-  const int fade  = (total / 4 < 80) ? total / 4 : 80;
-  const float inc = 2.0f * PI * freq / AUDIO_SAMPLE_RATE;
-  float phase = 0.0f;
-  int pos = 0;
-
-  while (pos < total) {
-    int n = (total - pos < BLOCK) ? (total - pos) : BLOCK;
-    for (int i = 0; i < n; i++) {
-      int idx = pos + i;
-      float env = 1.0f;
-      if (idx < fade)              env = (float)idx / fade;
-      else if (total - idx < fade) env = (float)(total - idx) / fade;
-
-      mono[i] = (freq > 0) ? (int16_t)(sinf(phase) * amp * env) : 0;
-      phase += inc;
-      if (phase > 2.0f * PI) phase -= 2.0f * PI;
-    }
-    audioWriteMono(mono, n, 1.0f);
-    pos += n;
-  }
-}
-
-static void audioPlaySfx(uint8_t id) {
-  struct Note { uint16_t f; uint16_t ms; };
-  static const Note nTick[]    = {{1800, 18}};
-  static const Note nBoot[]    = {{660, 90}, {880, 90}, {1320, 150}};
-  static const Note nConnect[] = {{880, 70}, {1320, 110}};
-  static const Note nHud[]     = {{1500, 60}, {0, 50}, {1500, 60}};
-  static const Note nArrive[]  = {{784, 120}, {988, 120}, {1319, 240}};
-  static const Note nOk[]      = {{880, 80}, {1175, 170}};
-  static const Note nBad[]     = {{300, 200}, {220, 280}};
-  static const Note nUnknown[] = {{600, 90}, {500, 90}, {600, 90}};
-  static const Note nTest[]    = {{440, 200}, {660, 200}, {880, 200}};
-
-  const Note* seq = nTick;
-  int cnt = 1;
-  int amp = VOLUME_PEAK[volumeLevel];
-
-  switch (id) {
-    case SFX_TICK:    seq = nTick;    cnt = 1; amp = amp * 6 / 10; break;
-    case SFX_BOOT:    seq = nBoot;    cnt = 3; break;
-    case SFX_CONNECT: seq = nConnect; cnt = 2; break;
-    case SFX_HUD:     seq = nHud;     cnt = 3; break;
-    case SFX_ARRIVE:  seq = nArrive;  cnt = 3; break;
-    case SFX_OK:      seq = nOk;      cnt = 2; break;
-    case SFX_BAD:     seq = nBad;     cnt = 2; break;
-    case SFX_UNKNOWN: seq = nUnknown; cnt = 3; break;
-    case SFX_TEST:    seq = nTest;    cnt = 3; break;
-    default: return;
-  }
-
-  if (amp <= 0) return;
-  for (int i = 0; i < cnt; i++) audioPlayTone(seq[i].f, seq[i].ms, amp);
-  audioWriteSilence(1600);
-}
-
-// ---------------------------------------------------------------------------
-// STT: satu request ke Groq Whisper. language="" = auto-detect.
-// ---------------------------------------------------------------------------
 static String groqSttRequest(const uint8_t* wav, size_t wavLen,
                               const char* language) {
   const String boundary = "----AbotBoundary" + String(millis());
@@ -408,19 +284,17 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
   head += "Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n";
   head += "Content-Type: audio/wav\r\n\r\n";
 
-  String tail = "\r\n--" + boundary + "\r\n";
-  tail += "Content-Disposition: form-data; name=\"model\"\r\n\r\n";
-  tail += GROQ_STT_MODEL;
-  tail += "\r\n--" + boundary + "\r\n";
-  tail += "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n";
-  tail += "json\r\n";
-  if (language && strlen(language) > 0) {
+  String tail = "";
+  auto field = [&](const char* name, const String& val) {
     tail += "\r\n--" + boundary + "\r\n";
-    tail += "Content-Disposition: form-data; name=\"language\"\r\n\r\n";
-    tail += language;
-    tail += "\r\n";
-  }
-  tail += "--" + boundary + "--\r\n";
+    tail += "Content-Disposition: form-data; name=\"" + String(name) + "\"\r\n\r\n";
+    tail += val;
+  };
+  field("model", GROQ_STT_MODEL);
+  field("response_format", "json");
+  field("temperature", "0");
+  if (language && strlen(language) > 0) field("language", language);
+  tail += "\r\n--" + boundary + "--\r\n";
 
   MultiPartStream stream(head, wav, wavLen, tail);
 
@@ -434,6 +308,7 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
 
   if (!http.begin(client, GROQ_STT_URL)) {
     Serial.println("[STT] HTTP begin failed");
+    sttLastCode = -1;
     return "";
   }
 
@@ -448,6 +323,7 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
                 (language && strlen(language) > 0) ? language : "auto");
   const unsigned long t0 = millis();
   int code = http.sendRequest("POST", &stream, stream.totalLength());
+  sttLastCode = code;
   const unsigned long elapsed = millis() - t0;
   Serial.printf("[STT] HTTP %d in %lu ms\n", code, elapsed);
 
@@ -464,7 +340,6 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
       Serial.printf("[STT] Transkrip: \"%s\"\n", out.c_str());
     } else {
       Serial.printf("[STT] JSON parse error: %s\n", err.c_str());
-      Serial.printf("[STT] Body: %s\n", body.c_str());
     }
   } else if (code == 429) {
     Serial.println("[STT] Rate limit Groq — coba lagi nanti");
@@ -480,9 +355,6 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// STT: kirim WAV ke Groq Whisper. Coba "id" dulu, fallback auto-detect.
-// ---------------------------------------------------------------------------
 static String groqTranscribe(const int16_t* pcm, size_t samples) {
   if (samples == 0) return "";
 
@@ -500,12 +372,11 @@ static String groqTranscribe(const int16_t* pcm, size_t samples) {
   writeWavHeader(wav, pcmBytes, AUDIO_SAMPLE_RATE);
   memcpy(wav + 44, pcm, pcmBytes);
 
-  // Coba 1: eksplisit Bahasa Indonesia
   String result = groqSttRequest(wav, wavLen, "id");
 
-  // Coba 2: kalau gagal, ulangi tanpa language (auto-detect)
-  if (result.length() == 0) {
-    Serial.println("[STT] Retry tanpa language (auto-detect)...");
+  if (result.length() == 0 && sttLastCode != 200) {
+    Serial.println("[STT] Retry tanpa language...");
+    vTaskDelay(pdMS_TO_TICKS(800));
     result = groqSttRequest(wav, wavLen, "");
   }
 
@@ -513,13 +384,75 @@ static String groqTranscribe(const int16_t* pcm, size_t samples) {
   return result;
 }
 
-// --- Task audio -----------------------------------------------------------
+// ===========================================================================
+//  TTS (ESP32-audioI2S internal Google Translate)
+// ===========================================================================
+static int splitSpeech(const String& text, String* out, int maxOut) {
+  int n = 0;
+  String cur = "";
+  for (size_t i = 0; i < text.length() && n < maxOut; i++) {
+    char c = text[i];
+    cur += c;
+    bool endSent = (c == '.' || c == '!' || c == '?' || c == '\n');
+    bool tooLong = (cur.length() >= 170 && c == ' ') || cur.length() >= 200;
+    if ((endSent && cur.length() >= 25) || tooLong) {
+      cur.trim();
+      if (cur.length()) out[n++] = cur;
+      cur = "";
+    }
+  }
+  cur.trim();
+  if (cur.length() && n < maxOut) out[n++] = cur;
+  return n;
+}
+
+static bool speakChunk(const String& s) {
+  ttsEof = false;
+  if (!audioI2S.connecttospeech(s.c_str(), "id")) {
+    Serial.println("[TTS] connecttospeech gagal");
+    return false;
+  }
+  const unsigned long t0 = millis();
+  bool started = false;
+  while (millis() - t0 < 25000) {
+    audioI2S.loop();
+    if (audioI2S.isRunning()) started = true;
+    if (ttsEof) break;
+    if (ttsStop) { audioI2S.stopSong(); return true; }
+    if (!started && millis() - t0 > 6000) { Serial.println("[TTS] tidak mulai"); return false; }
+    if (started && !audioI2S.isRunning()) break;
+    vTaskDelay(1);
+  }
+  return true;
+}
+
+static bool speakText(const String& text) {
+  if (volumeLevel == 0) { Serial.println("[TTS] mute, skip"); return false; }
+  if (text.length() == 0) return false;
+
+  String parts[8];
+  int n = splitSpeech(text, parts, 8);
+  Serial.printf("[TTS] Speak %d bagian\n", n);
+
+  ttsActive = true;
+  ttsStop = false;
+  bool ok = false;
+  for (int i = 0; i < n && !ttsStop; i++) {
+    if (speakChunk(parts[i])) ok = true;
+  }
+  audioI2S.stopSong();
+  ttsActive = false;
+  ttsStop = false;
+  return ok;
+}
+
+// ===========================================================================
+//  AUDIO TASK (MIC ONLY)
+// ===========================================================================
 static inline void audioPendingDone() {
   if (audioPending > 0) __atomic_sub_fetch(&audioPending, 1, __ATOMIC_SEQ_CST);
 }
 
-// Dipanggil dari audioTask saat rekaman berhenti.
-// Tidak mengirim apa pun. Hanya memicu voiceTask untuk jalankan STT.
 static void audioReportRecordingStats(bool emptyResult) {
   audioMicBars = 0;
 
@@ -536,9 +469,7 @@ static void audioReportRecordingStats(bool emptyResult) {
     xTaskNotifyGive(voiceTaskHandle);
   } else {
     Serial.println("[VOICE] WARN: voiceTaskHandle NULL, STT dilewati");
-    char buf[48];
-    snprintf(buf, sizeof(buf), "{\"t\":\"stt_skip\",\"why\":\"voice_task_off\"}");
-    linkSend(String(buf));
+    linkSend("{\"t\":\"stt_skip\",\"why\":\"voice_task_off\"}");
   }
 }
 
@@ -553,9 +484,7 @@ static void audioTask(void* pv) {
     if (!audioRecording) {
       if (xQueueReceive(audioQueue, &cmd, pdMS_TO_TICKS(40)) != pdTRUE) continue;
 
-      if (cmd.type == ACMD_SFX) {
-        if (audioSpkReady) audioPlaySfx(cmd.arg);
-      } else if (cmd.type == ACMD_REC_START) {
+      if (cmd.type == ACMD_REC_START) {
         recAutoFinished = false;
         if (audioMicReady && recBuf) {
           recLength = 0;
@@ -573,9 +502,10 @@ static void audioTask(void* pv) {
       continue;
     }
 
-    // ---- sedang merekam ----
     size_t bytesRead = 0;
-    i2s_read(AUDIO_MIC_PORT, blk, sizeof(blk), &bytesRead, pdMS_TO_TICKS(100));
+    if (micRxHandle) {
+      i2s_channel_read(micRxHandle, blk, sizeof(blk), &bytesRead, pdMS_TO_TICKS(40));
+    }
     int n = (int)(bytesRead / sizeof(int32_t));
     if (discardBlocks > 0) { discardBlocks--; n = 0; }
 
@@ -617,7 +547,6 @@ static void audioTask(void* pv) {
   }
 }
 
-// --- API publik -----------------------------------------------------------
 bool audioIsBusy() { return audioPending > 0 || audioRecording; }
 
 static bool audioEnqueue(uint8_t type, uint8_t arg) {
@@ -631,11 +560,6 @@ static bool audioEnqueue(uint8_t type, uint8_t arg) {
   return true;
 }
 
-void audioSfx(uint8_t id) {
-  if (!audioSpkReady || volumeLevel <= 0) return;
-  audioEnqueue(ACMD_SFX, id);
-}
-
 void audioStartRecording() {
   if (!audioMicReady) return;
   audioMicBars = 0;
@@ -644,7 +568,9 @@ void audioStartRecording() {
 
 void audioStopRecording() {
   if (!audioMicReady) return;
-  audioEnqueue(ACMD_REC_STOP, 0);
+  if (!audioEnqueue(ACMD_REC_STOP, 0)) {
+    Serial.println("[VOICE] WARN: gagal enqueue REC_STOP");
+  }
 }
 
 void audioSetVolume(int level) {
@@ -652,13 +578,15 @@ void audioSetVolume(int level) {
   if (level > VOLUME_LEVEL_MAX) level = VOLUME_LEVEL_MAX;
   volumeLevel = level;
   if (level > 0) volumeBeforeMute = level;
-  Serial.printf("[AUDIO] Volume %d/%d (puncak %d)%s\n", level, VOLUME_LEVEL_MAX,
-                VOLUME_PEAK[level], level == 0 ? " MUTE" : "");
+
+  audioI2S.setVolume(min(level * 4, 21));
+
+  Serial.printf("[AUDIO] Volume %d/%d%s\n", level, VOLUME_LEVEL_MAX,
+                level == 0 ? " MUTE" : "");
 }
 
 void audioVolumeStep(int delta) {
   audioSetVolume(volumeLevel + delta);
-  audioSfx(SFX_TICK);
 }
 
 void audioToggleMute() {
@@ -666,12 +594,10 @@ void audioToggleMute() {
     volumeBeforeMute = volumeLevel;
     audioSetVolume(0);
   } else {
-    audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : DEFAULT_VOLUME_LEVEL);
-    audioSfx(SFX_TICK);
+    audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 3);
   }
 }
 
-// Forward decl: voiceTask didefinisikan setelah forward declarations block
 static void voiceTask(void* pv);
 
 void audioBegin() {
@@ -682,8 +608,7 @@ void audioBegin() {
 
   audioQueue    = xQueueCreate(8, sizeof(AudioCmd));
   audioMicReady = audioMicDriverBegin();
-  audioSpkReady = audioSpkDriverBegin();
-  Serial.printf("[AUDIO] Drivers: mic=%d spk=%d\n", audioMicReady, audioSpkReady);
+  Serial.printf("[AUDIO] Mic driver: %d\n", audioMicReady);
 
   if (audioMicReady) {
     const bool hasPsram = psramFound();
@@ -720,18 +645,19 @@ void audioBegin() {
     }
   }
 
-  Serial.printf("[AUDIO] Mic %s | Speaker %s | Volume awal %d/%d\n",
-                audioMicReady ? "OK" : "GAGAL", audioSpkReady ? "OK" : "GAGAL",
-                volumeLevel, VOLUME_LEVEL_MAX);
+  Serial.printf("[AUDIO] Mic %s | Volume awal %d/%d\n",
+                audioMicReady ? "OK" : "GAGAL", volumeLevel, VOLUME_LEVEL_MAX);
 
-  if (audioQueue && (audioMicReady || audioSpkReady)) {
+  if (audioQueue && audioMicReady) {
     BaseType_t r = xTaskCreatePinnedToCore(audioTask, "AudioTask", 6144,
                                             NULL, 2, NULL, 0);
     if (r != pdPASS) Serial.println("[AUDIO] FAIL: audioTask spawn");
     else             Serial.println("[AUDIO] audioTask OK");
   }
 
-  // voiceTask TIDAK di-spawn di sini. Lihat setup() setelah WiFi connected.
+  audioI2S.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
+  audioI2S.setVolume(min(volumeLevel * 4, 21));
+  Serial.println("[AUDIO] TTS (audioI2S) ready");
 }
 
 // ===========================================================================
@@ -801,10 +727,6 @@ int       currentLyricScene = 0;
 const char* WIFI_SSID     = WIFI_SSID_STR;
 const char* WIFI_PASSWORD = WIFI_PASS_STR;
 
-const char* NVIDIA_URL     = "https://integrate.api.nvidia.com/v1/chat/completions";
-const char* NVIDIA_MODEL   = "nvidia/nemotron-3-super-120b-a12b";
-const char* NVIDIA_API_KEY = NVIDIA_API_KEY_STR;
-
 const char* WEATHER_URL =
   "https://api.open-meteo.com/v1/forecast"
   "?latitude=-6.175400&longitude=106.827202"
@@ -812,7 +734,6 @@ const char* WEATHER_URL =
   "&daily=temperature_2m_max,temperature_2m_min"
   "&timezone=Asia%2FJakarta";
 
-// --- MQTT ---
 const char* MQTT_HOST = "broker.emqx.io";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_TOPIC_COMMAND = "abot/wokwi/477375325542330369/v337/command";
@@ -857,7 +778,7 @@ const unsigned long DEST_ASK_TIMEOUT         = 12000;
 const unsigned long DEST_CONFIRM_DURATION    = 2200;
 const unsigned long DEST_FAILED_DURATION     = 3000;
 
-const unsigned long NVIDIA_COOLDOWN          = 12000;
+const unsigned long LLM_COOLDOWN             = 2000;
 const unsigned long WEATHER_REFRESH_MS       = 10UL * 60UL * 1000UL;
 const unsigned long WEATHER_RETRY_MS         = 60UL * 1000UL;
 const unsigned long OSRM_RETRY_MS            = 10000;
@@ -985,6 +906,8 @@ uint8_t       lyricBitmapFrameCache[1024];
 bool          lyricBitmapCacheValid = false;
 
 bool conversationActive = false;
+String currentVoiceReply = ""; 
+
 bool mapRequested       = false;
 bool companionActive    = false;
 bool companionGenerating= false;
@@ -1057,7 +980,7 @@ int           hudLockedStep     = -1;
 int           hudCompletedStep  = -1;
 unsigned long hudShownAt        = 0;
 
-unsigned long   lastNvidiaRequest = 0;
+unsigned long   lastLlmRequest = 0;
 volatile bool   networkBusy       = false;
 volatile bool   networkDone       = false;
 volatile bool   networkSuccess    = false;
@@ -1103,7 +1026,6 @@ unsigned long drLastMs           = 0;
 bool          otaActive          = false;
 String        otaReportedVersion = FW_VERSION;
 
-// --- Task handles ---
 TaskHandle_t displayTaskHandle = NULL;
 TaskHandle_t voiceTaskHandle   = NULL;
 
@@ -1273,7 +1195,7 @@ void gfxBitmap(int x, int y, const uint8_t* bitmap, int w, int h,
 }
 
 // ===========================================================================
-//  ROBOEYES PROXY + STATUS OVERLAY
+//  ROBOEYES PROXY
 // ===========================================================================
 volatile bool overlayListening = false;
 volatile bool overlayThinking  = false;
@@ -1281,19 +1203,15 @@ volatile bool overlayThinking  = false;
 class RoboEyesDisplayProxy {
  public:
   explicit RoboEyesDisplayProxy(U8G2& target) : gfx_(&target) {}
-
   void clearDisplay() { gfx_->clearBuffer(); }
-
   void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h,
                      int16_t r, uint16_t color) {
     gfxFillRoundRect(x, y, w, h, r, (uint8_t)color);
   }
-
   void fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
                     int16_t x2, int16_t y2, uint16_t color) {
     gfxFillTriangle(x0, y0, x1, y1, x2, y2, (uint8_t)color);
   }
-
   void display() {
     if (overlayListening)      drawListeningOverlay();
     else if (overlayThinking)  drawThinkingOverlay();
@@ -1324,7 +1242,6 @@ class RoboEyesDisplayProxy {
   static void drawThinkingOverlay() {
     const int phase = (millis() / 450UL) % 3;
     const char* dots = (phase == 0) ? "." : (phase == 1) ? ".." : "...";
-
     gfxFillRect(0, 0, 20, 8, COLOR_BLACK);
     gfxText(2, 0, dots, 1, COLOR_WHITE);
   }
@@ -1383,6 +1300,14 @@ String stripNonAscii(String text) {
   return result;
 }
 
+String jsonEscape(String s) {
+  s.replace("\\", "\\\\");
+  s.replace("\"", "\\\"");
+  s.replace("\n", " ");
+  s.replace("\r", "");
+  return s;
+}
+
 bool getLocalTimeSafe(struct tm* out) {
   time_t now = time(nullptr);
   if (now < 1700000000) return false;
@@ -1423,14 +1348,12 @@ void abotLog(const char* level, const char* fmt, ...) {
 
 void flushLogRing() {
   if (!mqttClient.connected()) return;
-
   char lines[LOG_RING_SIZE][LOG_LINE_MAX];
   int count = 0;
   {
     StateLock lock;
     count = logRingCount;
     if (count == 0) return;
-
     int start = (logRingHead - count + LOG_RING_SIZE) % LOG_RING_SIZE;
     for (int i = 0; i < count; i++) {
       memcpy(lines[i], logRing[(start + i) % LOG_RING_SIZE], LOG_LINE_MAX);
@@ -1438,11 +1361,9 @@ void flushLogRing() {
     logRingCount = 0;
     logRingHead  = 0;
   }
-
   for (int i = 0; i < count; i++) {
-    char buf[160];
-    snprintf(buf, sizeof(buf), "{\"t\":\"log\",\"l\":\"%s\"}", lines[i]);
-    mqttClient.publish(MQTT_TOPIC_STATUS, buf);
+    String out = "{\"t\":\"log\",\"l\":\"" + jsonEscape(String(lines[i])) + "\"}";
+    mqttClient.publish(MQTT_TOPIC_STATUS, out.c_str());
     delay(10);
   }
 }
@@ -1492,6 +1413,7 @@ void  startGeocode(const String& placeName);
 String buildOsrmUrl(float fromLat, float fromLon, float toLat, float toLon);
 int   decodePolyline(const String& encoded, RoutePoint* out, int maxPoints);
 void  handleCommand(char cmd);
+String abotPromptHint();
 
 void  linkBegin();
 void  linkUpdate();
@@ -1517,71 +1439,283 @@ void  startOTAUpdate(const String& url, const String& requestId = "",
 void  updateDisplay();
 
 // ===========================================================================
-//  VOICE TASK (STT Pipeline)
+//  MEMORI PERCAKAPAN + KONTEKS PERJALANAN + LLM
 // ===========================================================================
+constexpr int HIST_TURNS = 3;
+static String histUser[HIST_TURNS], histBot[HIST_TURNS];
+static int histCount = 0;
+
+static void histAdd(const String& u, const String& b) {
+  if (histCount == HIST_TURNS) {
+    for (int i = 1; i < HIST_TURNS; i++) { histUser[i-1] = histUser[i]; histBot[i-1] = histBot[i]; }
+    histCount--;
+  }
+  histUser[histCount] = u;
+  histBot[histCount]  = b;
+  histCount++;
+}
+
+static String buildContext() {
+  String c = "";
+  StateLock lock;
+
+  struct tm ti;
+  if (getLocalTimeSafe(&ti)) {
+    char b[40];
+    snprintf(b, sizeof(b), " Sekarang jam %02d:%02d WIB.", ti.tm_hour, ti.tm_min);
+    c += b;
+  }
+  if (weatherData.valid) {
+    String w = weatherData.condition; w.toLowerCase();
+    c += " Cuaca " + w + ", " + String(weatherData.temperature, 0) + " derajat.";
+  }
+  if (routeReady && tripActive) {
+    float remain = routeGeometryDistance - simulatedRouteDistance;
+    if (remain < 0) remain = 0;
+    float v = (speedMps < 3.0f) ? 8.0f : speedMps;
+    int minutes = (int)(remain / v / 60.0f + 0.5f);
+    c += " Perjalanan aktif, sisa sekitar ";
+    c += (remain >= 1000.0f) ? String(remain / 1000.0f, 1) + " kilometer" : String((int)remain) + " meter";
+    c += ", perkiraan " + String(minutes) + " menit lagi.";
+    int s = nextImportantStep();
+    if (s >= 0 && s < navStepCount) {
+      float d = navSteps[s].routeDistance - simulatedRouteDistance;
+      if (d < 0) d = 0;
+      String ins = navSteps[s].instruction; ins.toLowerCase();
+      c += " Belokan berikutnya: " + ins + " dalam " + String((int)d) + " meter.";
+    }
+  } else {
+    c += " Saat ini tidak ada perjalanan aktif.";
+  }
+  c += abotPromptHint();
+  return c;
+}
+
+static String groqChat(const String& userText) {
+  const String ctx = buildContext();
+
+  JsonDocument doc;
+  doc["max_tokens"]  = 250; // Naikkan sedikit agar cerita tidak terpotong
+  doc["temperature"] = 0.7;
+  JsonArray msgs = doc["messages"].to<JsonArray>();
+
+  JsonObject sys = msgs.add<JsonObject>();
+  sys["role"] = "system";
+  sys["content"] =
+    String("Kamu Abot, asisten suara pintar di helm driver ojol. Kamu bisa menjawab pertanyaan apa saja seperti chatbot. "
+           "Jawab bahasa Indonesia santai dan hangat, maksimal 3 kalimat pendek. Jangan pakai emoji, markdown, atau bullet. "
+           "Kalimat harus enak dibacakan suara. Pakai data berikut kalau relevan, jangan mengarang angka: ") + ctx;
+
+  for (int i = 0; i < histCount; i++) {
+    JsonObject u = msgs.add<JsonObject>(); u["role"] = "user";      u["content"] = histUser[i];
+    JsonObject a = msgs.add<JsonObject>(); a["role"] = "assistant"; a["content"] = histBot[i];
+  }
+  JsonObject usr = msgs.add<JsonObject>();
+  usr["role"] = "user";
+  usr["content"] = userText;
+
+  const char* models[2] = {GROQ_CHAT_MODEL, GROQ_CHAT_MODEL_2};
+  String reply = "";
+
+  for (int m = 0; m < 2 && reply.length() == 0; m++) {
+    doc["model"] = models[m];
+    String payload;
+    serializeJson(doc, payload);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(CHAT_TIMEOUT_MS);
+    if (!http.begin(client, GROQ_CHAT_URL)) { lastLlmHttp = -1; continue; }
+
+    String auth = "Bearer ";
+    auth += GROQ_API_KEY_STR;
+    http.addHeader("Authorization", auth);
+    http.addHeader("Content-Type", "application/json");
+
+    Serial.printf("[LLM] Request model=%s\n", models[m]);
+    const unsigned long t0 = millis();
+    int code = http.POST(payload);
+    lastLlmHttp = code;
+    Serial.printf("[LLM] HTTP %d in %lu ms\n", code, millis() - t0);
+
+    if (code == 200) {
+      JsonDocument resp;
+      if (!deserializeJson(resp, http.getString())) {
+        reply = resp["choices"][0]["message"]["content"].as<String>();
+        reply.trim();
+      }
+    } else if (code > 0) {
+      Serial.printf("[LLM] body: %s\n", http.getString().c_str());
+    }
+    http.end();
+    if (code == 401) break;   // API key salah, ganti model tidak membantu
+  }
+
+  reply.replace("*", "");
+  reply.replace("#", "");
+  reply.trim();
+  if (reply.length() > 0) histAdd(userText, reply);
+  return reply;
+}
+
+static String llmErrorText() {
+  if (WiFi.status() != WL_CONNECTED || lastLlmHttp < 0)
+    return "Koneksi internet lagi putus, coba lagi nanti ya.";
+  if (lastLlmHttp == 0)   return "Koneksi ke server lagi lambat, coba ulangi ya.";
+  if (lastLlmHttp == 429) return "Aku lagi kebanyakan mikir, tunggu sebentar ya.";
+  if (lastLlmHttp == 401) return "Kunci API-nya bermasalah, tolong dicek.";
+  return "Maaf, aku belum bisa jawab itu sekarang.";
+}
+
+static bool isWhisperHallucination(String t) {
+  t.toLowerCase();
+  if (t.length() < 2) return true;
+  const char* bad[] = {"terima kasih telah menonton", "terima kasih sudah menonton",
+                       "thanks for watching", "amara.org", "subtitle", "www."};
+  for (auto b : bad) if (t.indexOf(b) >= 0) return true;
+  return false;
+}
+
+// Perintah suara tanpa LLM: instan & hemat kuota. Return kalimat balasan, "" kalau bukan perintah.
+static String voiceLocalCommand(String t) {
+  t.toLowerCase();
+  StateLock lock;
+  if (t.indexOf("peta") >= 0 || t.indexOf("navigasi") >= 0) { handleCommand('M'); return "Oke, ini petanya."; }
+  if (t.indexOf("jam berapa") >= 0 || t.indexOf("cuaca") >= 0) { startInfoMode(); return "Ini jam dan cuacanya."; }
+  if (t.indexOf("lirik") >= 0)  { handleCommand('D'); return "Siap, kita putar lirik."; }
+  if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) { handleCommand('H'); return "Oke, siap-siap ketawa ya."; }
+  if (t.indexOf("trivia") >= 0) { handleCommand('T'); return "Oke, ini trivia buat kamu."; }
+  if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) { handleCommand('Q'); return "Oke, ini kuisnya."; }
+  if (t.indexOf("volume naik") >= 0 || t.indexOf("keras") >= 0) { audioVolumeStep(+1); return "Volume dinaikkan."; }
+  if (t.indexOf("volume turun") >= 0 || t.indexOf("pelan") >= 0) { audioVolumeStep(-1); return "Volume diturunkan."; }
+  if (t.indexOf("diam") >= 0 || t.indexOf("mute") >= 0) { audioToggleMute(); return ""; }
+  return "";
+}
+
+// ===========================================================================
+//  VOICE TASK: STT -> (perintah lokal | LLM) -> TTS
+// ===========================================================================
+static void voiceReact(CharacterEmotion e)  { StateLock lock; triggerCharacterReaction(e); }
+static void voiceThinkOn()  { StateLock lock; setCharacterEmotion(CHARACTER_THINKING); beginThinkingVisual(); }
+static void voiceThinkOff() { StateLock lock; endThinkingVisual(); }
+static void voiceEmotion(CharacterEmotion e) { StateLock lock; setCharacterEmotion(e); }
+
+static void voiceProcess() {
+  if (WiFi.status() != WL_CONNECTED) {
+    voiceReact(CHARACTER_CONFUSED);
+    speakText("Koneksi internet lagi putus, coba lagi nanti ya.");
+    return;
+  }
+
+  size_t samples = 0;
+  int16_t* snapshot = nullptr;
+  {
+    StateLock lock;
+    samples = recLength;
+    if (samples * sizeof(int16_t) < STT_MIN_BYTES) {
+      Serial.println("[VOICE] rekaman terlalu pendek, skip");
+      linkSend("{\"t\":\"stt_skip\",\"why\":\"too_short\"}");
+      return;
+    }
+    if (recPeak < 400) {
+      Serial.println("[VOICE] rekaman terlalu pelan, skip");
+      linkSend("{\"t\":\"stt_skip\",\"why\":\"too_quiet\"}");
+      triggerCharacterReaction(CHARACTER_CONFUSED);
+      return;
+    }
+    snapshot = (int16_t*)heap_caps_malloc(samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!snapshot) snapshot = (int16_t*)malloc(samples * sizeof(int16_t));
+    if (!snapshot) { Serial.println("[VOICE] OOM snapshot"); return; }
+    memcpy(snapshot, recBuf, samples * sizeof(int16_t));
+  }
+
+  voiceThinkOn();
+  String transcript = groqTranscribe(snapshot, samples);
+  free(snapshot);
+
+  if (transcript.length() == 0 || isWhisperHallucination(transcript)) {
+    voiceThinkOff();
+    Serial.println("[VOICE] STT kosong/halusinasi, diabaikan");
+    voiceReact(CHARACTER_CONFUSED);
+    linkSend("{\"t\":\"stt_result\",\"ok\":0}");
+    if (sttLastCode != 200 && sttLastCode != 0) speakText("Aku kurang jelas dengar, coba ulangi ya.");
+    return;
+  }
+
+  linkSend("{\"t\":\"stt_result\",\"ok\":1,\"text\":\"" + jsonEscape(transcript) + "\"}");
+  Serial.printf("[VOICE] STT OK: %s\n", transcript.c_str());
+
+  // --- FITUR BARU: JAWAB KUIS LEWAT SUARA ---
+  if (quizWaitingAnswer) {
+    String low = transcript; low.toLowerCase();
+    if (low.indexOf("benar") >= 0 || low.indexOf("betul") >= 0) {
+      handleQuizAnswer('J');
+      currentVoiceReply = "Wah hebat, jawabanmu benar!";
+    } else if (low.indexOf("salah") >= 0) {
+      handleQuizAnswer('K');
+      currentVoiceReply = "Yah, sayang sekali salah.";
+    } else if (low.indexOf("tidak tahu") >= 0 || low.indexOf("gak tahu") >= 0 || low.indexOf("bingung") >= 0) {
+      handleQuizAnswer('L');
+      currentVoiceReply = "Tidak apa-apa, tetap semangat ya.";
+    } else {
+      // Jika jawabannya bukan benar/salah/tidak tahu, anggap tidak tahu
+      handleQuizAnswer('L');
+      currentVoiceReply = "Aku belum bisa menilai jawaban itu, anggap tidak tahu ya.";
+    }
+    voiceThinkOff();
+    speakText(currentVoiceReply);
+    return;
+  }
+
+  // 1) Perintah lokal dulu (tanpa LLM)
+  String local = voiceLocalCommand(transcript);
+  if (local.length() > 0) {
+    voiceThinkOff();
+    voiceReact(CHARACTER_HAPPY);
+    currentVoiceReply = local; // TAMPILKAN DI OLED
+    speakText(local);
+    return;
+  }
+  
+  // "diam"/"mute" sudah ditangani di atas (balasan kosong) -> jangan lanjut ke LLM
+  {
+    String low = transcript; low.toLowerCase();
+    if (low.indexOf("diam") >= 0 || low.indexOf("mute") >= 0) { voiceThinkOff(); return; }
+  }
+
+  // 2) LLM dengan memori + konteks perjalanan (Chatbot Mode)
+  String reply = groqChat(transcript);
+  voiceThinkOff();
+
+  if (reply.length() == 0) {
+    Serial.printf("[VOICE] LLM gagal (HTTP %d)\n", lastLlmHttp);
+    voiceReact(CHARACTER_CONFUSED);
+    reply = llmErrorText();
+  } else {
+    linkSend("{\"t\":\"llm_reply\",\"ok\":1,\"text\":\"" + jsonEscape(reply) + "\"}");
+    Serial.printf("[VOICE] LLM OK: %s\n", reply.c_str());
+    voiceReact(CHARACTER_HAPPY);
+  }
+
+  currentVoiceReply = reply; // TAMPILKAN DI OLED
+  voiceEmotion(CHARACTER_HAPPY);
+  speakText(reply);
+  voiceEmotion(CHARACTER_DEFAULT);
+}
+
 static void voiceTask(void* pv) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    size_t samples = 0;
-    int16_t* snapshot = nullptr;
-
-    {
-      StateLock lock;
-      samples = recLength;
-
-      if (samples * sizeof(int16_t) < STT_MIN_BYTES) {
-        Serial.println("[VOICE] rekaman terlalu pendek (<100 ms), skip STT");
-        char buf[64];
-        snprintf(buf, sizeof(buf), "{\"t\":\"stt_skip\",\"why\":\"too_short\"}");
-        linkSend(String(buf));
-        continue;
-      }
-
-      snapshot = (int16_t*)heap_caps_malloc(
-          samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-      if (!snapshot) snapshot = (int16_t*)malloc(samples * sizeof(int16_t));
-      if (!snapshot) {
-        Serial.println("[VOICE] OOM: gagal snapshot rekaman");
-        continue;
-      }
-      memcpy(snapshot, recBuf, samples * sizeof(int16_t));
-    }
-
-    setCharacterEmotion(CHARACTER_THINKING);
-    beginThinkingVisual();
-
-    String transcript = groqTranscribe(snapshot, samples);
-    free(snapshot);
-
-    endThinkingVisual();
-
-    if (transcript.length() == 0) {
-      Serial.println("[VOICE] STT gagal / kosong");
-      triggerCharacterReaction(CHARACTER_CONFUSED);
-      char buf[64];
-      snprintf(buf, sizeof(buf), "{\"t\":\"stt_result\",\"ok\":0}");
-      linkSend(String(buf));
-      continue;
-    }
-
-    triggerCharacterReaction(CHARACTER_HAPPY);
-
-    String escaped = transcript;
-    escaped.replace("\\", "\\\\");
-    escaped.replace("\"", "\\\"");
-    escaped.replace("\n", " ");
-    escaped.replace("\r", "");
-
-    String msg = "{\"t\":\"stt_result\",\"ok\":1,\"text\":\"" + escaped + "\"}";
-    linkSend(msg);
-
-    Serial.printf("[VOICE] STT OK: %s\n", transcript.c_str());
+    voicePipelineActive = true;
+    ttsStop = false;
+    voiceProcess();
+    voicePipelineActive = false;
   }
 }
 
 // ===========================================================================
-//  MQTT TRANSPORT
+//  MQTT
 // ===========================================================================
 void mqttBegin() {
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
@@ -1600,7 +1734,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, MQTT_TOPIC_COMMAND) != 0) return;
   if (length == 0 || length >= LINK_LINE_MAX) return;
   if (payload[0] != '{') return;
-
   mqttPendingDispatch.reserve(length + 1);
   for (unsigned int i = 0; i < length; i++) mqttPendingDispatch += (char)payload[i];
   mqttPendingDispatch.trim();
@@ -1621,16 +1754,13 @@ void mqttHeartbeat() {
 
 void mqttUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
-
   if (mqttClient.connected()) {
     mqttClient.loop();
-
     if (mqttPendingDispatch.length() > 0) {
       String msg = mqttPendingDispatch;
       mqttPendingDispatch = "";
       linkDispatchLine(msg);
     }
-
     mqttHeartbeat();
     return;
   }
@@ -1640,7 +1770,7 @@ void mqttUpdate() {
   mqttLastReconnectAttempt = now;
 
   char clientId[40];
-  snprintf(clientId, sizeof(clientId), "ABOT-V3473-%08lx%04x",
+  snprintf(clientId, sizeof(clientId), "ABOT-V3484-%08lx%04x",
            (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF),
            (unsigned)random(0xFFFF));
 
@@ -1651,11 +1781,9 @@ void mqttUpdate() {
   if (mqttClient.connect(clientId, MQTT_TOPIC_STATUS, 0, true, willMsg)) {
     Serial.println("[MQTT] Connected");
     mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
-
     if (!mqttClient.subscribe(MQTT_TOPIC_COMMAND, 0)) {
       Serial.println("[MQTT] Subscribe FAILED");
     }
-
     String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") +
                        otaReportedVersion + "\"}";
     mqttClient.publish(MQTT_TOPIC_STATUS, onlineMsg.c_str(), true);
@@ -1689,16 +1817,11 @@ void linkUpdate() {
   static String buffer;
   static bool   overflow = false;
   static bool   reserved = false;
-
-  if (!reserved) {
-    buffer.reserve(LINK_LINE_MAX);
-    reserved = true;
-  }
+  if (!reserved) { buffer.reserve(LINK_LINE_MAX); reserved = true; }
 
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\r') continue;
-
     if (c == '\n') {
       if (overflow) {
         Serial.println("[LINK] Baris terlalu panjang, dibuang");
@@ -1712,7 +1835,6 @@ void linkUpdate() {
       buffer = "";
       continue;
     }
-
     if (overflow) continue;
     if (buffer.length() >= LINK_LINE_MAX) { overflow = true; continue; }
     buffer += c;
@@ -1750,7 +1872,6 @@ void linkDispatchLine(const String& line) {
       hpConnected  = true;
       abotLog("INFO", "AUTH OK. HP terhubung & diotorisasi.");
       linkSend("{\"t\":\"auth_ok\"}");
-      audioSfx(SFX_CONNECT);
     } else {
       isAuthorized = false;
       abotLog("WARN", "AUTH GAGAL. Token salah.");
@@ -1768,10 +1889,7 @@ void linkDispatchLine(const String& line) {
   hpConnected = true;
 
   if (strcmp(t, "route") == 0) {
-    if (millis() - lastRouteMsgAt < MIN_ROUTE_INTERVAL_MS) {
-      abotLog("WARN", "Route terlalu cepat, diabaikan");
-      return;
-    }
+    if (millis() - lastRouteMsgAt < MIN_ROUTE_INTERVAL_MS) return;
     lastRouteMsgAt = millis();
     onLinkRoute(doc);
   } else if (strcmp(t, "gps") == 0) {
@@ -1796,7 +1914,7 @@ void linkDispatchLine(const String& line) {
   } else if (strcmp(t, "ota_cancel") == 0) {
     const char* requestId = doc["id"] | "";
     String cancelMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId +
-                       "\",\"code\":\"cancelled\",\"message\":\"OTA dibatalkan oleh aplikasi\"}";
+                       "\",\"code\":\"cancelled\",\"message\":\"OTA dibatalkan\"}";
     linkSend(cancelMsg);
   } else if (strcmp(t, "ota") == 0) {
     const char* url = doc["url"] | "";
@@ -1806,8 +1924,6 @@ void linkDispatchLine(const String& line) {
     char volBuf[64];
     snprintf(volBuf, sizeof(volBuf), "{\"t\":\"ack\",\"for\":\"vol\",\"v\":%d}", volumeLevel);
     linkSend(String(volBuf));
-  } else if (strcmp(t, "beep") == 0) {
-    audioSfx(SFX_TEST);
   } else {
     abotLog("WARN", "Unknown link type: %s", t);
   }
@@ -1828,7 +1944,7 @@ void linkReportStatus() {
 }
 
 // ===========================================================================
-//  OTA UPDATE
+//  OTA
 // ===========================================================================
 void startOTAUpdate(const String& url, const String& requestId,
                     const String& targetVersion) {
@@ -1871,14 +1987,11 @@ void startOTAUpdate(const String& url, const String& requestId,
   drawCenteredText("SELESAI", 38, 2);
   presentFrame();
 
-  String doneMsg = String("{\"t\":\"ota_done\",\"id\":\"") + requestId +
-                   "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}";
-  linkSend(doneMsg);
+  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId +
+           "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}");
   delay(900);
-
-  String resultMsg = String("{\"t\":\"ota_result\",\"id\":\"") + requestId +
-                     "\",\"ok\":true,\"ver\":\"" + effectiveTarget + "\",\"sim\":true}";
-  linkSend(resultMsg);
+  linkSend(String("{\"t\":\"ota_result\",\"id\":\"") + requestId +
+           "\",\"ok\":true,\"ver\":\"" + effectiveTarget + "\",\"sim\":true}");
   linkSend(String("{\"t\":\"ota_simulated\",\"id\":\"") + requestId +
            "\",\"ver\":\"" + effectiveTarget + "\"}");
   abotLog("INFO", "Simulasi OTA selesai; versi virtual=%s", effectiveTarget.c_str());
@@ -1963,23 +2076,19 @@ void startOTAUpdate(const String& url, const String& requestId,
 // ===========================================================================
 void skipStartupSequence() {
   if (bootTransitionActive) bootTransitionActive = false;
-
   if (!introductionFinished) {
     wakeIntroStage      = WAKE_FINISHED;
     introductionFinished = true;
     roboEyes.setAutoblinker(ON, 3, 2);
     roboEyes.setIdleMode(ON, 2, 1);
   }
-
   if (startupOnboardingActive) {
     startupOnboardingActive = false;
     startupStage            = STARTUP_NORMAL;
     startupOnboardingManual = false;
   }
-
   startupOnboardingCompleted = true;
   infoModeActive = false;
-
   resetNaturalEyeBehavior();
   lastUserActivityMs = millis();
 }
@@ -1989,17 +2098,14 @@ void syncRouteProgress() {
          routeCumulativeDistance[simulatedRouteIndex + 1] < simulatedRouteDistance) {
     simulatedRouteIndex++;
   }
-
   int newStep = 0;
   for (int i = 0; i < navStepCount; i++) {
     if (navSteps[i].routeDistance <= simulatedRouteDistance) newStep = i;
   }
-
   if (newStep != activeStep) {
     activeStep = newStep;
     Serial.print("[NAV] Passed step -> ");
     Serial.println(newStep);
-
     char buf[64];
     snprintf(buf, sizeof(buf), "{\"t\":\"step\",\"i\":%d,\"prog\":%.0f}",
              newStep, simulatedRouteDistance);
@@ -2009,7 +2115,6 @@ void syncRouteProgress() {
 
 void updateSpeedEstimate(float newDist) {
   unsigned long now = millis();
-
   if (speedLastAt != 0) {
     float dt = (now - speedLastAt) / 1000.0f;
     if (dt >= 0.2f && dt <= 5.0f) {
@@ -2019,29 +2124,22 @@ void updateSpeedEstimate(float newDist) {
       speedMps = speedMps * 0.6f + v * 0.4f;
     }
   }
-
   speedLastAt   = now;
   speedLastDist = newDist;
 }
 
 void deadReckonStep() {
   unsigned long now = millis();
-
   if (drLastMs == 0) { drLastMs = now; return; }
-
   float dt = (now - drLastMs) / 1000.0f;
   drLastMs = now;
   if (dt > 0.25f) dt = 0.25f;
-
   if (now - lastLinkGpsAt > DEAD_RECKON_MAX_MS) return;
   if (speedMps < 1.0f) return;
-
   float limit = routeGeometryDistance - 16.0f;
   if (simulatedRouteDistance >= limit) return;
-
   simulatedRouteDistance += speedMps * dt;
   if (simulatedRouteDistance > limit) simulatedRouteDistance = limit;
-
   syncRouteProgress();
 }
 
@@ -2053,7 +2151,6 @@ void onLinkRoute(JsonDocument& doc) {
   size_t total = coords.size();
 
   if (total < 2) {
-    Serial.println("[LINK] Route ditolak: coords < 2");
     linkSend("{\"t\":\"nack\",\"for\":\"route\",\"why\":\"no_coords\"}");
     return;
   }
@@ -2083,18 +2180,13 @@ void onLinkRoute(JsonDocument& doc) {
   int validCount = 0;
   for (int k = 0; k < routePointCount; k++) {
     if (routePoints[k].lat < -90.0 || routePoints[k].lat > 90.0 ||
-        routePoints[k].lon < -180.0 || routePoints[k].lon > 180.0) {
-      abotLog("WARN", "Buang titik invalid lat=%.6f lon=%.6f",
-              routePoints[k].lat, routePoints[k].lon);
-      continue;
-    }
+        routePoints[k].lon < -180.0 || routePoints[k].lon > 180.0) continue;
     if (validCount != k) routePoints[validCount] = routePoints[k];
     validCount++;
   }
   routePointCount = validCount;
 
   if (routePointCount < 2) {
-    abotLog("ERR", "Route ditolak: <2 titik valid setelah filter");
     linkSend("{\"t\":\"nack\",\"for\":\"route\",\"why\":\"no_valid_coords\"}");
     return;
   }
@@ -2113,7 +2205,6 @@ void onLinkRoute(JsonDocument& doc) {
   }
 
   if (routeGeometryDistance < 50.0f) {
-    abotLog("ERR", "Route ditolak: geometri cuma %.1f m", routeGeometryDistance);
     linkSend("{\"t\":\"nack\",\"for\":\"route\",\"why\":\"degenerate_route\"}");
     routeReady = false;
     return;
@@ -2129,20 +2220,15 @@ void onLinkRoute(JsonDocument& doc) {
   for (JsonObject s : doc["steps"].as<JsonArray>()) {
     if (navStepCount >= MAX_NAV_STEPS) break;
     NavigationStep& nav = navSteps[navStepCount];
-
     nav.instruction = s["instr"] | "LANJUT";
     nav.road        = s["road"]  | "";
-    nav.type        = "";
-    nav.modifier    = "";
     nav.distance    = s["dist"]  | 0.0f;
-
     int idx = (s["idx"] | 0) / routeStride;
     if (idx >= routePointCount) idx = routePointCount - 1;
     if (idx < 0)                idx = 0;
-    nav.routeIndex = idx;
-
+    nav.routeIndex    = idx;
     nav.routeDistance = (s["routeDist"] | 0.0f) * linkDistScale;
-    nav.important     = s["imp"]         | false;
+    nav.important     = s["imp"] | false;
     navStepCount++;
   }
 
@@ -2163,11 +2249,10 @@ void onLinkRoute(JsonDocument& doc) {
   activeOsrmUrl      = "";
   osrmFailCount      = 0;
   tripIntroTriggerAsk= false;
-
-  tripActive        = true;
-  tripArrived       = false;
-  arrivalActive     = false;
-  initialMapShown   = true;
+  tripActive         = true;
+  tripArrived        = false;
+  arrivalActive      = false;
+  initialMapShown    = true;
   destinationAskActive = false;
 
   simulatedRouteDistance = 0;
@@ -2187,11 +2272,6 @@ void onLinkRoute(JsonDocument& doc) {
   drLastMs    = 0;
   lastLinkGpsAt = 0;
 
-  Serial.printf("[LINK] Points: %d (stride %d), Steps: %d\n",
-                routePointCount, routeStride, navStepCount);
-  Serial.printf("[LINK] Distance: %.2f km, ETA: %.1f min, scale: %.3f\n",
-                osrmTotalDistance / 1000.0, osrmTotalDuration / 60.0, linkDistScale);
-
   skipStartupSequence();
   tripIntroActive = false;
   tripMapPending  = false;
@@ -2205,15 +2285,12 @@ void onLinkRoute(JsonDocument& doc) {
            "{\"t\":\"ack\",\"for\":\"route\",\"pts\":%d,\"steps\":%d,\"scale\":%.3f}",
            routePointCount, navStepCount, linkDistScale);
   linkSend(String(buf));
-
-  Serial.println("[LINK] ROUTE READY");
 }
 
 float snapToRoute(double lat, double lon, int from, int to, float& along) {
   double cosLat = cos(lat * DEG_TO_RAD);
   float  best   = 1e9f;
   along = simulatedRouteDistance;
-
   if (from < 0) from = 0;
   if (to > routePointCount - 2) to = routePointCount - 2;
 
@@ -2222,16 +2299,13 @@ float snapToRoute(double lat, double lon, int from, int to, float& along) {
     double ay = (routePoints[i].lat     - lat) * 110540.0;
     double bx = (routePoints[i + 1].lon - lon) * 111320.0 * cosLat;
     double by = (routePoints[i + 1].lat - lat) * 110540.0;
-
     double dx = bx - ax, dy = by - ay;
     double len2 = dx * dx + dy * dy;
     double t = (len2 > 0.0) ? -(ax * dx + ay * dy) / len2 : 0.0;
     if (t < 0.0) t = 0.0;
     if (t > 1.0) t = 1.0;
-
     double px = ax + t * dx, py = ay + t * dy;
     float d = (float)sqrt(px * px + py * py);
-
     if (d < best) {
       best  = d;
       along = routeCumulativeDistance[i] +
@@ -2243,15 +2317,11 @@ float snapToRoute(double lat, double lon, int from, int to, float& along) {
 
 void onLinkGps(JsonDocument& doc) {
   if (!routeReady || routePointCount < 2) return;
-
   float dist = simulatedRouteDistance;
 
   if (!doc["progress"].isNull()) {
     float rawP = doc["progress"].as<float>();
-    if (isnan(rawP) || isinf(rawP)) {
-      abotLog("WARN", "GPS progress NaN/Inf, diabaikan");
-      return;
-    }
+    if (isnan(rawP) || isinf(rawP)) return;
     float p = rawP * linkDistScale;
     if (p < simulatedRouteDistance - 40.0f) return;
     if (p < 0.0f) return;
@@ -2259,19 +2329,13 @@ void onLinkGps(JsonDocument& doc) {
   } else if (!doc["lat"].isNull() && !doc["lon"].isNull()) {
     double lat = doc["lat"].as<double>();
     double lon = doc["lon"].as<double>();
-
     if (isnan(lat) || isinf(lat) || isnan(lon) || isinf(lon) ||
-        lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
-      abotLog("WARN", "GPS invalid lat=%.6f lon=%.6f", lat, lon);
-      return;
-    }
-
+        lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
     float along = 0;
     int from = simulatedRouteIndex - 2;
     int to   = simulatedRouteIndex + 30;
     float off = snapToRoute(lat, lon, from, to, along);
     if (off > OFFROUTE_METERS) off = snapToRoute(lat, lon, 0, routePointCount - 2, along);
-
     if (off > OFFROUTE_METERS) {
       if (millis() - lastOffRouteReportAt > OFFROUTE_REPORT_MS) {
         lastOffRouteReportAt = millis();
@@ -2280,12 +2344,10 @@ void onLinkGps(JsonDocument& doc) {
                  "{\"t\":\"offroute\",\"lat\":%.6f,\"lon\":%.6f,\"off\":%.0f}",
                  lat, lon, off);
         linkSend(String(buf));
-        abotLog("WARN", "OFF ROUTE %.0f m -> minta reroute ke HP", off);
         triggerCharacterReaction(CHARACTER_CONFUSED);
       }
       return;
     }
-
     if (along < simulatedRouteDistance - 40.0f) return;
     dist = along;
   } else {
@@ -2294,30 +2356,23 @@ void onLinkGps(JsonDocument& doc) {
 
   lastLinkGpsAt = millis();
   drLastMs      = millis();
-
   if (dist < 0) dist = 0;
   if (dist > routeGeometryDistance) dist = routeGeometryDistance;
-
   updateSpeedEstimate(dist);
   simulatedRouteDistance = dist;
-
   syncRouteProgress();
-
   if (simulatedRouteDistance >= routeGeometryDistance - 15.0f) {
     if (tripActive && !tripArrived && !arrivalActive) handleArrival();
   }
 }
 
 void onLinkTripStart() {
-  Serial.println("[LINK] >>> TRIP START");
   markUserActivity();
   skipStartupSequence();
-
   tripActive        = true;
   tripArrived       = false;
   arrivalActive     = false;
   tripMapPending    = false;
-
   routeReady        = false;
   routeRequested    = false;
   routePointCount   = 0;
@@ -2343,56 +2398,42 @@ void onLinkTripStart() {
   speedLastAt            = 0;
   drLastMs               = 0;
   destinationAskActive   = false;
-
   tripIntroActive     = true;
   tripIntroStartedAt  = millis();
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
-
-  Serial.println("[LINK] Trip baru siap, tunggu route dari HP");
 }
 
 void onLinkTripEnd() {
-  Serial.println("[LINK] >>> TRIP END");
-
   tripActive    = false;
   tripArrived   = false;
   arrivalActive = false;
   tripMapPending= false;
-
   routeReady       = false;
   routeRequested   = false;
   routeFromLink    = false;
   linkRouteReceived= false;
   mapRequested     = false;
-
   routePointCount = 0;
   navStepCount    = 0;
   activeStep      = 0;
   hudLockedStep   = -1;
   hudCompletedStep= -1;
-
   simulatedRouteDistance = 0;
   simulatedRouteIndex    = 0;
   gpsLastMs              = 0;
   lastLinkGpsAt          = 0;
-
   pendingNavigationAI = false;
   navigationAIStarted = false;
   activeOsrmUrl       = "";
-
   hudActive        = false;
   initialMapShown  = false;
-
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
-
   linkSend("{\"t\":\"trip_ended\",\"route\":0,\"trip\":0}");
-  Serial.println("[LINK] Trip dan route berhasil dibersihkan");
 }
 
 void onLinkReset() {
-  Serial.println("[LINK] >>> RESET");
   simulatedRouteDistance = 0;
   simulatedRouteIndex    = 0;
   gpsLastMs              = 0;
@@ -2420,15 +2461,10 @@ void onLinkPing() {
 //  ROUTING UTILITIES
 // ===========================================================================
 int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
-  int idx   = 0;
-  int count = 0;
-  int lat   = 0;
-  int lng   = 0;
-  int len   = encoded.length();
-
+  int idx = 0, count = 0, lat = 0, lng = 0;
+  int len = encoded.length();
   while (idx < len && count < maxPoints) {
     int b, shift, result;
-
     shift = 0; result = 0;
     do {
       if (idx >= len) return count;
@@ -2438,7 +2474,6 @@ int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
     } while (b >= 0x20);
     int dlat = ((result & 1) ? ~(result >> 1) : (result >> 1));
     lat += dlat;
-
     shift = 0; result = 0;
     do {
       if (idx >= len) return count;
@@ -2448,12 +2483,10 @@ int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
     } while (b >= 0x20);
     int dlng = ((result & 1) ? ~(result >> 1) : (result >> 1));
     lng += dlng;
-
     out[count].lat = lat / 1e5;
     out[count].lon = lng / 1e5;
     count++;
   }
-
   return count;
 }
 
@@ -2498,7 +2531,7 @@ EyeMood abotEyeFor(AbotPersonality p) {
 String abotPromptHint() {
   switch (currentAbotPersonality) {
     case ABOT_MORNING:   return " Suasana pagi: nada kamu bersemangat dan ceria.";
-    case ABOT_DAY:       return " Suasana siang: nada kamu agak lelah tapi tetap hangat dan sabar.";
+    case ABOT_DAY:       return " Suasana siang: nada kamu agak lelah tapi tetap hangat.";
     case ABOT_AFTERNOON: return " Suasana sore: nada kamu santai dan sedikit lemas tapi tetap ramah.";
     case ABOT_NIGHT:     return " Suasana malam: nada kamu tenang dan sedikit mengantuk tapi tetap hangat.";
     default:             return "";
@@ -2513,7 +2546,7 @@ void updateAbotPersonality() {
   currentAbotPersonality = p;
 
   if (!introductionFinished || bootTransitionActive || sleepModeActive ||
-      listeningActive ||
+      listeningActive || voicePipelineActive ||
       companionActive || companionGenerating || companionNextMenuActive ||
       companionNextMenuPending || conversationActive || mapRequested ||
       hudActive || arrivalActive || startupOnboardingActive || infoModeActive ||
@@ -2529,7 +2562,6 @@ void updateAbotPersonality() {
 
   EyeMood desired = abotEyeFor(p);
   if (currentEyeMood == desired) return;
-
   setEyeMood(desired);
   currentCharacterEmotion =
     (desired == EYE_HAPPY) ? CHARACTER_HAPPY :
@@ -2539,7 +2571,6 @@ void updateAbotPersonality() {
 void setEyeMood(EyeMood mood) {
   if (currentEyeMood == mood) return;
   currentEyeMood = mood;
-
   switch (mood) {
     case EYE_DEFAULT: roboEyes.setMood(DEFAULT); break;
     case EYE_HAPPY:   roboEyes.setMood(HAPPY);   break;
@@ -2552,7 +2583,6 @@ void setCharacterEmotion(CharacterEmotion emotion) {
   currentCharacterEmotion  = emotion;
   characterReactionActive  = false;
   characterReactionUntil   = 0;
-
   switch (emotion) {
     case CHARACTER_DEFAULT:   setEyeMood(EYE_DEFAULT); break;
     case CHARACTER_LISTENING: setEyeMood(EYE_HAPPY);   break;
@@ -2568,7 +2598,6 @@ void setCharacterEmotion(CharacterEmotion emotion) {
 void triggerCharacterReaction(CharacterEmotion emotion) {
   characterReactionActive = true;
   currentCharacterEmotion = emotion;
-
   switch (emotion) {
     case CHARACTER_HAPPY:
       setEyeMood(EYE_HAPPY);
@@ -2597,18 +2626,11 @@ void triggerCharacterReaction(CharacterEmotion emotion) {
 void updateCharacterEmotion() {
   if (!characterReactionActive) return;
   if (millis() < characterReactionUntil) return;
-
   characterReactionActive = false;
   characterReactionUntil  = 0;
-
-  if (listeningActive) {
-    setCharacterEmotion(CHARACTER_LISTENING);
-    return;
-  }
-  if (companionGenerating || systemState == STATE_THINKING) {
-    setCharacterEmotion(CHARACTER_THINKING);
-    return;
-  }
+  if (listeningActive) { setCharacterEmotion(CHARACTER_LISTENING); return; }
+  if (companionGenerating || systemState == STATE_THINKING ||
+      voicePipelineActive) { setCharacterEmotion(CHARACTER_THINKING); return; }
   setCharacterEmotion(CHARACTER_DEFAULT);
 }
 
@@ -2630,16 +2652,13 @@ void triggerNaturalWink() {
 
 void updateNaturalEyeBehavior() {
   if (!naturalEyeBehaviorEnabled) return;
-
   if (!introductionFinished || bootTransitionActive || sleepModeActive ||
-      listeningActive ||
+      listeningActive || voicePipelineActive ||
       companionActive || companionGenerating || companionNextMenuActive ||
       mapRequested || hudActive || arrivalActive || startupOnboardingActive ||
       infoModeActive || destinationAskActive || tripIntroActive ||
       conversationActive || systemState == STATE_THINKING ||
-      characterReactionActive || otaActive) {
-    return;
-  }
+      characterReactionActive || otaActive) return;
 
   if (naturalEyeGazeActive) {
     if (millis() >= naturalEyeReturnAt) {
@@ -2649,12 +2668,7 @@ void updateNaturalEyeBehavior() {
     }
     return;
   }
-
-  if (millis() >= naturalEyeNextWinkAt) {
-    triggerNaturalWink();
-    return;
-  }
-
+  if (millis() >= naturalEyeNextWinkAt) { triggerNaturalWink(); return; }
   if (millis() < naturalEyeNextActionAt) return;
 
   switch (naturalEyeSequence % 3) {
@@ -2662,7 +2676,6 @@ void updateNaturalEyeBehavior() {
     case 1:  roboEyes.setPosition(OJOL_POS_E); break;
     default: roboEyes.setPosition(OJOL_POS_N); break;
   }
-
   naturalEyeSequence++;
   naturalEyeGazeActive = true;
   naturalEyeReturnAt   = millis() + NATURAL_EYE_GAZE_DURATION_MS;
@@ -2672,13 +2685,11 @@ void updateThinkingGaze() {
   if (!thinkingVisualPrepared) return;
   unsigned long now = millis();
   if (now < thinkingGazeNextAt) return;
-
   switch (thinkingGazeStep % 3) {
     case 0:  roboEyes.setPosition(OJOL_POS_NW); break;
     case 1:  roboEyes.setPosition(OJOL_POS_NE); break;
     default: roboEyes.setPosition(DEFAULT);     break;
   }
-
   thinkingGazeStep++;
   thinkingGazeNextAt = now + 1200;
 }
@@ -2696,60 +2707,49 @@ void markUserActivity() {
 void enterSleepMode() {
   if (sleepModeActive) return;
   sleepModeActive = true;
-
   currentEyeMood = EYE_DEFAULT;
   roboEyes.setPosition(DEFAULT);
   roboEyes.setMood(DEFAULT);
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
   roboEyes.close();
-
   naturalEyeGazeActive  = false;
   naturalEyeNextActionAt= millis() + NATURAL_EYE_ACTION_INTERVAL_MS;
-
   Serial.println("[SLEEP] 20s idle -> SLEEP MODE");
 }
 
 void wakeFromSleep() {
   if (!sleepModeActive) { lastUserActivityMs = millis(); return; }
-
   sleepModeActive    = false;
   lastUserActivityMs = millis();
-
   currentEyeMood = EYE_DEFAULT;
   roboEyes.setMood(DEFAULT);
   roboEyes.setPosition(DEFAULT);
   roboEyes.open();
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 1);
-
   resetNaturalEyeBehavior();
-
   currentCharacterEmotion = CHARACTER_DEFAULT;
   characterReactionActive = false;
   characterReactionUntil  = 0;
-
   Serial.println("[SLEEP] WAKE UP");
 }
 
 void updateSleepMode() {
   if (!introductionFinished) return;
-
   bool safeForSleep =
-    !bootTransitionActive && !listeningActive &&
+    !bootTransitionActive && !listeningActive && !voicePipelineActive &&
     !startupOnboardingActive &&
     !destinationAskActive && !infoModeActive && !tripIntroActive &&
     !companionGenerating && !companionActive && !companionNextMenuActive &&
     !companionNextMenuPending && !conversationActive &&
     systemState != STATE_THINKING && !mapRequested && !hudActive &&
     !arrivalActive && !characterReactionActive && !otaActive;
-
   if (!safeForSleep) {
     lastUserActivityMs = millis();
     if (sleepModeActive) wakeFromSleep();
     return;
   }
-
   if (!sleepModeActive && millis() - lastUserActivityMs >= SLEEP_IDLE_TIMEOUT) {
     enterSleepMode();
   }
@@ -2764,32 +2764,26 @@ void renderListening() { roboEyes.update(); }
 
 void beginThinkingVisual() {
   if (thinkingVisualPrepared) return;
-
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 1);
   setCharacterEmotion(CHARACTER_THINKING);
-
   overlayListening = false;
   overlayThinking  = true;
   thinkingGazeStep = 0;
   thinkingGazeNextAt = millis();
   roboEyes.setPosition(OJOL_POS_NW);
-
   thinkingVisualPrepared = true;
 }
 
 void endThinkingVisual() {
   if (!thinkingVisualPrepared) return;
-
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 1);
-
   overlayThinking        = false;
   thinkingVisualPrepared = false;
   thinkingGazeStep       = 0;
   thinkingGazeNextAt     = 0;
   roboEyes.setPosition(DEFAULT);
-
   setCharacterEmotion(CHARACTER_DEFAULT);
   roboEyes.blink();
 }
@@ -2814,6 +2808,15 @@ void startListening() {
     triggerCharacterReaction(CHARACTER_CONFUSED);
     return;
   }
+  if (ttsActive) {
+    ttsStop = true;
+    Serial.println("[VOICE] TTS dihentikan (barge-in), tahan TALK lagi untuk bicara");
+    return;
+  }
+  if (voicePipelineActive) {
+    Serial.println("[VOICE] Pipeline sibuk — tunggu selesai");
+    return;
+  }
 
   mapRequested            = false;
   hudActive               = false;
@@ -2834,19 +2837,17 @@ void startListening() {
 
 void stopListening() {
   if (!listeningActive) return;
-
   listeningActive  = false;
   overlayListening = false;
   listeningState   = LISTENING_IDLE;
   conversationActive = false;
-
   audioStopRecording();
   setCharacterEmotion(CHARACTER_DEFAULT);
   Serial.println("[LISTENING] STOP");
 }
 
 // ===========================================================================
-//  DESTINATION (legacy stubs)
+//  DESTINATION STUBS
 // ===========================================================================
 void startGeocode(const String& placeName) {
   destinationResolved     = false;
@@ -2859,7 +2860,7 @@ void startGeocode(const String& placeName) {
 void startDestinationAsk() {
   destinationAskActive = false;
   destinationResolved  = false;
-  Serial.println("[ABOT] Layar preset dihapus; menunggu rute dari aplikasi HP.");
+  Serial.println("[ABOT] Menunggu rute dari aplikasi HP.");
 }
 
 void finishDestinationAsk() {
@@ -2873,14 +2874,13 @@ void renderDestinationAsk() { destinationAskActive = false; }
 //  BUTTONS
 // ===========================================================================
 void startActionButtonFunction() {
-  if (listeningActive) return;
+  if (listeningActive || voicePipelineActive) return;
   companionActive         = false;
   companionNextMenuActive = false;
   companionNextMenuPending= false;
   conversationActive      = false;
   hudActive               = false;
   cancelThinking();
-
   startCompanion(COMPANION_CHALLENGE);
   Serial.println("[BUTTON ACTION] SHORT -> LIRIK ANIMASI");
 }
@@ -2891,10 +2891,6 @@ void startActionCompanionRandom() {
     COMPANION_HUMOR, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_STORY
   };
   CompanionType selected = types[random(0, 4)];
-
-  Serial.print("[BUTTON ACTION] HOLD -> RANDOM: ");
-  Serial.println(companionName(selected));
-
   startCompanion(selected);
 }
 
@@ -2909,10 +2905,8 @@ void updateButtons() {
 
   if (now - talkLastChange >= BUTTON_DEBOUNCE_MS && talkReading != talkStableState) {
     talkStableState = talkReading;
-
     if (talkStableState == LOW) {
       markUserActivity();
-      audioSfx(SFX_TICK);
       talkPressedAt     = now;
       talkLongTriggered = false;
     } else {
@@ -2929,7 +2923,7 @@ void updateButtons() {
     talkLongTriggered = true;
     startListening();
     Serial.println(listeningActive ? "[BUTTON TALK] HOLD CONFIRMED (rekam)"
-                                   : "[BUTTON TALK] HOLD gagal (mic off)");
+                                   : "[BUTTON TALK] HOLD gagal");
   }
 
   bool actionReading = digitalRead(BUTTON_ACTION);
@@ -2941,15 +2935,12 @@ void updateButtons() {
   if (now - actionLastChange >= BUTTON_DEBOUNCE_MS &&
       actionReading != actionStableState) {
     actionStableState = actionReading;
-
     if (actionStableState == LOW) {
       markUserActivity();
-      audioSfx(SFX_TICK);
       actionPressedAt = now;
     } else {
       unsigned long held = now - actionPressedAt;
       if (listeningActive) return;
-
       if (held < BUTTON_HOLD_MS) startActionButtonFunction();
       else                       startActionCompanionRandom();
     }
@@ -2962,7 +2953,6 @@ void updateButtons() {
 void ensureWiFiConnected() {
   if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL_MS) return;
   lastWiFiCheck = millis();
-
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiConnected) {
       wifiConnected = true;
@@ -2971,15 +2961,12 @@ void ensureWiFiConnected() {
     }
     return;
   }
-
   if (wifiConnected) {
     wifiConnected = false;
     abotLog("WARN", "WiFi koneksi terputus");
   }
-
   if (millis() - lastWiFiAttempt < WIFI_RETRY_INTERVAL_MS) return;
   lastWiFiAttempt = millis();
-
   Serial.println("[WIFI] Mencoba reconnect...");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -2988,10 +2975,8 @@ void ensureWiFiConnected() {
 void checkHeapHealth() {
   if (millis() - lastHeapCheck < HEAP_CHECK_INTERVAL_MS) return;
   lastHeapCheck = millis();
-
   uint32_t freeHeap = ESP.getFreeHeap();
   Serial.printf("[HEAP] Free: %u bytes\n", freeHeap);
-
   if (freeHeap < HEAP_CRITICAL_BYTES) {
     abotLog("ERR", "HEAP KRITIS -> restart terkontrol");
     delay(200);
@@ -3000,7 +2985,7 @@ void checkHeapHealth() {
 }
 
 // ===========================================================================
-//  BOOT & INTRODUCTION SCREENS
+//  BOOT & INTRODUCTION
 // ===========================================================================
 void renderWifiConnecting() {
   beginFrame();
@@ -3012,21 +2997,17 @@ void renderWifiConnecting() {
 void startBootTransition() {
   bootTransitionActive    = true;
   bootTransitionStartedAt = millis();
-
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
-
   Serial.println("[BOOT] Selesai -> sapaan Abot");
 }
 
 void renderBootTransition() {
   unsigned long elapsed = millis() - bootTransitionStartedAt;
-
   beginFrame();
   drawCenteredText("ABOT", 20, 2);
   drawCenteredText(wifiConnected ? "ONLINE" : "OFFLINE", 47, 1);
   presentFrame();
-
   if (elapsed >= BOOT_TRANSITION_MS) {
     bootTransitionActive = false;
     startIntroduction();
@@ -3037,24 +3018,19 @@ void startIntroduction() {
   introductionFinished     = false;
   wakeIntroStage           = WAKE_DARK;
   wakeIntroStageStartedAt  = millis();
-
   beginFrame();
   presentFrame();
-
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
   roboEyes.setMood(DEFAULT);
   roboEyes.setPosition(DEFAULT);
   currentEyeMood = EYE_DEFAULT;
-
   Serial.println("[ABOT] Perkenalan dimulai");
-  audioSfx(SFX_BOOT);
 }
 
 void renderIntroduction() {
   unsigned long now     = millis();
   unsigned long elapsed = now - wakeIntroStageStartedAt;
-
   beginFrame();
   gfxFillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_WHITE);
   gfxBitmap(0, 0, abotIntroBitmap, 128, 64, COLOR_BLACK);
@@ -3067,7 +3043,6 @@ void renderIntroduction() {
     }
     return;
   }
-
   if (wakeIntroStage == WAKE_ABOT_HELLO) {
     if (elapsed >= WAKE_ABOT_HELLO_MS) {
       wakeIntroStage          = WAKE_ABOT_PERSONALITY;
@@ -3075,18 +3050,15 @@ void renderIntroduction() {
     }
     return;
   }
-
   if (wakeIntroStage == WAKE_ABOT_PERSONALITY) {
     updateAbotPersonality();
     if (elapsed >= WAKE_ABOT_PERSONALITY_MS) {
       wakeIntroStage       = WAKE_FINISHED;
       introductionFinished = true;
-
       roboEyes.setAutoblinker(ON, 3, 2);
       roboEyes.setIdleMode(ON, 2, 1);
       resetNaturalEyeBehavior();
       lastUserActivityMs = millis();
-
       if (!startupOnboardingCompleted) {
         startupOnboardingManual = false;
         startStartupOnboarding();
@@ -3096,7 +3068,6 @@ void renderIntroduction() {
     }
     return;
   }
-
   roboEyes.update();
 }
 
@@ -3106,14 +3077,11 @@ void startTripIntroduction() {
   updateAbotPersonality();
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
-  Serial.println("[ABOT] Intro trip baru");
 }
 
 void renderTripIntroduction() {
   if (!tripIntroActive) return;
-
   unsigned long elapsed = millis() - tripIntroStartedAt;
-
   beginFrame();
   switch (currentAbotPersonality) {
     case ABOT_MORNING:
@@ -3148,35 +3116,25 @@ void renderTripIntroduction() {
                                       : TRIP_INTRO_DURATION;
   if (elapsed >= introMs) {
     tripIntroActive = false;
-
     if (tripIntroTriggerAsk) {
       tripIntroTriggerAsk = false;
-      if (!hpConnected && !routeReady) {
-        Serial.println("[ABOT] Intro selesai -> fallback tanya tujuan");
-        startDestinationAsk();
-      } else {
-        Serial.println("[ABOT] HP connected, tunggu route dari HP");
-      }
+      if (!hpConnected && !routeReady) startDestinationAsk();
     }
-
     if (tripMapPending && routeReady) {
       tripMapPending = false;
       startMapDisplay();
       pendingNavigationAI = NAV_AI_ON_ROUTE;
-      Serial.println("[ABOT] Intro selesai -> MAP");
     }
   }
 }
 
 // ===========================================================================
-//  CLOCK, WEATHER & INFO SCREENS
+//  CLOCK, WEATHER, INFO
 // ===========================================================================
 void renderClockScreen(const String& header) {
   beginFrame();
-
   drawCenteredText(header, 3, 1);
   gfxLine(12, 14, 115, 14);
-
   struct tm ti;
   if (getLocalTimeSafe(&ti)) {
     char clockText[10];
@@ -3185,14 +3143,12 @@ void renderClockScreen(const String& header) {
              ti.tm_hour, ti.tm_min, ti.tm_sec);
     snprintf(dateText, sizeof(dateText), "%s, %d %s",
              HARI_NAMA[ti.tm_wday], ti.tm_mday, BULAN_NAMA[ti.tm_mon]);
-
     drawCenteredText(String(clockText), 24, 2);
     drawCenteredText(String(dateText), 49, 1);
   } else {
     drawCenteredText("--:--:--", 24, 2);
     drawCenteredText("WAKTU BELUM SIAP", 49, 1);
   }
-
   presentFrame();
 }
 
@@ -3213,7 +3169,6 @@ String weatherCodeToText(int code) {
 void ensureWeatherData() {
   if (!introductionFinished || networkIsBusy() || weatherFetching ||
       !wifiConnected) return;
-
   unsigned long interval = weatherData.valid ? WEATHER_REFRESH_MS
                                              : WEATHER_RETRY_MS;
   if (lastWeatherAttempt == 0 || millis() - lastWeatherAttempt >= interval) {
@@ -3223,14 +3178,11 @@ void ensureWeatherData() {
 
 void renderWeatherScreen(const String& header) {
   beginFrame();
-
   drawCenteredText(header, 1, 1);
   gfxLine(10, 12, 117, 12);
-
   if (!weatherData.valid) {
-    if (weatherFetching) {
-      drawCenteredText("MEMUAT CUACA...", 30, 1);
-    } else {
+    if (weatherFetching) drawCenteredText("MEMUAT CUACA...", 30, 1);
+    else {
       drawCenteredText("CUACA OFFLINE", 23, 1);
       drawCenteredText("DATA BELUM TERSEDIA", 38, 1);
       drawCenteredText("COBA LAGI NANTI", 53, 1);
@@ -3238,11 +3190,9 @@ void renderWeatherScreen(const String& header) {
     presentFrame();
     return;
   }
-
   String temp  = String(weatherData.temperature, 1) + " C";
   String range = "H:" + String(weatherData.tempMax, 0) +
                  "  L:" + String(weatherData.tempMin, 0);
-
   drawCenteredText(temp, 18, 2);
   drawCenteredText(weatherData.condition, 42, 1);
   drawCenteredText(range, 56, 1);
@@ -3251,27 +3201,21 @@ void renderWeatherScreen(const String& header) {
 
 void startInfoMode() {
   if (destinationAskActive) return;
-
   mapRequested             = false;
   hudActive                = false;
   companionActive          = false;
   companionNextMenuActive  = false;
   companionNextMenuPending = false;
   conversationActive       = false;
-
   infoModeActive  = true;
   infoPage        = 0;
   infoModeStarted = millis();
   if (!weatherData.valid) lastWeatherAttempt = 0;
-
-  Serial.println("[BUTTON TALK] SHORT -> INFO");
 }
 
 void renderInfoMode() {
   if (!infoModeActive) return;
-
   unsigned long elapsed = millis() - infoModeStarted;
-
   if (infoPage == 0) {
     renderClockScreen("JAM");
     if (elapsed >= INFO_CLOCK_DURATION) {
@@ -3283,7 +3227,6 @@ void renderInfoMode() {
     if (elapsed >= INFO_WEATHER_DURATION) {
       infoModeActive = false;
       infoPage       = 0;
-      Serial.println("[INFO] selesai -> EYES");
     }
   }
 }
@@ -3296,14 +3239,11 @@ void startStartupOnboarding() {
   startupStage            = STARTUP_USAGE;
   startupStageStarted     = millis();
   infoModeActive          = false;
-
   mapRequested       = false;
   hudActive          = false;
   companionActive    = false;
   conversationActive = false;
   cancelThinking();
-
-  Serial.println("[STARTUP] CARA MENGGUNAKAN");
 }
 
 void finishStartupOnboarding() {
@@ -3313,39 +3253,27 @@ void finishStartupOnboarding() {
   introductionFinished       = true;
   infoModeActive             = false;
   resetNaturalEyeBehavior();
-
   if (!startupOnboardingManual) {
-    if (hpConnected) {
-      Serial.println("[STARTUP] selesai -> tunggu route dari HP");
-    } else {
-      startDestinationAsk();
-      Serial.println("[STARTUP] selesai -> tanya tujuan (fallback)");
-    }
-  } else {
-    Serial.println("[STARTUP] selesai (manual) -> EYES");
+    if (hpConnected) { }
+    else { startDestinationAsk(); }
   }
-
   startupOnboardingManual = false;
 }
 
 void renderStartupOnboarding() {
   if (!startupOnboardingActive) return;
-
   unsigned long elapsed = millis() - startupStageStarted;
   beginFrame();
-
   bool fastLink = hpConnected && !startupOnboardingManual;
 
   if (startupStage == STARTUP_USAGE) {
     drawCenteredText("CARA MENGGUNAKAN", 1, 1);
     gfxLine(10, 13, 117, 13);
-
     gfxText(2, 20, "TALK tahan=bicara");
     gfxText(2, 32, "TALK tekan=jam/cuaca");
     gfxText(2, 44, "ACTION tekan=LIRIK");
     gfxText(2, 56, "ACTION tahan=hiburan");
     presentFrame();
-
     unsigned long usageMs = fastLink ? STARTUP_USAGE_LINK_MS
                                      : STARTUP_USAGE_DURATION;
     if (elapsed >= usageMs) {
@@ -3355,7 +3283,6 @@ void renderStartupOnboarding() {
     }
     return;
   }
-
   if (startupStage == STARTUP_CLOCK) {
     renderClockScreen("JAM");
     if (elapsed >= STARTUP_CLOCK_DURATION) {
@@ -3364,7 +3291,6 @@ void renderStartupOnboarding() {
     }
     return;
   }
-
   if (startupStage == STARTUP_WEATHER) {
     renderWeatherScreen("CUACA");
     if (elapsed >= STARTUP_WEATHER_DURATION) finishStartupOnboarding();
@@ -3405,7 +3331,6 @@ void drawMapDestination(int x, int y) {
 void drawMiniTurnIcon(const String& instruction, int cx, int cy) {
   String text = instruction;
   text.toUpperCase();
-
   if (text.indexOf("KIRI") >= 0 || text.indexOf("LEFT") >= 0) {
     gfxLine(cx + 5, cy, cx - 4, cy);
     gfxLine(cx - 4, cy, cx, cy - 4);
@@ -3436,22 +3361,17 @@ void drawMapHeader() {
 
 void drawMapFooter() {
   gfxLine(0, 52, 127, 52);
-
   int s = nextImportantStep();
   if (s >= 0 && s < navStepCount) {
     NavigationStep& step = navSteps[s];
     float distanceToTurn = step.routeDistance - simulatedRouteDistance;
     if (distanceToTurn < 0) distanceToTurn = 0;
-
     drawMiniTurnIcon(step.instruction, 7, 59);
-
     String label = (distanceToTurn >= 1000.0f)
                    ? String(distanceToTurn / 1000.0f, 1) + "k "
                    : String((int)distanceToTurn) + "m ";
-
     String instruction = step.instruction;
     if (instruction.length() > 11) instruction = instruction.substring(0, 11);
-
     gfxText(16, 55, label + instruction);
   } else {
     gfxText(16, 55, "RUTE AKTIF");
@@ -3460,14 +3380,12 @@ void drawMapFooter() {
 
 void renderMap() {
   beginFrame();
-
   if (!routeReady || routePointCount < 2) {
     drawMapHeader();
     drawCenteredText("MENCARI RUTE", 28, 1);
     presentFrame();
     return;
   }
-
   const int   centerX = 64;
   const int   centerY = 42;
   const float pixelsPerMeter = 0.13f;
@@ -3476,10 +3394,7 @@ void renderMap() {
 
   int seg = 0;
   while (seg < routePointCount - 2 &&
-         routeCumulativeDistance[seg + 1] < simulatedRouteDistance) {
-    seg++;
-  }
-
+         routeCumulativeDistance[seg + 1] < simulatedRouteDistance) seg++;
   float segStart = routeCumulativeDistance[seg];
   float segEnd   = routeCumulativeDistance[seg + 1];
   float t = (segEnd > segStart)
@@ -3514,7 +3429,6 @@ void renderMap() {
     float d2 = routeCumulativeDistance[i];
     if (d2 < simulatedRouteDistance - behindMeters) continue;
     if (d1 > simulatedRouteDistance + aheadMeters)  break;
-
     int x1, y1, x2, y2;
     toScreen(routePoints[i - 1].lat, routePoints[i - 1].lon, x1, y1);
     toScreen(routePoints[i].lat,     routePoints[i].lon,     x2, y2);
@@ -3540,9 +3454,7 @@ void renderMap() {
 void drawTurnArrow(const String& instruction) {
   String text = instruction;
   text.toUpperCase();
-
   int cx = 64, cy = 34;
-
   if (text.indexOf("KIRI") >= 0 || text.indexOf("LEFT") >= 0) {
     gfxLine(cx + 18, cy, cx - 12, cy);
     gfxLine(cx - 12, cy, cx - 2, cy - 8);
@@ -3563,27 +3475,21 @@ void drawTurnArrow(const String& instruction) {
 
 void renderHUD() {
   beginFrame();
-
   int displayStep = (hudLockedStep >= 0 && hudLockedStep < navStepCount)
                     ? hudLockedStep
                     : nextImportantStep();
-
   if (displayStep >= 0 && displayStep < navStepCount) {
     NavigationStep& step = navSteps[displayStep];
     float distanceToTurn = step.routeDistance - simulatedRouteDistance;
     if (distanceToTurn < 0) distanceToTurn = 0;
-
     String distanceText = (distanceToTurn >= 1000.0f)
                           ? String(distanceToTurn / 1000.0f, 1) + "k"
                           : String((int)distanceToTurn) + "m";
     gfxText(0, 0, distanceText, 2);
-
     drawTurnArrow(step.instruction);
-
     String instruction = step.instruction;
     if (instruction.length() > 20) instruction = instruction.substring(0, 20);
     gfxText(0, 49, instruction);
-
     if (step.road.length() > 0) {
       String road = step.road;
       if (road.length() > 20) road = road.substring(0, 20);
@@ -3592,7 +3498,6 @@ void renderHUD() {
   } else {
     drawCenteredText("LANJUTKAN", 28, 1);
   }
-
   presentFrame();
 }
 
@@ -3602,12 +3507,10 @@ void renderHUD() {
 void handleArrival() {
   if (arrivalActive) return;
   if (sleepModeActive) wakeFromSleep();
-
   arrivalActive     = true;
   tripArrived       = true;
   tripActive        = false;
   arrivalStartedAt  = millis();
-
   mapRequested             = false;
   hudActive                = false;
   hudLockedStep            = -1;
@@ -3619,18 +3522,14 @@ void handleArrival() {
   infoModeActive           = false;
   startupOnboardingActive  = false;
   cancelThinking();
-
   setCharacterEmotion(CHARACTER_HAPPY);
   lastUserActivityMs = millis();
-
   linkSend("{\"t\":\"arrived\"}");
-  audioSfx(SFX_ARRIVE);
   abotLog("INFO", "TUJUAN TERCAPAI");
 }
 
 void renderArrival() {
   beginFrame();
-
   drawCenteredText("SUDAH SAMPAI!", 1, 1);
   gfxLine(25, 11, 102, 11);
   drawCenteredText("Pastikan barang", 16, 1);
@@ -3639,7 +3538,6 @@ void renderArrival() {
   drawCenteredText("dilakukan ya.", 46, 1);
   drawCenteredText("Terima kasih!", 56, 1);
   presentFrame();
-
   if (millis() - arrivalStartedAt >= ARRIVAL_DISPLAY_DURATION) {
     arrivalActive  = false;
     tripArrived    = true;
@@ -3647,23 +3545,16 @@ void renderArrival() {
     setCharacterEmotion(CHARACTER_DEFAULT);
     resetNaturalEyeBehavior();
     lastUserActivityMs = millis();
-    Serial.println("[ARRIVAL] selesai -> EYES / menunggu trip baru");
   }
 }
 
 void startNewTrip() {
-  if (networkIsBusy()) {
-    Serial.println("[TRIP] Network masih sibuk, coba lagi");
-    return;
-  }
-
+  if (networkIsBusy()) return;
   markUserActivity();
-
   tripActive    = true;
   tripArrived   = false;
   arrivalActive = false;
   tripMapPending= false;
-
   routeReady       = false;
   routeRequested   = false;
   routeFromLink    = false;
@@ -3683,24 +3574,17 @@ void startNewTrip() {
   navigationAIStarted    = false;
   pendingNavigationAI    = false;
   systemState            = STATE_READY;
-
   activeOsrmUrl         = "";
   osrmFailCount         = 0;
   osrmGaveUpAt          = 0;
   destinationResolved   = false;
   tripIntroTriggerAsk   = true;
   linkRouteReceived     = false;
-
   startTripIntroduction();
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println("[TRIP] TRIP BARU - tunggu route dari HP...");
-  Serial.println("========================================");
 }
 
 // ===========================================================================
-//  COMPANION: PROMPTS & CONTENT
+//  COMPANION (Groq GPT-OSS)
 // ===========================================================================
 String personalityInstruction() {
   switch (personalityMode) {
@@ -3714,51 +3598,32 @@ String createCompanionPrompt(CompanionType type) {
   String prompt = "Kamu adalah Abot, AI Travel Companion di helm ojol. ";
   prompt += personalityInstruction();
   prompt += abotPromptHint();
-  prompt += " Konten harus cocok untuk customer yang sedang duduk di kendaraan. ";
-  prompt += "Jangan menggunakan markdown. Jangan menggunakan simbol bullet. ";
-  prompt += "Jangan menggunakan tanda ---. ";
-  prompt += "Jangan menggunakan emoji sama sekali, hanya huruf, angka, dan tanda baca biasa.";
-  prompt += "\n\n";
+  prompt += " Konten cocok untuk customer di kendaraan. ";
+  prompt += "Jangan pakai markdown, bullet, tanda ---, atau emoji.\n\n";
 
   if (type == COMPANION_QUIZ) {
-    prompt += "Buat SATU pertanyaan quiz singkat. Customer harus menjawab sendiri. ";
-    prompt += "JANGAN berikan jawaban. JANGAN memberikan pilihan A B C. ";
-    prompt += "Maksimal sekitar 100 karakter. ";
-    prompt += "Pertanyaannya harus menyenangkan dan mudah dipahami.";
+    prompt += "Buat SATU pertanyaan quiz singkat. JANGAN beri jawaban. "
+              "JANGAN beri pilihan A B C. Maks ~100 karakter.";
   } else if (type == COMPANION_TRIVIA) {
-    prompt += "Buat satu trivia menarik yang singkat. ";
-    prompt += "Tujuannya membuat customer tertarik membaca atau mendengarkan. ";
-    prompt += "Maksimal sekitar 180 karakter.";
+    prompt += "Buat satu trivia menarik singkat. Maks ~180 karakter.";
   } else if (type == COMPANION_HUMOR) {
-    prompt += "Buat satu humor ringan dan aman untuk customer. ";
-    prompt += "Jangan kasar. Jangan menghina kelompok tertentu. ";
-    prompt += "Maksimal sekitar 180 karakter.";
-  } else if (type == COMPANION_CHALLENGE) {
-    prompt += "Buat satu challenge ringan untuk customer. ";
-    prompt += "Customer harus melakukan atau menjawab sesuatu di dalam pikirannya atau melalui percakapan. ";
-    prompt += "Jangan membutuhkan alat tambahan. Maksimal sekitar 180 karakter.";
+    prompt += "Buat satu humor ringan, aman, tidak kasar. Maks ~180 karakter.";
   } else if (type == COMPANION_STORY) {
-    prompt += "Buat cerita pendek yang menarik untuk menemani perjalanan customer. ";
-    prompt += "Boleh detail dan lebih panjang dibanding mode lain. ";
-    prompt += "Buat alurnya menarik agar customer ingin terus mendengarkan sampai selesai. ";
-    prompt += "Maksimal sekitar 500 karakter.";
+    prompt += "Buat cerita pendek menarik. Maks ~500 karakter.";
   }
 
   if (previousCompanionText.length() > 0) {
-    prompt += "\n\nKonten sebelumnya adalah:\n";
-    String previous = previousCompanionText;
-    if (previous.length() > 350) previous = previous.substring(0, 350);
-    prompt += previous;
+    prompt += "\n\nKonten sebelumnya:\n";
+    String prev = previousCompanionText;
+    if (prev.length() > 350) prev = prev.substring(0, 350);
+    prompt += prev;
     prompt += "\n\nJangan mengulang konten sebelumnya.";
   }
-
   return prompt;
 }
 
 String fallbackCompanion(CompanionType type) {
-  static int quizIndex = 0, triviaIndex = 0, humorIndex = 0,
-             storyIndex = 0, challengeIndex = 0;
-
+  static int quizIndex = 0, triviaIndex = 0, humorIndex = 0, storyIndex = 0;
   if (type == COMPANION_QUIZ) {
     const char* bank[] = {
       "Apa warna lampu lalu lintas yang berarti berhenti?",
@@ -3770,36 +3635,27 @@ String fallbackCompanion(CompanionType type) {
   if (type == COMPANION_TRIVIA) {
     const char* bank[] = {
       "Tahukah kamu? Gurita memiliki tiga jantung.",
-      "Tahukah kamu? Madu dapat bertahan sangat lama jika disimpan dengan baik.",
-      "Tahukah kamu? Pisang secara botani termasuk buah beri."
+      "Tahukah kamu? Madu bisa bertahan sangat lama.",
+      "Tahukah kamu? Pisang termasuk buah beri."
     };
     return String(bank[triviaIndex++ % 3]);
   }
   if (type == COMPANION_HUMOR) {
     const char* bank[] = {
       "Customer: Mas, masih jauh? Driver: Tenang, yang jauh itu kenangan.",
-      "Kalau perjalanan terasa lama, mungkin karena kamu terlalu fokus melihat jam.",
-      "GPS bilang belok kanan. Hati bilang pulang. Kita ikuti GPS dulu."
+      "Kalau perjalanan terasa lama, mungkin kamu terlalu fokus lihat jam.",
+      "GPS bilang belok kanan. Hati bilang pulang. Ikuti GPS dulu."
     };
     return String(bank[humorIndex++ % 3]);
   }
-  if (type == COMPANION_CHALLENGE) {
-    const char* bank[] = {
-      "Challenge: coba sebutkan tiga makanan favoritmu tanpa berpikir lama.",
-      "Challenge: sebutkan lima kota di Indonesia dalam sepuluh detik.",
-      "Challenge: coba ingat nama guru yang paling kamu ingat dari sekolah."
-    };
-    return String(bank[challengeIndex++ % 3]);
-  }
   if (type == COMPANION_STORY) {
     const char* bank[] = {
-      "Bayangkan sebuah perjalanan kecil yang awalnya terasa biasa. Namun di tengah jalan, kamu menemukan sesuatu yang membuat perjalanan itu menjadi kenangan. Kadang perjalanan bukan hanya tentang tujuan, tetapi tentang cerita yang muncul di sepanjang jalan.",
-      "Ada seseorang yang setiap hari melewati jalan yang sama. Suatu hari ia memutuskan untuk memperhatikan hal-hal kecil yang selama ini tidak pernah ia lihat. Sejak saat itu, perjalanan yang sama terasa berbeda.",
-      "Seorang penumpang pernah berkata bahwa perjalanan terbaik bukan perjalanan yang paling cepat, tetapi perjalanan yang membuat kita pulang dengan cerita baru."
+      "Bayangkan perjalanan kecil yang awalnya biasa. Di tengah jalan kamu menemukan sesuatu yang membuatnya jadi kenangan.",
+      "Ada orang yang setiap hari lewat jalan sama. Suatu hari ia memperhatikan hal kecil. Sejak itu perjalanan terasa berbeda.",
+      "Seorang penumpang berkata, perjalanan terbaik bukan yang tercepat, tapi yang membuat kita pulang dengan cerita baru."
     };
     return String(bank[storyIndex++ % 3]);
   }
-
   return "Mari kita lanjutkan perjalanan.";
 }
 
@@ -3818,18 +3674,15 @@ void buildCompanionPages(const String& rawText) {
   companionPageCount  = 0;
   companionPage       = 0;
   companionTypedChars = 0;
-
   for (int p = 0; p < MAX_COMPANION_PAGES; p++) {
     for (int l = 0; l < MAX_COMPANION_LINES; l++) companionPages[p][l] = "";
   }
-
   String text = cleanCompanionText(rawText);
   text.replace("\n", " ");
   text.trim();
   if (text.length() == 0) text = "Maaf, coba lagi sebentar.";
 
   int pg = 0, ln = 0;
-
   auto pushLine = [&](const String& s) -> bool {
     if (pg >= MAX_COMPANION_PAGES) return false;
     companionPages[pg][ln] = s;
@@ -3841,17 +3694,13 @@ void buildCompanionPages(const String& rawText) {
   String cur = "";
   int pos = 0;
   bool full = false;
-
   while (pos < (int)text.length() && !full) {
     int sp = text.indexOf(' ', pos);
     String word;
-
     if (sp == -1) { word = text.substring(pos); pos = text.length(); }
     else          { word = text.substring(pos, sp); pos = sp + 1; }
-
     word.trim();
     if (word.length() == 0) continue;
-
     while ((int)word.length() > MAX_LINE_CHARS) {
       if (cur.length() > 0) {
         if (!pushLine(cur)) { full = true; break; }
@@ -3861,7 +3710,6 @@ void buildCompanionPages(const String& rawText) {
       word = word.substring(MAX_LINE_CHARS);
     }
     if (full) break;
-
     if (cur.length() == 0) {
       cur = word;
     } else if ((int)(cur.length() + 1 + word.length()) <= MAX_LINE_CHARS) {
@@ -3872,16 +3720,11 @@ void buildCompanionPages(const String& rawText) {
       cur = word;
     }
   }
-
   if (!full && cur.length() > 0) pushLine(cur);
-
   int count = (ln == 0) ? pg : pg + 1;
   if (count > MAX_COMPANION_PAGES) count = MAX_COMPANION_PAGES;
   if (count < 1) count = 1;
   companionPageCount = count;
-
-  Serial.print("[COMPANION] Pages: ");
-  Serial.println(companionPageCount);
 }
 
 int companionPageTotalChars() {
@@ -3905,12 +3748,9 @@ void startRunningText(const char* text) {
 
 bool updateRunningText(const char* text) {
   if (!isTextAnimating) return true;
-
   gfxFillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_WHITE);
   gfxTextScrolling(runTextX, 22, text, 2, COLOR_BLACK);
-
   runTextX -= 3;
-
   if (runTextX <= runTextTargetEndX) {
     isTextAnimating = false;
     return true;
@@ -3925,7 +3765,6 @@ void renderBitmapScene(const LyricScene& scene) {
 void renderSeventeenLyrics() {
   if (currentLyricScene >= totalLyricScenes) currentLyricScene = 0;
   const LyricScene& scene = lyricScenes[currentLyricScene];
-
   const bool newScene = (lyricSceneLoaded != currentLyricScene);
   if (newScene) {
     lyricSceneLoaded      = currentLyricScene;
@@ -3933,7 +3772,6 @@ void renderSeventeenLyrics() {
     isTextAnimating       = false;
     lyricHoldStartAt      = 0;
     lyricBitmapCacheValid = false;
-
     if (scene.bitmap == NULL) startRunningText(scene.text1);
     else                      lyricHoldStartAt = millis();
   }
@@ -3949,7 +3787,6 @@ void renderSeventeenLyrics() {
       memcpy(u8g2.getBufferPtr(), lyricBitmapFrameCache,
              sizeof(lyricBitmapFrameCache));
     }
-
     if (lyricHoldStartAt > 0 && millis() - lyricHoldStartAt >= 1500) {
       lyricHoldStartAt = 0;
       currentLyricScene++;
@@ -3981,12 +3818,11 @@ void renderSeventeenLyrics() {
 }
 
 // ===========================================================================
-//  NETWORK: JOB STARTERS
+//  NETWORK JOB STARTERS
 // ===========================================================================
 bool startNetworkJob(NetworkJob job, const char* taskName,
                      const String& prompt, uint32_t requestId) {
   if (networkIsBusy()) return false;
-
   networkJob          = job;
   networkRequestId    = requestId;
   networkPrompt       = prompt;
@@ -3999,7 +3835,6 @@ bool startNetworkJob(NetworkJob job, const char* taskName,
 
   BaseType_t result = xTaskCreatePinnedToCore(
     networkTask, taskName, 20000, NULL, 1, NULL, 0);
-
   if (result != pdPASS) {
     networkBusy = false;
     return false;
@@ -4007,74 +3842,44 @@ bool startNetworkJob(NetworkJob job, const char* taskName,
   return true;
 }
 
-bool nvidiaCooldownActive() {
-  if (lastNvidiaRequest == 0) return false;
-  return (millis() - lastNvidiaRequest) < NVIDIA_COOLDOWN;
+bool llmCooldownActive() {
+  if (lastLlmRequest == 0) return false;
+  return (millis() - lastLlmRequest) < LLM_COOLDOWN;
 }
 
 void startWeatherFetch() {
   if (weatherFetching || !wifiConnected || WiFi.status() != WL_CONNECTED) return;
-
   lastWeatherAttempt = millis();
   if (!startNetworkJob(NET_WEATHER, "weatherTask", "", millis())) return;
-
   weatherFetching = true;
-  Serial.println("[WEATHER] Fetch dimulai");
 }
 
 void startOSRM() {
-  if (networkIsBusy()) {
-    Serial.println("[OSRM] Network busy");
-    return;
-  }
-  if (activeOsrmUrl.length() == 0) {
-    Serial.println("[OSRM] URL kosong, skip");
-    return;
-  }
-  if (osrmFailCount >= OSRM_MAX_RETRIES) {
-    Serial.print("[OSRM] Sudah gagal ");
-    Serial.print(osrmFailCount);
-    Serial.println("x, berhenti retry");
-    return;
-  }
-
+  if (networkIsBusy()) return;
+  if (activeOsrmUrl.length() == 0) return;
+  if (osrmFailCount >= OSRM_MAX_RETRIES) return;
   lastOsrmAttempt = millis();
-
   if (!startNetworkJob(NET_OSRM, "osrmTask", activeOsrmUrl, millis())) {
     systemState = STATE_ERROR;
-    Serial.println("[OSRM] Task gagal");
     return;
   }
-
   systemState   = STATE_GETTING_ROUTE;
   routeRequested= true;
-
-  Serial.print("[OSRM] Request attempt #");
-  Serial.print(osrmFailCount + 1);
-  Serial.print(": ");
-  Serial.println(activeOsrmUrl);
 }
 
 String createNavigationPrompt() {
   String prompt = "Kamu adalah Abot, AI navigasi ojol. ";
-  prompt += "Berikan respon singkat dan natural untuk customer. Bahasa Indonesia. ";
+  prompt += "Berikan respon singkat natural untuk customer. Bahasa Indonesia. ";
   prompt += abotPromptHint();
-  prompt += " Jangan gunakan markdown. Jangan gunakan emoji. Jangan terlalu panjang. ";
-  prompt += "Buat customer merasa ditemani.";
-  prompt += "\n\n";
-
+  prompt += " Jangan pakai markdown/emoji. Buat customer merasa ditemani.\n\n";
   if (destName.length() > 0) {
-    prompt += "Tujuan: ";
-    prompt += destName;
-    prompt += "\n";
+    prompt += "Tujuan: "; prompt += destName; prompt += "\n";
   }
   prompt += "Jarak total: ";
   prompt += String(osrmTotalDistance / 1000.0, 2);
-  prompt += " km\n";
-  prompt += "Estimasi: ";
+  prompt += " km\nEstimasi: ";
   prompt += String(osrmTotalDuration / 60.0, 1);
   prompt += " menit\n";
-
   int nextStep = nextImportantStep();
   if (nextStep >= 0 && nextStep < navStepCount) {
     prompt += "Instruksi berikutnya: ";
@@ -4087,39 +3892,28 @@ String createNavigationPrompt() {
 void startNavigationAI() {
   if (!routeReady) return;
   if (networkIsBusy()) return;
-  if (nvidiaCooldownActive()) {
-    Serial.println("[NVIDIA] Navigation cooldown");
-    return;
-  }
+  if (llmCooldownActive()) return;
   if (navigationAIStarted) return;
-
   navigationAIStarted  = true;
   pendingNavigationAI  = false;
-  lastNvidiaRequest    = millis();
-
+  lastLlmRequest       = millis();
   if (!startNetworkJob(NET_NAVIGATION_AI, "navAiTask",
                        createNavigationPrompt(), millis())) {
     navigationAIStarted = false;
     return;
   }
-  Serial.println("[NVIDIA] Navigation request (background)");
 }
 
 // ===========================================================================
-//  COMPANION: FLOW
+//  COMPANION FLOW
 // ===========================================================================
 void startCompanion(CompanionType type) {
   companionNextMenuActive  = false;
   companionNextMenuPending = false;
   companionNextMenuDelayMs = 350;
-
-  Serial.print("[COMPANION] Starting ");
-  Serial.println(companionName(type));
-
   mapRequested      = false;
   hudActive         = false;
   hudSuppressUntil  = millis() + HUD_SUPPRESS_DURATION;
-
   currentCompanion  = type;
   companionActive   = false;
   companionGenerating = true;
@@ -4130,7 +3924,6 @@ void startCompanion(CompanionType type) {
     lyricTextReachedCenter = false;
     lyricHoldStartAt       = 0;
     lyricBitmapCacheValid  = false;
-
     currentLyricScene  = 0;
     companionActive    = true;
     companionGenerating= false;
@@ -4140,27 +3933,20 @@ void startCompanion(CompanionType type) {
 
   setEyeMood(EYE_DEFAULT);
   beginThinkingVisual();
-
   companionRequestCounter++;
   activeCompanionRequestId = companionRequestCounter;
-
   String prompt = createCompanionPrompt(type);
 
-  if (nvidiaCooldownActive() || networkIsBusy()) {
-    Serial.println("[NVIDIA] Cooldown/busy -> fallback");
+  if (llmCooldownActive() || networkIsBusy()) {
     finishCompanionGeneration(fallbackCompanion(type), type);
     return;
   }
-
-  lastNvidiaRequest = millis();
-
-  if (!startNetworkJob(NET_COMPANION, "nvidiaTask",
-                       prompt, activeCompanionRequestId)) {
-    Serial.println("[NVIDIA] Task gagal -> fallback");
+  lastLlmRequest = millis();
+  if (!startNetworkJob(NET_COMPANION, "llmTask", prompt,
+                       activeCompanionRequestId)) {
     finishCompanionGeneration(fallbackCompanion(type), type);
     return;
   }
-  Serial.println("[NVIDIA] Companion request started");
 }
 
 void finishCompanionGeneration(const String& rawText, CompanionType type) {
@@ -4169,27 +3955,15 @@ void finishCompanionGeneration(const String& rawText, CompanionType type) {
 
   if (type == COMPANION_QUIZ) {
     int answerPos = text.indexOf("Jawaban:");
-    if (answerPos >= 0) {
-      text = text.substring(0, answerPos);
-      text.trim();
-    }
+    if (answerPos >= 0) { text = text.substring(0, answerPos); text.trim(); }
     int answerPos2 = text.indexOf("jawabannya");
-    if (answerPos2 >= 0) {
-      text = text.substring(0, answerPos2);
-      text.trim();
-    }
-
+    if (answerPos2 >= 0) { text = text.substring(0, answerPos2); text.trim(); }
     currentQuizQuestion = text;
     quizWaitingAnswer   = true;
-
-    Serial.println("[QUIZ] Question:");
-    Serial.println(currentQuizQuestion);
-    Serial.println("[QUIZ] J = BENAR | K = SALAH | L = TIDAK TAHU");
   }
 
   previousCompanionText = text;
   buildCompanionPages(text);
-
   companionPage       = 0;
   companionTypedChars = 0;
   companionLastType   = millis();
@@ -4197,35 +3971,23 @@ void finishCompanionGeneration(const String& rawText, CompanionType type) {
   companionPlayback   = COMPANION_TYPING;
   companionActive     = true;
   companionGenerating = false;
-
   endThinkingVisual();
   systemState = STATE_READY;
 
   if (type == COMPANION_HUMOR || type == COMPANION_QUIZ ||
-      type == COMPANION_TRIVIA) {
-    setEyeMood(EYE_HAPPY);
-  } else {
-    setEyeMood(EYE_DEFAULT);
-  }
-
-  Serial.print("[COMPANION] Playback ");
-  Serial.println(companionName(type));
+      type == COMPANION_TRIVIA) setEyeMood(EYE_HAPPY);
+  else                        setEyeMood(EYE_DEFAULT);
 }
 
 void finishCompanion() {
-  Serial.println("[COMPANION] Finished");
   currentLyricScene = 0;
-
   companionActive     = false;
   companionGenerating = false;
   companionPlayback   = COMPANION_IDLE;
   currentCompanion    = COMPANION_NONE;
-
   setEyeMood(EYE_DEFAULT);
-
   hudActive        = false;
   hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
-
   roboEyes.blink();
   openCompanionNextMenu(companionNextMenuDelayMs);
 }
@@ -4236,46 +3998,33 @@ void openCompanionNextMenu(unsigned long delayMs) {
   companionNextMenuAt       = millis() + delayMs;
   companionNextMenuPageAt   = 0;
   companionNextMenuPage     = 0;
-
   hudActive        = false;
   hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
-
-  Serial.println("[COMPANION] Next activity menu scheduled");
 }
 
 void closeCompanionNextMenu() {
   companionNextMenuActive  = false;
   companionNextMenuPending = false;
   companionNextMenuPage    = 0;
-
   setEyeMood(EYE_DEFAULT);
   hudSuppressUntil   = millis() + HUD_SUPPRESS_DURATION;
   lastUserActivityMs = millis();
-
-  Serial.println("[COMPANION] Next activity menu closed");
 }
 
 void updateCompanionNextMenu() {
   if (!companionNextMenuPending) return;
-
   if (!companionNextMenuActive) {
     if (millis() < companionNextMenuAt) return;
-
     companionNextMenuActive   = true;
     companionNextMenuPage     = 0;
     companionNextMenuPageAt   = millis();
     companionNextMenuOpenedAt = millis();
-
-    Serial.println("[COMPANION] MENU: Q=QUIZ T=TRIVIA S=STORY D=LIRIK H=HUMOR X=SELESAI");
     return;
   }
-
   if (millis() - companionNextMenuOpenedAt >= COMPANION_NEXT_MENU_TIMEOUT) {
-    Serial.println("[COMPANION] Menu timeout");
     closeCompanionNextMenu();
     return;
   }
-
   if (millis() - companionNextMenuPageAt >= COMPANION_NEXT_MENU_PAGE_MS) {
     companionNextMenuPage   = (companionNextMenuPage + 1) % 2;
     companionNextMenuPageAt = millis();
@@ -4287,22 +4036,16 @@ void renderCompanion() {
     renderSeventeenLyrics();
     return;
   }
-
   beginFrame();
-
   String title = companionName(currentCompanion);
   int titleX = (128 - (int)title.length() * 6) / 2;
   if (titleX < 0) titleX = 0;
-
   gfxText(titleX, 0, title);
   gfxLine(10, 9, 117, 9);
-
   int remaining = companionTypedChars;
-
   for (int l = 0; l < MAX_COMPANION_LINES; l++) {
     String line = companionPages[companionPage][l];
     if (line.length() == 0) continue;
-
     String visible;
     if (remaining >= (int)line.length()) {
       visible = line;
@@ -4313,27 +4056,20 @@ void renderCompanion() {
     } else {
       visible = "";
     }
-
     gfxText(0, 12 + (l * 7), visible);
-
     if (visible.length() > 0 && remaining == 0 &&
         companionPlayback == COMPANION_TYPING) {
       int cursorX = visible.length() * 6;
-      if (cursorX < 126) {
-        gfxLine(cursorX, 12 + (l * 7), cursorX, 17 + (l * 7));
-      }
+      if (cursorX < 126) gfxLine(cursorX, 12 + (l * 7), cursorX, 17 + (l * 7));
     }
   }
-
   presentFrame();
 }
 
 void renderCompanionNextMenu() {
   beginFrame();
-
   drawCenteredText("MAU LANJUT?", 0, 1);
   gfxLine(12, 9, 115, 9);
-
   if (companionNextMenuPage == 0) {
     gfxText(5, 16, "Q  QUIZ LAGI");
     gfxText(5, 28, "T  TRIVIA");
@@ -4342,21 +4078,18 @@ void renderCompanionNextMenu() {
   } else {
     gfxText(5, 16, "H  HUMOR");
     gfxText(5, 28, "X  SELESAI");
-    gfxText(5, 40, "Pilih dengan suara");
-    gfxText(5, 52, "di versi AUDIO");
+    gfxText(5, 40, "Pilih dengan tombol");
+    gfxText(5, 52, "atau suara");
   }
-
   presentFrame();
 }
 
 void updateCompanion() {
   if (!companionActive) return;
   if (currentCompanion == COMPANION_CHALLENGE) return;
-
   if (companionPlayback == COMPANION_TYPING) {
     if (millis() - companionLastType >= TYPING_INTERVAL) {
       companionLastType = millis();
-
       if (companionTypedChars < companionPageTotalChars()) {
         companionTypedChars++;
       } else {
@@ -4367,7 +4100,6 @@ void updateCompanion() {
   } else if (companionPlayback == COMPANION_HOLD) {
     unsigned long holdTime = COMPANION_HOLD_DURATION;
     if (companionPage == companionPageCount - 1) holdTime = COMPANION_FINAL_HOLD;
-
     if (millis() - companionStateStart >= holdTime) {
       if (companionPage < companionPageCount - 1) {
         companionPage       = companionPage + 1;
@@ -4384,45 +4116,28 @@ void updateCompanion() {
 
 void handleQuizAnswer(char cmd) {
   cmd = toupper(cmd);
-
-  if (!quizWaitingAnswer) {
-    Serial.println("[QUIZ] Tidak ada quiz aktif.");
-    return;
-  }
-
+  if (!quizWaitingAnswer) return;
   switch (cmd) {
     case 'J':
-      Serial.println("[QUIZ] RESULT: BENAR");
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_LAUGH);
-      audioSfx(SFX_OK);
       companionNextMenuDelayMs = CHARACTER_REACTION_LAUGH_MS + 350;
       break;
-
     case 'K':
-      Serial.println("[QUIZ] RESULT: SALAH");
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_ANGRY);
-      audioSfx(SFX_BAD);
       companionNextMenuDelayMs = CHARACTER_REACTION_ANGRY_MS + 350;
       break;
-
     case 'L':
-      Serial.println("[QUIZ] RESULT: TIDAK TAHU");
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_CONFUSED);
-      audioSfx(SFX_UNKNOWN);
       companionNextMenuDelayMs = CHARACTER_REACTION_CONFUSED_MS + 350;
-      break;
-
-    default:
-      Serial.println("[QUIZ] Gunakan J/K/L.");
       break;
   }
 }
 
 // ===========================================================================
-//  NETWORK: WORKER TASK
+//  NETWORK WORKER
 // ===========================================================================
 void networkTask(void* parameter) {
   {
@@ -4434,124 +4149,80 @@ void networkTask(void* parameter) {
 
     if (job == NET_OSRM) {
       for (int attempt = 1; attempt <= 3; attempt++) {
-        Serial.printf("[OSRM] Attempt %d / 3\n", attempt);
-
         HTTPClient http;
         http.setTimeout(12000);
         http.useHTTP10(true);
-
-        if (!http.begin(prompt)) {
-          Serial.println("[OSRM] Begin failed");
-          continue;
-        }
-
+        if (!http.begin(prompt)) continue;
         httpCode = http.GET();
-        Serial.printf("[OSRM] HTTP: %d\n", httpCode);
-
         if (httpCode == 200) {
-          int len = http.getSize();
-          Serial.printf("[OSRM] Response size (header): %d bytes\n", len);
-
           response = http.getString();
           success  = response.length() > 0;
-
-          if (success) {
-            Serial.printf("[OSRM] Received %d bytes\n", response.length());
-            http.end();
-            break;
-          }
+          if (success) { http.end(); break; }
         }
-
         http.end();
         delay(500);
       }
     } else if (job == NET_WEATHER) {
       WiFiClientSecure client;
       client.setInsecure();
-
       HTTPClient http;
       http.setTimeout(8000);
-
       if (http.begin(client, WEATHER_URL)) {
         httpCode = http.GET();
-        Serial.printf("[WEATHER] HTTP: %d\n", httpCode);
-
         if (httpCode == 200) {
           response = http.getString();
           success  = response.length() > 0;
         }
         http.end();
-      } else {
-        Serial.println("[WEATHER] HTTPS begin failed");
       }
     } else if (job == NET_NAVIGATION_AI || job == NET_COMPANION) {
       WiFiClientSecure client;
       client.setInsecure();
-
       HTTPClient http;
-      http.setTimeout(20000);
+      http.setTimeout(CHAT_TIMEOUT_MS);
 
-      if (http.begin(client, NVIDIA_URL)) {
+      if (http.begin(client, GROQ_CHAT_URL)) {
         http.addHeader("Content-Type", "application/json");
         http.addHeader("Accept", "application/json");
-
         String authorization = "Bearer ";
-        authorization += NVIDIA_API_KEY;
+        authorization += GROQ_API_KEY_STR;
         http.addHeader("Authorization", authorization);
 
         JsonDocument requestDoc;
-        requestDoc["model"]            = NVIDIA_MODEL;
-        requestDoc["temperature"]      = (job == NET_COMPANION) ? 0.75 : 0.2;
-        requestDoc["top_p"]            = 0.95;
-        requestDoc["max_tokens"]       = (job == NET_COMPANION) ? 140 : 80;
-        requestDoc["stream"]           = false;
-        requestDoc["reasoning_effort"] = "none";
+        requestDoc["model"]      = GROQ_CHAT_MODEL;
+        requestDoc["temperature"]= (job == NET_COMPANION) ? 0.8 : 0.3;
+        requestDoc["max_tokens"] = (job == NET_COMPANION) ? 160 : 100;
 
         JsonArray messages = requestDoc["messages"].to<JsonArray>();
-
         JsonObject systemMessage = messages.add<JsonObject>();
         systemMessage["role"]    = "system";
         systemMessage["content"] =
           (job == NET_COMPANION)
-            ? "Kamu adalah Abot, AI Travel Companion yang menemani customer selama perjalanan. Jangan menggunakan emoji."
-            : "Kamu adalah Abot, AI navigasi kendaraan yang membantu customer. Jangan menggunakan emoji.";
-
+            ? "Kamu Abot, AI Travel Companion. Jangan pakai emoji."
+            : "Kamu Abot, AI navigasi. Jangan pakai emoji.";
         JsonObject userMessage = messages.add<JsonObject>();
         userMessage["role"]    = "user";
         userMessage["content"] = prompt;
 
         String payload;
         serializeJson(requestDoc, payload);
-
-        Serial.println("[NVIDIA] Sending request...");
         httpCode = http.POST(payload);
-        Serial.printf("[NVIDIA] HTTP: %d\n", httpCode);
-
         if (httpCode == 200) {
           String raw = http.getString();
-
           JsonDocument filter;
           filter["choices"][0]["message"]["content"] = true;
-
           JsonDocument responseDoc;
           DeserializationError error =
             deserializeJson(responseDoc, raw, DeserializationOption::Filter(filter));
-
           if (!error) {
             JsonVariant content = responseDoc["choices"][0]["message"]["content"];
             if (!content.isNull()) {
               response = content.as<String>();
               success  = response.length() > 0;
-            } else {
-              Serial.println("[NVIDIA] Content null");
             }
-          } else {
-            Serial.println("[NVIDIA] JSON parse failed");
           }
         }
         http.end();
-      } else {
-        Serial.println("[NVIDIA] HTTPS begin failed");
       }
     }
 
@@ -4561,46 +4232,29 @@ void networkTask(void* parameter) {
     networkDone      = true;
     networkBusy      = false;
   }
-
   vTaskDelete(NULL);
 }
 
 // ===========================================================================
-//  NETWORK: RESULT PROCESSING
+//  NETWORK RESULT PROCESSING
 // ===========================================================================
 void processNetworkDone() {
   if (!networkDone) return;
-
   NetworkJob completedJob = networkJob;
   bool       success      = networkSuccess;
   String     response     = networkResponse;
   int        httpCode     = networkHttpCode;
   uint32_t   requestId    = networkRequestId;
-
   networkDone = false;
 
   if (completedJob == NET_WEATHER) {
     weatherFetching = false;
-
-    if (!success || httpCode != 200) {
-      abotLog("WARN", "Cuaca gagal, coba lagi nanti");
-      return;
-    }
-
+    if (!success || httpCode != 200) return;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, response);
-    if (err) {
-      abotLog("ERR", "Cuaca JSON error: %s", err.c_str());
-      return;
-    }
-
+    if (deserializeJson(doc, response)) return;
     JsonObject current = doc["current"];
     JsonObject daily   = doc["daily"];
-    if (current.isNull()) {
-      abotLog("ERR", "Data cuaca current kosong");
-      return;
-    }
-
+    if (current.isNull()) return;
     weatherData.temperature = current["temperature_2m"] | 0.0f;
     weatherData.weatherCode = current["weather_code"]   | -1;
     weatherData.condition   = weatherCodeToText(weatherData.weatherCode);
@@ -4608,75 +4262,33 @@ void processNetworkDone() {
     weatherData.tempMin     = daily["temperature_2m_min"][0] | weatherData.temperature;
     weatherData.valid       = true;
     weatherData.updatedAt   = millis();
-
-    abotLog("INFO", "Cuaca: %.1f C / %s",
-            weatherData.temperature, weatherData.condition.c_str());
     return;
   }
 
   if (completedJob == NET_OSRM) {
     routeRequested = false;
-
-    if (routeFromLink) {
-      abotLog("INFO", "OSRM dibuang, rute dari HP sudah aktif");
-      return;
-    }
-
+    if (routeFromLink) return;
     if (!success || httpCode != 200) {
-      abotLog("ERR", "OSRM FAILED (http error)");
       systemState = STATE_ERROR;
       osrmFailCount++;
-      if (osrmFailCount >= OSRM_MAX_RETRIES) {
-        osrmGaveUpAt = millis();
-        abotLog("ERR", "OSRM Max retries reached, giving up");
-      }
       return;
     }
-
-    abotLog("INFO", "OSRM Parsing %d bytes JSON", response.length());
-
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, response);
+    if (deserializeJson(doc, response)) { osrmFailCount++; return; }
     response = "";
-
-    if (err) {
-      abotLog("ERR", "OSRM JSON parse error: %s", err.c_str());
-      systemState = STATE_ERROR;
-      osrmFailCount++;
-      if (osrmFailCount >= OSRM_MAX_RETRIES) {
-        osrmGaveUpAt = millis();
-        abotLog("ERR", "OSRM Max retries reached, giving up");
-      }
-      return;
-    }
-
     JsonObject route = doc["routes"][0];
-    if (route.isNull()) {
-      abotLog("ERR", "OSRM Tidak ada rute");
-      systemState = STATE_ERROR;
-      osrmFailCount++;
-      if (osrmFailCount >= OSRM_MAX_RETRIES) {
-        osrmGaveUpAt = millis();
-        abotLog("ERR", "OSRM Max retries reached, giving up");
-      }
-      return;
-    }
-
+    if (route.isNull()) { osrmFailCount++; return; }
     osrmTotalDistance = route["distance"].as<float>();
     osrmTotalDuration = route["duration"].as<float>();
-
     const char* polylineStr = route["geometry"];
     routePointCount = 0;
-
     if (polylineStr != nullptr && strlen(polylineStr) > 0) {
       String encoded = String(polylineStr);
       routePointCount = decodePolyline(encoded, routePoints, MAX_ROUTE_POINTS);
     }
-
     if (routePointCount >= 2) {
-      routeGeometryDistance      = 0;
+      routeGeometryDistance = 0;
       routeCumulativeDistance[0] = 0;
-
       for (int i = 1; i < routePointCount; i++) {
         double lat1 = routePoints[i - 1].lat;
         double lon1 = routePoints[i - 1].lon;
@@ -4688,45 +4300,31 @@ void processNetworkDone() {
         routeCumulativeDistance[i] = routeGeometryDistance;
       }
     }
-
     navStepCount = 0;
     JsonArray legs = route["legs"];
-
     for (JsonObject leg : legs) {
       JsonArray steps = leg["steps"];
-
       for (JsonObject step : steps) {
         if (navStepCount >= MAX_NAV_STEPS) break;
         NavigationStep& nav = navSteps[navStepCount];
-
         nav.distance = step["distance"].as<float>();
         nav.type     = step["maneuver"]["type"].as<String>();
         nav.modifier = step["maneuver"]["modifier"].as<String>();
         nav.road     = step["name"].as<String>();
-
-        String type     = nav.type;
-        String modifier = nav.modifier;
+        String type = nav.type, modifier = nav.modifier;
         type.toLowerCase();
         modifier.toLowerCase();
-
         nav.instruction = "LANJUT";
         if (type.indexOf("roundabout") >= 0)        nav.instruction = "PUTARAN";
         else if (modifier.indexOf("uturn") >= 0)    nav.instruction = "PUTAR BALIK";
         else if (modifier.indexOf("left")  >= 0)    nav.instruction = "BELOK KIRI";
         else if (modifier.indexOf("right") >= 0)    nav.instruction = "BELOK KANAN";
-        else if (type == "merge")                   nav.instruction = "GABUNG";
-        else if (type == "fork")                    nav.instruction = "PILIH JALUR";
-
-        nav.important =
-          (type == "turn" || type == "merge" || type == "fork" ||
-           type == "roundabout" || type == "on ramp" || type == "off ramp");
-
+        nav.important = (type == "turn" || type == "merge" || type == "fork" ||
+                         type == "roundabout" || type == "on ramp" || type == "off ramp");
         double maneuverLon = step["maneuver"]["location"][0].as<double>();
         double maneuverLat = step["maneuver"]["location"][1].as<double>();
-
         float bestDistance = 999999.0;
-        int   bestIndex    = 0;
-
+        int bestIndex = 0;
         if (routePointCount > 0) {
           for (int i = 0; i < routePointCount; i++) {
             double dx = (routePoints[i].lon - maneuverLon) * 111320.0;
@@ -4736,27 +4334,11 @@ void processNetworkDone() {
           }
           nav.routeIndex    = bestIndex;
           nav.routeDistance = routeCumulativeDistance[bestIndex];
-        } else {
-          nav.routeIndex = 0;
-          float cumul = 0;
-          for (int j = 0; j < navStepCount; j++) cumul += navSteps[j].distance;
-          nav.routeDistance = cumul;
         }
-
         navStepCount++;
       }
     }
-
     simulatedRouteDistance = 0;
-    int firstImportant = -1;
-    for (int i = 0; i < navStepCount; i++) {
-      if (isImportantStep(navSteps[i])) { firstImportant = i; break; }
-    }
-    if (firstImportant >= 0 && routePointCount > 0) {
-      simulatedRouteDistance = navSteps[firstImportant].routeDistance - 250.0;
-      if (simulatedRouteDistance < 0) simulatedRouteDistance = 0;
-    }
-
     simulatedRouteIndex = 0;
     gpsLastMs           = 0;
     activeStep          = 0;
@@ -4764,43 +4346,29 @@ void processNetworkDone() {
     hudCompletedStep    = -1;
     hudActive           = false;
     hudShownAt          = 0;
-
     routeReady    = true;
     tripActive    = true;
     tripArrived   = false;
     arrivalActive = false;
     systemState   = STATE_READY;
-
     osrmFailCount = 0;
     osrmGaveUpAt  = 0;
-
-    abotLog("INFO", "OSRM ROUTE READY OK");
-
-    if (destinationAskActive) {
-      abotLog("INFO", "Route siap, menunggu konfirmasi tujuan");
-    } else if (!initialMapShown && startupOnboardingCompleted &&
-               !startupOnboardingActive) {
+    if (!initialMapShown && startupOnboardingCompleted &&
+        !startupOnboardingActive) {
       initialMapShown = true;
-      abotLog("INFO", "Initial MAP");
       startMapDisplay();
       pendingNavigationAI = NAV_AI_ON_ROUTE;
     } else if (tripMapPending && !tripIntroActive) {
       tripMapPending = false;
-      abotLog("INFO", "New Trip MAP");
       startMapDisplay();
       pendingNavigationAI = NAV_AI_ON_ROUTE;
     }
-
     return;
   }
 
   if (completedJob == NET_COMPANION) {
-    if (requestId != activeCompanionRequestId) {
-      Serial.println("[COMPANION] Stale response ignored");
-      return;
-    }
+    if (requestId != activeCompanionRequestId) return;
     if (!success || httpCode != 200 || response.length() == 0) {
-      abotLog("WARN", "NVIDIA Companion failed -> fallback");
       finishCompanionGeneration(fallbackCompanion(currentCompanion),
                                 currentCompanion);
       return;
@@ -4810,12 +4378,6 @@ void processNetworkDone() {
   }
 
   if (completedJob == NET_NAVIGATION_AI) {
-    if (success && response.length() > 0) {
-      abotLog("INFO", "NVIDIA NAV RESPONSE diterima");
-    } else {
-      abotLog("WARN", "Navigation response failed");
-    }
-
     if (!companionGenerating) {
       endThinkingVisual();
       if (systemState == STATE_THINKING) systemState = STATE_READY;
@@ -4825,28 +4387,23 @@ void processNetworkDone() {
 }
 
 // ===========================================================================
-//  GPS SIMULATION + DEAD-RECKONING
+//  GPS SIMULATION
 // ===========================================================================
 void updateGPSSimulation() {
   if (!routeReady || routePointCount < 2) return;
-
   if (routeFromLink) {
     bool gpsFresh = (lastLinkGpsAt != 0) &&
                     (millis() - lastLinkGpsAt <= LINK_GPS_FRESH_MS);
     if (gpsFresh) { deadReckonStep(); return; }
     if (!SIM_WHEN_NO_GPS) return;
   }
-
   unsigned long now = millis();
   if (gpsLastMs == 0) { gpsLastMs = now; return; }
-
   float deltaSeconds = (now - gpsLastMs) / 1000.0;
   gpsLastMs = now;
   if (deltaSeconds > 1.0) deltaSeconds = 1.0;
-
   speedMps = GPS_SPEED_MPS;
   simulatedRouteDistance += GPS_SPEED_MPS * deltaSeconds;
-
   if (simulatedRouteDistance >= routeGeometryDistance) {
     simulatedRouteDistance = routeGeometryDistance;
     if (tripActive && !tripArrived && !arrivalActive) {
@@ -4854,7 +4411,6 @@ void updateGPSSimulation() {
       return;
     }
   }
-
   syncRouteProgress();
 }
 
@@ -4871,21 +4427,19 @@ float hudTriggerDistance() {
 void updateHUDLatch() {
   if (conversationActive || companionActive || companionGenerating ||
       companionNextMenuActive || companionNextMenuPending ||
-      tripIntroActive || infoModeActive || destinationAskActive) {
+      tripIntroActive || infoModeActive || destinationAskActive ||
+      voicePipelineActive || ttsActive) {
     hudActive = false;
     return;
   }
-
   if (millis() < hudSuppressUntil) { hudActive = false; return; }
   if (navStepCount == 0)           { hudActive = false; return; }
 
   if (hudLockedStep >= 0) {
     float turnDist = navSteps[hudLockedStep].routeDistance - simulatedRouteDistance;
-
     bool passed  = (turnDist <= -HUD_PASSED_MARGIN_M);
     bool tooLong = (millis() - hudShownAt > HUD_MAX_SHOW_MS) &&
                    (turnDist > 25.0f) && (speedMps > 8.0f);
-
     if (passed || tooLong) {
       if (passed) {
         char buf[48];
@@ -4908,20 +4462,12 @@ void updateHUDLatch() {
   float trigger       = hudTriggerDistance();
   int   nextImportant = -1;
   float nextDist      = 0;
-
   for (int i = 0; i < navStepCount; i++) {
     if (i <= hudCompletedStep) continue;
     if (!isImportantStep(navSteps[i])) continue;
-
     float d = navSteps[i].routeDistance - simulatedRouteDistance;
-
-    if (d <= -HUD_PASSED_MARGIN_M) {
-      hudCompletedStep = i;
-      continue;
-    }
-
+    if (d <= -HUD_PASSED_MARGIN_M) { hudCompletedStep = i; continue; }
     if (mapRequested && d > HUD_PREEMPT_MAP_M) break;
-
     if (d <= trigger) { nextImportant = i; nextDist = d; }
     break;
   }
@@ -4930,12 +4476,10 @@ void updateHUDLatch() {
     hudLockedStep = nextImportant;
     hudShownAt    = millis();
     hudActive     = true;
-
     char buf[64];
     snprintf(buf, sizeof(buf), "{\"t\":\"hud\",\"i\":%d,\"m\":%.0f}",
              nextImportant, nextDist);
     linkSend(String(buf));
-    audioSfx(SFX_HUD);
   } else {
     hudActive = false;
   }
@@ -4944,9 +4488,62 @@ void updateHUDLatch() {
 // ===========================================================================
 //  DISPLAY PRIORITY
 // ===========================================================================
+int lastVoiceTextY = -1;
+
+// Fungsi baru untuk merender teks balasan AI di layar OLED (Support Scroll)
+void renderVoiceText() {
+  beginFrame();
+  drawCenteredText("ABOT:", 0, 1);
+  gfxLine(12, 10, 115, 10);
+
+  String text = currentVoiceReply;
+  int maxChars = 21; 
+  int lineHeight = 9;
+  int maxLinesVisible = 5; 
+  int visibleHeight = maxLinesVisible * lineHeight;
+
+  int totalLines = (text.length() + maxChars - 1) / maxChars;
+  if (totalLines <= maxLinesVisible) {
+     if (lastVoiceTextY != 0) {
+        lastVoiceTextY = 0; // Reset scroll if new short text
+     }
+  }
+
+  int scrollY = 0;
+  if (totalLines > maxLinesVisible) {
+      int maxScroll = (totalLines - maxLinesVisible) * lineHeight;
+      scrollY = map(millis() % (maxScroll * 50), 0, (maxScroll * 50), 0, maxScroll);
+  }
+
+  int pos = 0;
+  int lineIndex = 0;
+  int yPos = 12;
+  
+  while (pos < (int)text.length() && lineIndex < totalLines) {
+    int spacePos = text.indexOf(' ', pos + maxChars);
+    if (spacePos == -1 || spacePos - pos > maxChars + 5) {
+      spacePos = pos + maxChars;
+    }
+    if (spacePos > (int)text.length()) spacePos = text.length();
+
+    String line = text.substring(pos, spacePos);
+    line.trim();
+
+    int drawY = yPos - scrollY;
+    if (drawY > 8 && drawY < 64) { // Hanya gambar jika masuk area layar
+      gfxText(0, drawY, line);
+    }
+
+    pos = spacePos;
+    if (pos < (int)text.length() && text[pos] == ' ') pos++;
+    lineIndex++;
+    yPos += lineHeight;
+  }
+  presentFrame();
+}
+
 void updateDisplay() {
   if (otaActive) return;
-
   if (listeningActive)                        { renderListening(); return; }
   if (companionActive)                        { renderCompanion(); return; }
   if (companionNextMenuActive)                { renderCompanionNextMenu(); return; }
@@ -4956,29 +4553,34 @@ void updateDisplay() {
   if (infoModeActive)                         { renderInfoMode(); return; }
   if (bootTransitionActive)                   { renderBootTransition(); return; }
   if (!introductionFinished)                  { renderIntroduction(); return; }
-  if (companionGenerating || systemState == STATE_THINKING) { renderThinking(); return; }
+  
+  // TAMPILKAN TEKS JAWABAN SAAT TTS BERBUNYI
+  if (ttsActive && currentVoiceReply.length() > 0) { 
+    renderVoiceText(); 
+    return; 
+  }
+
+  if (companionGenerating || systemState == STATE_THINKING ||
+      voicePipelineActive)                    { renderThinking(); return; }
   if (conversationActive)                     { renderEyes(); return; }
   if (arrivalActive)                          { renderArrival(); return; }
   if (hudActive)                              { renderHUD(); return; }
   if (mapRequested)                           { renderMap(); return; }
   if (sleepModeActive)                        { renderSleep(); return; }
-
   renderEyes();
 }
 
 // ===========================================================================
-//  DISPLAY TASK (CORE 1)
+//  DISPLAY TASK
 // ===========================================================================
 void displayRenderTask(void* pvParameters) {
   const TickType_t period = pdMS_TO_TICKS(16);
-
   for (;;) {
     const TickType_t frameStart = xTaskGetTickCount();
     {
       StateLock lock;
       updateDisplay();
     }
-
     const TickType_t elapsed = xTaskGetTickCount() - frameStart;
     vTaskDelay(elapsed >= period ? 1 : period - elapsed);
   }
@@ -4991,44 +4593,23 @@ void printHelp() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("COMMANDS:");
-  Serial.println("TOMBOL TALK   : tahan=bicara (STT), tekan=jam/cuaca");
-  Serial.println("TOMBOL ACTION : tekan=lirik Seventeen, tahan=companion acak");
-  Serial.println("M = MAP");
-  Serial.println("U = CARA MENGGUNAKAN (manual)");
-  Serial.println("G = TRIP BARU");
+  Serial.println("TOMBOL TALK   : tahan=bicara (STT+LLM+TTS), tekan=jam/cuaca");
+  Serial.println("TOMBOL ACTION : tekan=lirik, tahan=companion acak");
+  Serial.println("M = MAP | U = CARA MENGGUNAKAN | G = TRIP BARU");
   Serial.println("C = CONVERSATION ON / X = OFF");
-  Serial.println("Q = QUIZ | T = TRIVIA | H = HUMOR");
-  Serial.println("S = STORY | D = LIRIK SEVENTEEN");
-  Serial.println("J = QUIZ BENAR | K = SALAH | L = TIDAK TAHU");
-  Serial.println("A = NAVIGATION AI");
-  Serial.println("1-6 = preset mata | W = WINK");
-  Serial.println("P = PLAYFUL | N = NORMAL | E = EXCITED");
-  Serial.println("B = THINKING DEMO");
-  Serial.println("R = RESET GPS");
-  Serial.println("V = REKAM SUARA ON/OFF (STT Groq Whisper aktif, TTS belum)");
-  Serial.println("+ / - = VOLUME NAIK / TURUN | Z = MUTE | Y = TES BUNYI");
-  Serial.println("(Serial Monitor: set line ending ke Newline)");
-  Serial.println();
-  Serial.println("LINK PROTOCOL (JSON, dari HP):");
-  Serial.println("{\"t\":\"auth\",\"token\":\"abot-secret-2025\"}");
-  Serial.println("{\"t\":\"route\",\"dist\":5230,\"dur\":780,\"coords\":[[lon,lat],...],\"steps\":[{\"instr\":\"BELOK KIRI\",\"road\":\"Jl. Sudirman\",\"dist\":200,\"idx\":1,\"routeDist\":150,\"imp\":true}]}");
-  Serial.println("{\"t\":\"gps\",\"progress\":150}");
-  Serial.println("{\"t\":\"gps\",\"lat\":-6.17,\"lon\":106.82}");
-  Serial.println("{\"t\":\"trip_start\"}");
-  Serial.println("{\"t\":\"trip_end\"}");
-  Serial.println("{\"t\":\"reset\"}");
-  Serial.println("{\"t\":\"ping\"}");
-  Serial.println("{\"t\":\"ota\",\"url\":\"http://...\"}");
+  Serial.println("Q = QUIZ | T = TRIVIA | H = HUMOR | S = STORY");
+  Serial.println("D = LIRIK SEVENTEEN | J/K/L = quiz answer");
+  Serial.println("A = NAVIGATION AI | B = THINKING DEMO");
+  Serial.println("1-6 = preset mata | W = WINK | P/N/E = personality");
+  Serial.println("R = RESET GPS | V = REKAM SUARA");
+  Serial.println("+ / - = VOLUME | Z = MUTE");
+  Serial.println("SUARA : peta, jam berapa, cuaca, lirik, humor, trivia, kuis,");
+  Serial.println("        volume naik/turun, diam");
   Serial.println("========================================");
-  Serial.println();
 }
 
 void handleCommand(char cmd) {
   cmd = toupper(cmd);
-
-  Serial.print("[CMD] ");
-  Serial.println(cmd);
-
   if (companionNextMenuActive) {
     if (cmd == 'Q' || cmd == 'T' || cmd == 'S' || cmd == 'D' || cmd == 'H') {
       closeCompanionNextMenu();
@@ -5041,18 +4622,9 @@ void handleCommand(char cmd) {
     }
     if (cmd == 'X') { closeCompanionNextMenu(); return; }
   }
-
   if (cmd == 'J' || cmd == 'K' || cmd == 'L') { handleQuizAnswer(cmd); return; }
-
   if (cmd == 'G') { startNewTrip(); return; }
-
-  if (cmd == 'U') {
-    markUserActivity();
-    startupOnboardingManual = true;
-    startStartupOnboarding();
-    return;
-  }
-
+  if (cmd == 'U') { markUserActivity(); startupOnboardingManual = true; startStartupOnboarding(); return; }
   if (cmd == 'M') {
     if (destinationAskActive) return;
     companionActive          = false;
@@ -5061,10 +4633,8 @@ void handleCommand(char cmd) {
     hudActive                = false;
     cancelThinking();
     startMapDisplay();
-    Serial.println("[DISPLAY] MAP requested");
     return;
   }
-
   if (cmd == 'C') {
     if (destinationAskActive) return;
     conversationActive       = true;
@@ -5076,24 +4646,19 @@ void handleCommand(char cmd) {
     cancelThinking();
     hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
     setEyeMood(EYE_HAPPY);
-    Serial.println("[CONVERSATION] ON");
     return;
   }
-
   if (cmd == 'X') {
     conversationActive = false;
     hudSuppressUntil   = millis() + HUD_SUPPRESS_DURATION;
     setEyeMood(EYE_DEFAULT);
-    Serial.println("[CONVERSATION] OFF");
     return;
   }
-
   if (cmd == 'Q') { startCompanion(COMPANION_QUIZ);      return; }
   if (cmd == 'T') { startCompanion(COMPANION_TRIVIA);    return; }
   if (cmd == 'H') { startCompanion(COMPANION_HUMOR);     return; }
   if (cmd == 'S') { startCompanion(COMPANION_STORY);     return; }
   if (cmd == 'D') { startCompanion(COMPANION_CHALLENGE); return; }
-
   if (cmd >= '1' && cmd <= '6') {
     abotHoldUntil = millis() + 8000;
     if      (cmd == '1') setEyeMood(EYE_DEFAULT);
@@ -5104,20 +4669,16 @@ void handleCommand(char cmd) {
     else if (cmd == '6') { setEyeMood(EYE_DEFAULT); roboEyes.anim_confused(); }
     return;
   }
-
   if (cmd == 'W') {
     abotHoldUntil = millis() + 8000;
     setEyeMood(EYE_DEFAULT);
     roboEyes.setPosition(DEFAULT);
     triggerNaturalWink();
-    Serial.println("[ROBOEYES] MANUAL WINK");
     return;
   }
-
-  if (cmd == 'P') { personalityMode = PERSONALITY_PLAYFUL; Serial.println("[PERSONALITY] PLAYFUL"); return; }
-  if (cmd == 'N') { personalityMode = PERSONALITY_NORMAL;  Serial.println("[PERSONALITY] NORMAL");  return; }
-  if (cmd == 'E') { personalityMode = PERSONALITY_EXCITED; Serial.println("[PERSONALITY] EXCITED"); return; }
-
+  if (cmd == 'P') { personalityMode = PERSONALITY_PLAYFUL; return; }
+  if (cmd == 'N') { personalityMode = PERSONALITY_NORMAL;  return; }
+  if (cmd == 'E') { personalityMode = PERSONALITY_EXCITED; return; }
   if (cmd == 'B') {
     thinkingDemoUntil = millis() + 3000;
     systemState       = STATE_THINKING;
@@ -5125,17 +4686,11 @@ void handleCommand(char cmd) {
     beginThinkingVisual();
     return;
   }
-
-  if (cmd == 'A') {
-    navigationAIStarted = false;
-    startNavigationAI();
-    return;
-  }
-
+  if (cmd == 'A') { navigationAIStarted = false; startNavigationAI(); return; }
   if (cmd == 'R') {
-    arrivalActive          = false;
-    tripArrived            = false;
-    tripActive             = true;
+    arrivalActive = false;
+    tripArrived   = false;
+    tripActive    = true;
     simulatedRouteDistance = 0;
     simulatedRouteIndex    = 0;
     gpsLastMs              = 0;
@@ -5146,21 +4701,16 @@ void handleCommand(char cmd) {
     hudShownAt             = 0;
     speedLastAt            = 0;
     drLastMs               = 0;
-    Serial.println("[GPS] RESET");
     return;
   }
-
   if (cmd == '+') { audioVolumeStep(+1); return; }
   if (cmd == '-') { audioVolumeStep(-1); return; }
   if (cmd == 'Z') { audioToggleMute();   return; }
-  if (cmd == 'Y') { audioSfx(SFX_TEST);  return; }
-
   if (cmd == 'V') {
     if (listeningActive) stopListening();
     else                 startListening();
     return;
   }
-
   if (cmd == '?') { printHelp(); return; }
 }
 
@@ -5176,8 +4726,7 @@ void oledProbeAddress() {
       return;
     }
   }
-  Serial.println("[OLED] PERINGATAN: tidak ada perangkat I2C di 0x3C/0x3D. "
-                 "Cek SDA=GPIO8, SCL=GPIO9, VCC, GND.");
+  Serial.println("[OLED] PERINGATAN: tidak ada I2C di 0x3C/0x3D.");
   Wire.end();
 }
 
@@ -5197,13 +4746,11 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("       OJOL ASSISTEN (ABOT) V" FW_VERSION);
-  Serial.println("  LINK-BASED: HP driver kirim rute+GPS");
-  Serial.println("  AUDIO: rekam + STT Groq Whisper");
+  Serial.println("  VOICE AI: STT Groq + LLM Groq + TTS Google");
   Serial.println("========================================");
 
   pinMode(BUTTON_TALK,   INPUT_PULLUP);
   pinMode(BUTTON_ACTION, INPUT_PULLUP);
-  Serial.println("[BUTTON] TALK GPIO10 / ACTION GPIO11");
 
   oledProbeAddress();
   u8g2.setBusClock(OLED_I2C_CLOCK_HZ);
@@ -5224,7 +4771,6 @@ void setup() {
   Serial.println("[ROBOEYES] OK");
 
   audioBegin();
-
   linkBegin();
   mqttBegin();
 
@@ -5237,10 +4783,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     renderWifiConnecting();
     delay(250);
-    if (millis() - wifiStart > 20000) {
-      Serial.println("[WIFI] Timeout (dicoba lagi otomatis di loop)");
-      break;
-    }
+    if (millis() - wifiStart > 20000) break;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -5248,35 +4791,26 @@ void setup() {
     Serial.println("[WIFI] Connected!");
     Serial.print("[WIFI] IP: ");
     Serial.println(WiFi.localIP());
-
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
     Serial.println("[NTP] WIB UTC+7 sync requested");
-
-    // Beri WiFi stack waktu "napas" sebelum spawn task besar
     delay(500);
-
-    // Spawn voiceTask sekarang, setelah WiFi heap internal stabil
-    BaseType_t r = xTaskCreatePinnedToCore(voiceTask, "VoiceTask", 12288,
-                                            NULL, 3, &voiceTaskHandle, 0);
-    if (r != pdPASS) {
-      Serial.println("[VOICE] FAIL: voiceTask spawn — STT tidak aktif");
-      voiceTaskHandle = NULL;
-    } else {
-      Serial.println("[VOICE] voiceTask started (STT Groq Whisper)");
-    }
   } else {
     wifiConnected = false;
-    Serial.println("[VOICE] voiceTask tidak di-spawn (WiFi offline)");
+    Serial.println("[WIFI] Offline saat boot, akan reconnect otomatis");
+  }
+
+  BaseType_t r = xTaskCreatePinnedToCore(voiceTask, "VoiceTask", 16384,
+                                          NULL, 3, &voiceTaskHandle, 0);
+  if (r != pdPASS) {
+    Serial.println("[VOICE] FAIL: voiceTask spawn");
+    voiceTaskHandle = NULL;
+  } else {
+    Serial.println("[VOICE] voiceTask started (STT+LLM+TTS)");
   }
 
   systemState = STATE_READY;
   printHelp();
   startBootTransition();
-
-  routeRequested      = false;
-  routeReady          = false;
-  navigationAIStarted = false;
-  pendingNavigationAI = false;
 
   lastUserActivityMs = millis();
   sleepModeActive    = false;
@@ -5289,9 +4823,7 @@ void setup() {
     .idle_core_mask = 0,
     .trigger_panic  = true,
   };
-  if (esp_task_wdt_init(&wdt_config) == ESP_ERR_INVALID_STATE) {
-    esp_task_wdt_reconfigure(&wdt_config);
-  }
+  if (esp_task_wdt_reconfigure(&wdt_config) != ESP_OK) esp_task_wdt_init(&wdt_config);
 #else
   esp_task_wdt_init(15, true);
 #endif
@@ -5308,16 +4840,13 @@ void setup() {
 // ===========================================================================
 void loop() {
   esp_task_wdt_reset();
-
   linkUpdate();
   mqttUpdate();
-
   ensureWiFiConnected();
   checkHeapHealth();
 
   {
     StateLock lock;
-
     updateCharacterEmotion();
     updateAbotPersonality();
     updateNaturalEyeBehavior();
@@ -5327,7 +4856,6 @@ void loop() {
         millis() - lastLinkMessageAt > LINK_TIMEOUT_MS) {
       hpConnected = false;
       abotLog("WARN", "HP terputus (timeout)");
-      if (tripActive && routeFromLink) triggerCharacterReaction(CHARACTER_CONFUSED);
     }
 
     if (thinkingDemoUntil > 0 && millis() >= thinkingDemoUntil) {
@@ -5369,7 +4897,6 @@ void loop() {
                                          : USER_MAP_DURATION;
     if (mapRequested && millis() - mapStartTime >= mapMs) {
       mapRequested = false;
-      Serial.println("[DISPLAY] MAP timeout");
     }
 
     if (pendingNavigationAI && !navigationAIStarted && routeReady &&
