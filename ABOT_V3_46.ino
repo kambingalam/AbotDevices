@@ -1,6 +1,6 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.48.4 — VOICE AI CHATBOT + VOICE QUIZ (OLED FIX)
+   OJOL ASSISTEN (ABOT) V3.48.5 — VOICE AI CHATBOT (OLED PERFECT SYNC)
   ============================================================================
    Fungsi    : Display navigasi + lyric slide + AI companion + voice chat
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
@@ -12,9 +12,10 @@
    Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
                ESP32-audioI2S
 
-   V3.48.4 PERUBAHAN:
-     • Perbaikan OLED saat TTS memutar teks panjang (tidak stuck/macet).
-     • Teks panjang otomatis bergulir (scroll) ke atas.
+   V3.48.5 PERUBAHAN:
+     • OLED Sinkronisasi Per Kalimat: Teks di layar berganti sesuai 
+       dengan kalimat yang sedang diucapkan oleh TTS.
+     • Tidak ada scroll membingungkan. Kalimat dipecah maks 90 karakter.
      • Model LLM openai/gpt-oss-120b (tersedia di Groq).
   ============================================================================
 */
@@ -61,7 +62,7 @@ enum DestinationStage       : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.48.4"
+#define FW_VERSION "3.48.5"
 
 #define OTA_SIMULATION_MODE 1
 
@@ -387,6 +388,7 @@ static String groqTranscribe(const int16_t* pcm, size_t samples) {
 // ===========================================================================
 //  TTS (ESP32-audioI2S internal Google Translate)
 // ===========================================================================
+// Dipotong lebih pendek (90 karakter) agar pasti muat 5 baris di OLED
 static int splitSpeech(const String& text, String* out, int maxOut) {
   int n = 0;
   String cur = "";
@@ -394,7 +396,7 @@ static int splitSpeech(const String& text, String* out, int maxOut) {
     char c = text[i];
     cur += c;
     bool endSent = (c == '.' || c == '!' || c == '?' || c == '\n');
-    bool tooLong = (cur.length() >= 170 && c == ' ') || cur.length() >= 200;
+    bool tooLong = (cur.length() >= 90 && c == ' ') || cur.length() >= 100;
     if ((endSent && cur.length() >= 25) || tooLong) {
       cur.trim();
       if (cur.length()) out[n++] = cur;
@@ -426,6 +428,8 @@ static bool speakChunk(const String& s) {
   return true;
 }
 
+static String currentTtsPart = ""; // Variabel baru untuk sinkronisasi OLED
+
 static bool speakText(const String& text) {
   if (volumeLevel == 0) { Serial.println("[TTS] mute, skip"); return false; }
   if (text.length() == 0) return false;
@@ -437,9 +441,20 @@ static bool speakText(const String& text) {
   ttsActive = true;
   ttsStop = false;
   bool ok = false;
+  
   for (int i = 0; i < n && !ttsStop; i++) {
+    {
+      StateLock lock;
+      currentTtsPart = parts[i]; // Update OLED dengan kalimat saat ini
+    }
     if (speakChunk(parts[i])) ok = true;
   }
+  
+  {
+    StateLock lock;
+    currentTtsPart = ""; // Bersihkan setelah selesai
+  }
+  
   audioI2S.stopSong();
   ttsActive = false;
   ttsStop = false;
@@ -1770,7 +1785,7 @@ void mqttUpdate() {
   mqttLastReconnectAttempt = now;
 
   char clientId[40];
-  snprintf(clientId, sizeof(clientId), "ABOT-V3484-%08lx%04x",
+  snprintf(clientId, sizeof(clientId), "ABOT-V3485-%08lx%04x",
            (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF),
            (unsigned)random(0xFFFF));
 
@@ -4512,7 +4527,7 @@ void renderVoiceText() {
   int scrollY = 0;
   if (totalLines > maxLinesVisible) {
       int maxScroll = (totalLines - maxLinesVisible) * lineHeight;
-      scrollY = map(millis() % (maxScroll * 50), 0, (maxScroll * 50), 0, maxScroll);
+      scrollY = map(millis() % (maxScroll * 100), 0, (maxScroll * 100), 0, maxScroll);
   }
 
   int pos = 0;
