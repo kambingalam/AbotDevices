@@ -1,6 +1,6 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.48.5 — VOICE AI CHATBOT (OLED PERFECT SYNC)
+   OJOL ASSISTEN (ABOT) V3.49.0 — VOICE AI CHATBOT + LAYAR DINAMIS
   ============================================================================
    Fungsi    : Display navigasi + lyric slide + AI companion + voice chat
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
@@ -11,6 +11,16 @@
    Wajib     : secrets.h  ->  WIFI_SSID_STR, WIFI_PASS_STR, GROQ_API_KEY_STR
    Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
                ESP32-audioI2S
+
+   V3.49.0 PERUBAHAN:
+     • Semua ucapan dijawab LLM (chatbot bebas), LLM juga memilih tampilan OLED:
+       peta, jam, cuaca, kuis, trivia, humor, cerita, lirik, cara pakai, intro,
+       atau KARTU TEKS BEBAS (apa pun yang diminta pengguna).
+     • Cuaca kota mana pun (geocoding Open-Meteo), kota asal = HOME_CITY.
+     • Model Groq dicek otomatis lewat /models (tahan error 404 model_not_found).
+     • Kuis dinilai LLM (benar/salah/tidak tahu) lalu memicu reaksi mata.
+     • Teks OLED tampil per kalimat yang sedang diucapkan; peta/jam/cuaca tidak
+       lagi tertutup teks saat TTS.
 
    V3.48.5 PERUBAHAN:
      • OLED Sinkronisasi Per Kalimat: Teks di layar berganti sesuai 
@@ -62,7 +72,7 @@ enum DestinationStage       : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.48.5"
+#define FW_VERSION "3.49.0"
 
 #define OTA_SIMULATION_MODE 1
 
@@ -74,6 +84,12 @@ SemaphoreHandle_t stateMutex = nullptr;
 struct StateLock {
   StateLock()  { if (stateMutex) xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY); }
   ~StateLock() { if (stateMutex) xSemaphoreGiveRecursive(stateMutex); }
+};
+
+// Hasil jawaban LLM (harus di atas: Arduino menaruh prototipe fungsi di sini)
+struct VoiceAct {
+  String say, show, title, card, city, mood, volume, verdict;
+  bool   customWeather = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,12 +189,13 @@ constexpr int REC_SECONDS_HEAP  = 2;
 const char* GROQ_STT_URL      = "https://api.groq.com/openai/v1/audio/transcriptions";
 const char* GROQ_STT_MODEL    = "whisper-large-v3-turbo";
 const char* GROQ_CHAT_URL     = "https://api.groq.com/openai/v1/chat/completions";
+const char* GROQ_MODELS_URL   = "https://api.groq.com/openai/v1/models";
 const char* GROQ_CHAT_MODEL   = "openai/gpt-oss-120b"; 
 const char* GROQ_CHAT_MODEL_2 = "qwen/qwen3.8-27b";      
 
 const unsigned long STT_TIMEOUT_MS  = 15000;
 const unsigned long CHAT_TIMEOUT_MS = 10000;
-const size_t        STT_MIN_BYTES   = 3200;
+const size_t        STT_MIN_BYTES   = 19200;   // min 0,6 detik (hindari halusinasi "terima kasih")
 
 static int sttLastCode = 0;
 static int lastLlmHttp = 0;
@@ -685,7 +702,7 @@ enum EyeMood                : unsigned char { EYE_DEFAULT, EYE_HAPPY, EYE_ANGRY,
 enum CharacterEmotion       : unsigned char { CHARACTER_DEFAULT, CHARACTER_LISTENING, CHARACTER_THINKING, CHARACTER_HAPPY, CHARACTER_LAUGH, CHARACTER_CONFUSED, CHARACTER_ANGRY, CHARACTER_TIRED };
 enum AbotPersonality        : unsigned char { ABOT_NEUTRAL, ABOT_MORNING, ABOT_DAY, ABOT_AFTERNOON, ABOT_NIGHT };
 enum PersonalityMode        : unsigned char { PERSONALITY_NORMAL, PERSONALITY_PLAYFUL, PERSONALITY_EXCITED };
-enum CompanionType          : unsigned char { COMPANION_NONE, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_HUMOR, COMPANION_STORY, COMPANION_CHALLENGE };
+enum CompanionType          : unsigned char { COMPANION_NONE, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_HUMOR, COMPANION_STORY, COMPANION_CHALLENGE, COMPANION_CARD };
 enum CompanionPlaybackState : unsigned char { COMPANION_IDLE, COMPANION_TYPING, COMPANION_HOLD };
 enum WakeIntroStage         : unsigned char { WAKE_DARK, WAKE_ABOT_HELLO, WAKE_ABOT_PERSONALITY, WAKE_FINISHED };
 enum NetworkJob             : unsigned char { NET_NONE, NET_OSRM, NET_NAVIGATION_AI, NET_COMPANION, NET_WEATHER, NET_GEOCODE };
@@ -742,9 +759,12 @@ int       currentLyricScene = 0;
 const char* WIFI_SSID     = WIFI_SSID_STR;
 const char* WIFI_PASSWORD = WIFI_PASS_STR;
 
+#define HOME_CITY "Medan"        // kota asal: ganti sesuai kotamu
+#define HOME_LAT  "3.5952"
+#define HOME_LON  "98.6722"
 const char* WEATHER_URL =
   "https://api.open-meteo.com/v1/forecast"
-  "?latitude=-6.175400&longitude=106.827202"
+  "?latitude=" HOME_LAT "&longitude=" HOME_LON
   "&current=temperature_2m,weather_code"
   "&daily=temperature_2m_max,temperature_2m_min"
   "&timezone=Asia%2FJakarta";
@@ -907,6 +927,7 @@ int    companionPageCount  = 0;
 int    companionPage       = 0;
 int    companionTypedChars = 0;
 String previousCompanionText = "";
+String cardTitle = "INFO";
 
 int           runTextX           = SCREEN_WIDTH;
 int           runTextTargetEndX  = 0;
@@ -921,7 +942,7 @@ uint8_t       lyricBitmapFrameCache[1024];
 bool          lyricBitmapCacheValid = false;
 
 bool conversationActive = false;
-String currentVoiceReply = ""; 
+bool   voiceTextActive = false;   // true = teks balasan tampil di OLED saat TTS
 
 bool mapRequested       = false;
 bool companionActive    = false;
@@ -1010,6 +1031,9 @@ unsigned long   networkJobStartedAt = 0;
 bool            networkJobWasBusy    = false;
 
 WeatherData   weatherData;
+WeatherData   cityWeather;            // cuaca kota pilihan lewat suara
+String        weatherViewLabel = "";
+bool          weatherViewCustom = false;
 bool          weatherFetching    = false;
 unsigned long lastWeatherAttempt = 0;
 
@@ -1338,6 +1362,7 @@ String companionName(CompanionType type) {
     case COMPANION_HUMOR:     return "HUMOR";
     case COMPANION_STORY:     return "STORY";
     case COMPANION_CHALLENGE: return "LIRIK";
+    case COMPANION_CARD:      return cardTitle;
     default:                  return "COMPANION";
   }
 }
@@ -1454,9 +1479,86 @@ void  startOTAUpdate(const String& url, const String& requestId = "",
 void  updateDisplay();
 
 // ===========================================================================
-//  MEMORI PERCAKAPAN + KONTEKS PERJALANAN + LLM
+//  AI ASISTEN: model Groq otomatis + LLM berformat JSON (jawaban + aksi layar)
 // ===========================================================================
-constexpr int HIST_TURNS = 3;
+String weatherCodeToText(int code);   // didefinisikan di bagian cuaca
+void handleQuizAnswer(char cmd);
+
+static String activeChatModel = GROQ_CHAT_MODEL;
+static bool   modelChecked    = false;
+
+static bool groqModelUsable(const String& id) {
+  String s = id;
+  s.toLowerCase();
+  const char* bad[] = {"whisper", "orpheus", "guard", "tts", "safeguard",
+                       "embed", "distil", "playai", "compound"};
+  for (auto b : bad) if (s.indexOf(b) >= 0) return false;
+  return true;
+}
+
+// Tanya Groq model apa saja yang boleh dipakai key ini, lalu pilih yang terbaik.
+static void groqEnsureModel(bool force = false) {
+  static unsigned long lastTry = 0;
+  if (modelChecked && !force) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!force && lastTry != 0 && millis() - lastTry < 30000UL) return;
+  lastTry = millis();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, GROQ_MODELS_URL)) return;
+  String auth = "Bearer ";
+  auth += GROQ_API_KEY_STR;
+  http.addHeader("Authorization", auth);
+  int code = http.GET();
+  Serial.printf("[MODELS] HTTP %d\n", code);
+  if (code != 200) {
+    if (code > 0) Serial.printf("[MODELS] body: %s\n", http.getString().c_str());
+    http.end();
+    return;
+  }
+
+  JsonDocument filter;
+  filter["data"][0]["id"] = true;
+  JsonDocument doc;
+  DeserializationError err =
+    deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) { Serial.printf("[MODELS] JSON error: %s\n", err.c_str()); return; }
+
+  const String pref[5] = {String(GROQ_CHAT_MODEL), String(GROQ_CHAT_MODEL_2),
+                          String("openai/gpt-oss-20b"), String("llama-3.3-70b-versatile"),
+                          String("llama-3.1-8b-instant")};
+  bool found[5] = {false, false, false, false, false};
+  String firstOther = "";
+  String all = "";
+  for (JsonObject m : doc["data"].as<JsonArray>()) {
+    String id = String((const char*)(m["id"] | ""));
+    all += id;
+    all += " ";
+    for (int i = 0; i < 5; i++) if (id == pref[i]) found[i] = true;
+    if (firstOther.length() == 0 && groqModelUsable(id)) firstOther = id;
+  }
+  Serial.printf("[MODELS] tersedia: %s\n", all.c_str());
+
+  String pick = "";
+  for (int i = 0; i < 5; i++) if (found[i]) { pick = pref[i]; break; }
+  if (pick.length() == 0) pick = firstOther;
+  if (pick.length() > 0) {
+    activeChatModel = pick;
+    modelChecked    = true;
+    Serial.printf("[MODELS] dipakai: %s\n", activeChatModel.c_str());
+  } else {
+    Serial.println("[MODELS] tidak ada model chat yang bisa dipakai key ini");
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Memori percakapan + konteks perjalanan
+// ---------------------------------------------------------------------------
+constexpr int HIST_TURNS = 4;
 static String histUser[HIST_TURNS], histBot[HIST_TURNS];
 static int histCount = 0;
 
@@ -1474,15 +1576,24 @@ static String buildContext() {
   String c = "";
   StateLock lock;
 
+  c += " Kota asal perangkat: ";
+  c += HOME_CITY;
+  c += ".";
+
   struct tm ti;
   if (getLocalTimeSafe(&ti)) {
-    char b[40];
+    char b[48];
     snprintf(b, sizeof(b), " Sekarang jam %02d:%02d WIB.", ti.tm_hour, ti.tm_min);
     c += b;
   }
   if (weatherData.valid) {
-    String w = weatherData.condition; w.toLowerCase();
-    c += " Cuaca " + w + ", " + String(weatherData.temperature, 0) + " derajat.";
+    String w = weatherData.condition;
+    w.toLowerCase();
+    c += " Cuaca di ";
+    c += HOME_CITY;
+    c += " sekarang " + w + ", " + String(weatherData.temperature, 0) + " derajat";
+    c += ", hari ini terendah " + String(weatherData.tempMin, 0) +
+         " dan tertinggi " + String(weatherData.tempMax, 0) + " derajat.";
   }
   if (routeReady && tripActive) {
     float remain = routeGeometryDistance - simulatedRouteDistance;
@@ -1490,13 +1601,15 @@ static String buildContext() {
     float v = (speedMps < 3.0f) ? 8.0f : speedMps;
     int minutes = (int)(remain / v / 60.0f + 0.5f);
     c += " Perjalanan aktif, sisa sekitar ";
-    c += (remain >= 1000.0f) ? String(remain / 1000.0f, 1) + " kilometer" : String((int)remain) + " meter";
+    c += (remain >= 1000.0f) ? String(remain / 1000.0f, 1) + " kilometer"
+                             : String((int)remain) + " meter";
     c += ", perkiraan " + String(minutes) + " menit lagi.";
     int s = nextImportantStep();
     if (s >= 0 && s < navStepCount) {
       float d = navSteps[s].routeDistance - simulatedRouteDistance;
       if (d < 0) d = 0;
-      String ins = navSteps[s].instruction; ins.toLowerCase();
+      String ins = navSteps[s].instruction;
+      ins.toLowerCase();
       c += " Belokan berikutnya: " + ins + " dalam " + String((int)d) + " meter.";
     }
   } else {
@@ -1506,72 +1619,171 @@ static String buildContext() {
   return c;
 }
 
-static String groqChat(const String& userText) {
-  const String ctx = buildContext();
+static String buildSystemPrompt(const String& extra) {
+  String p;
+  p.reserve(2200);
+  p += "Kamu Abot, asisten suara berupa robot bermata di helm driver ojol. "
+       "Bicara bahasa Indonesia yang santai, hangat, dan ekspresif. "
+       "Jawab SEMUA permintaan pengguna: pertanyaan umum, saran, hitungan, ngobrol, candaan, "
+       "bahkan akting suara. Ikuti gaya yang diminta pengguna (misal terkejut, lucu, formal).\n"
+       "Balas HANYA satu objek JSON tanpa teks lain, dengan field:\n"
+       "say: kalimat yang dibacakan suara. Tanpa emoji dan markdown, enak diucapkan, "
+       "1-3 kalimat (cerita boleh sampai 5 kalimat).\n"
+       "show: tampilan layar OLED, salah satu: none, map (peta rute), clock (jam), "
+       "weather (cuaca), quiz, trivia, humor, story, lyrics (animasi lirik), "
+       "usage (cara pakai), intro (animasi perkenalan), card (teks bebas di layar).\n"
+       "title: judul pendek huruf kapital maksimal 14 karakter, untuk card.\n"
+       "card: teks di layar untuk show quiz, trivia, humor, story, atau card. "
+       "ASCII saja tanpa emoji, maksimal 220 karakter. Boleh dikosongkan kalau sama dengan say.\n"
+       "city: nama kota HANYA jika show=weather dan pengguna menyebut kota tertentu.\n"
+       "mood: ekspresi mata sesuai nada jawaban: default, happy, laugh, confused, angry, tired.\n"
+       "volume: none, up, down, mute, unmute.\n"
+       "verdict: hanya saat ada kuis aktif dan pengguna menjawabnya: correct, wrong, atau unknown. Selain itu kosongkan.\n"
+       "Aturan: pakai show=card kalau pengguna minta sesuatu ditampilkan di layar "
+       "(tulisan, daftar, angka, hasil hitungan, ringkasan, kata-kata) walau tidak ada di daftar. "
+       "Kalau pengguna minta tampilan tertentu, pilih show yang sesuai (misal tampilkan peta -> map). "
+       "Kalau tidak perlu tampilan pakai none. Untuk quiz, say berisi pertanyaan lalu ajak pengguna "
+       "menjawab, jangan bocorkan jawabannya. Transkrip suara bisa salah dengar, tebak maksud yang "
+       "paling masuk akal. Jangan mengarang data jam, cuaca, atau rute, pakai data di bawah. "
+       "Kamu belum punya data GPS lokasi saat ini.\n"
+       "Data saat ini:";
+  p += buildContext();
+  p += extra;
+  return p;
+}
 
+// ---------------------------------------------------------------------------
+//  Panggilan Groq chat
+// ---------------------------------------------------------------------------
+static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, String& out) {
+  doc["model"] = model;
+  const bool gptOss = model.startsWith("openai/gpt-oss");
+  const bool thinky = gptOss || model.indexOf("qwen") >= 0;
+  doc["max_tokens"] = thinky ? 900 : 380;       // model "berpikir" butuh jatah token lebih
+  if (jsonMode && gptOss) doc["reasoning_effort"] = "low";
+  else                    doc.remove("reasoning_effort");
+  if (jsonMode) doc["response_format"]["type"] = "json_object";
+  else          doc.remove("response_format");
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(CHAT_TIMEOUT_MS);
+  if (!http.begin(client, GROQ_CHAT_URL)) { lastLlmHttp = -1; return -1; }
+
+  String auth = "Bearer ";
+  auth += GROQ_API_KEY_STR;
+  http.addHeader("Authorization", auth);
+  http.addHeader("Content-Type", "application/json");
+
+  Serial.printf("[LLM] Request model='%s' (len %d) json=%d\n",
+                model.c_str(), (int)model.length(), jsonMode ? 1 : 0);
+  const unsigned long t0 = millis();
+  int code = http.POST(payload);
+  lastLlmHttp = code;
+  Serial.printf("[LLM] HTTP %d in %lu ms\n", code, millis() - t0);
+
+  out = "";
+  if (code == 200) {
+    JsonDocument resp;
+    if (!deserializeJson(resp, http.getString())) {
+      out = String((const char*)(resp["choices"][0]["message"]["content"] | ""));
+    }
+  } else if (code > 0) {
+    Serial.printf("[LLM] body: %s\n", http.getString().c_str());
+  }
+  http.end();
+  return code;
+}
+
+static String lc(String s) { s.toLowerCase(); return s; }
+
+static void cleanSpeech(String& s) {
+  s.replace("*", "");
+  s.replace("#", "");
+  s.replace("`", "");
+  s.trim();
+}
+
+static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) {
   JsonDocument doc;
-  doc["max_tokens"]  = 250; // Naikkan sedikit agar cerita tidak terpotong
   doc["temperature"] = 0.7;
   JsonArray msgs = doc["messages"].to<JsonArray>();
 
   JsonObject sys = msgs.add<JsonObject>();
-  sys["role"] = "system";
-  sys["content"] =
-    String("Kamu Abot, asisten suara pintar di helm driver ojol. Kamu bisa menjawab pertanyaan apa saja seperti chatbot. "
-           "Jawab bahasa Indonesia santai dan hangat, maksimal 3 kalimat pendek. Jangan pakai emoji, markdown, atau bullet. "
-           "Kalimat harus enak dibacakan suara. Pakai data berikut kalau relevan, jangan mengarang angka: ") + ctx;
+  sys["role"]    = "system";
+  sys["content"] = buildSystemPrompt(extra);
 
   for (int i = 0; i < histCount; i++) {
     JsonObject u = msgs.add<JsonObject>(); u["role"] = "user";      u["content"] = histUser[i];
     JsonObject a = msgs.add<JsonObject>(); a["role"] = "assistant"; a["content"] = histBot[i];
   }
   JsonObject usr = msgs.add<JsonObject>();
-  usr["role"] = "user";
+  usr["role"]    = "user";
   usr["content"] = userText;
 
-  const char* models[2] = {GROQ_CHAT_MODEL, GROQ_CHAT_MODEL_2};
-  String reply = "";
+  String content = "";
+  String model   = activeChatModel;
+  int code = groqPost(model, true, doc, content);
+  if (code == 400) code = groqPost(model, false, doc, content);   // model tanpa JSON mode
 
-  for (int m = 0; m < 2 && reply.length() == 0; m++) {
-    doc["model"] = models[m];
-    String payload;
-    serializeJson(doc, payload);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.setTimeout(CHAT_TIMEOUT_MS);
-    if (!http.begin(client, GROQ_CHAT_URL)) { lastLlmHttp = -1; continue; }
-
-    String auth = "Bearer ";
-    auth += GROQ_API_KEY_STR;
-    http.addHeader("Authorization", auth);
-    http.addHeader("Content-Type", "application/json");
-
-    Serial.printf("[LLM] Request model=%s\n", models[m]);
-    const unsigned long t0 = millis();
-    int code = http.POST(payload);
-    lastLlmHttp = code;
-    Serial.printf("[LLM] HTTP %d in %lu ms\n", code, millis() - t0);
-
-    if (code == 200) {
-      JsonDocument resp;
-      if (!deserializeJson(resp, http.getString())) {
-        reply = resp["choices"][0]["message"]["content"].as<String>();
-        reply.trim();
-      }
-    } else if (code > 0) {
-      Serial.printf("[LLM] body: %s\n", http.getString().c_str());
+  if ((code == 404 || code == 403) && content.length() == 0) {
+    // Model tidak bisa diakses: cek daftar model asli dari Groq
+    modelChecked = false;
+    groqEnsureModel(true);
+    if (activeChatModel != model) {
+      model = activeChatModel;
+      code  = groqPost(model, true, doc, content);
+      if (code == 400) code = groqPost(model, false, doc, content);
     }
-    http.end();
-    if (code == 401) break;   // API key salah, ganti model tidak membantu
+  }
+  if (content.length() == 0 && code > 0 && code != 401 &&
+      model != String(GROQ_CHAT_MODEL_2)) {
+    code = groqPost(String(GROQ_CHAT_MODEL_2), true, doc, content);
+    if (code == 400) code = groqPost(String(GROQ_CHAT_MODEL_2), false, doc, content);
   }
 
-  reply.replace("*", "");
-  reply.replace("#", "");
-  reply.trim();
-  if (reply.length() > 0) histAdd(userText, reply);
-  return reply;
+  int th = content.lastIndexOf("</think>");
+  if (th >= 0) content = content.substring(th + 8);
+  content.trim();
+  if (content.length() == 0) return false;
+
+  act = VoiceAct();
+  bool parsed = false;
+  int a = content.indexOf('{');
+  int b = content.lastIndexOf('}');
+  if (a >= 0 && b > a) {
+    JsonDocument j;
+    if (!deserializeJson(j, content.substring(a, b + 1))) {
+      act.say    = String((const char*)(j["say"]    | ""));
+      act.show   = lc(String((const char*)(j["show"]   | "none")));
+      act.title  = String((const char*)(j["title"]  | ""));
+      act.card   = String((const char*)(j["card"]   | ""));
+      act.city   = String((const char*)(j["city"]   | ""));
+      act.mood   = lc(String((const char*)(j["mood"]   | "default")));
+      act.volume = lc(String((const char*)(j["volume"] | "none")));
+      act.verdict= lc(String((const char*)(j["verdict"]| "")));
+      parsed = true;
+    }
+  }
+  if (!parsed) { act.say = content; act.show = "none"; }
+  if (act.say.length() == 0 && act.card.length() > 0) act.say = act.card;
+  if (act.say.length() == 0) return false;
+
+  cleanSpeech(act.say);
+  act.show.trim();
+  act.city.trim();
+  act.title.trim();
+
+  const char* okShow[] = {"none", "map", "clock", "weather", "quiz", "trivia", "humor",
+                          "story", "lyrics", "usage", "intro", "card"};
+  bool valid = false;
+  for (auto s : okShow) if (act.show == s) valid = true;
+  if (!valid) act.show = "none";
+  return true;
 }
 
 static String llmErrorText() {
@@ -1580,6 +1792,8 @@ static String llmErrorText() {
   if (lastLlmHttp == 0)   return "Koneksi ke server lagi lambat, coba ulangi ya.";
   if (lastLlmHttp == 429) return "Aku lagi kebanyakan mikir, tunggu sebentar ya.";
   if (lastLlmHttp == 401) return "Kunci API-nya bermasalah, tolong dicek.";
+  if (lastLlmHttp == 404 || lastLlmHttp == 403)
+    return "Model AI-nya belum bisa diakses, tolong cek pengaturan Groq.";
   return "Maaf, aku belum bisa jawab itu sekarang.";
 }
 
@@ -1592,33 +1806,281 @@ static bool isWhisperHallucination(String t) {
   return false;
 }
 
-// Perintah suara tanpa LLM: instan & hemat kuota. Return kalimat balasan, "" kalau bukan perintah.
-static String voiceLocalCommand(String t) {
-  t.toLowerCase();
+// ---------------------------------------------------------------------------
+//  Cuaca kota mana saja (Open-Meteo geocoding + forecast)
+// ---------------------------------------------------------------------------
+static String urlEncode(const String& s) {
+  String o = "";
+  const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+    else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+  }
+  return o;
+}
+
+static bool fetchCityWeather(const String& city, String& outName, String& outSummary) {
+  double lat = 0, lon = 0;
+  {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(8000);
+    String url = String("https://geocoding-api.open-meteo.com/v1/search?count=1&language=id&format=json&name=")
+                 + urlEncode(city);
+    if (!http.begin(client, url)) return false;
+    int code = http.GET();
+    Serial.printf("[GEO] HTTP %d (%s)\n", code, city.c_str());
+    if (code != 200) { http.end(); return false; }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getString());
+    http.end();
+    if (err || doc["results"][0].isNull()) return false;
+    lat = doc["results"][0]["latitude"]  | 0.0;
+    lon = doc["results"][0]["longitude"] | 0.0;
+    outName = String((const char*)(doc["results"][0]["name"] | city.c_str()));
+  }
+
+  WeatherData w;
+  {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(8000);
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
+                 "&longitude=" + String(lon, 4) +
+                 "&current=temperature_2m,weather_code"
+                 "&daily=temperature_2m_max,temperature_2m_min&timezone=auto";
+    if (!http.begin(client, url)) return false;
+    int code = http.GET();
+    Serial.printf("[WX] HTTP %d (%s)\n", code, outName.c_str());
+    if (code != 200) { http.end(); return false; }
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getString());
+    http.end();
+    if (err) return false;
+    JsonObject cur = doc["current"];
+    if (cur.isNull()) return false;
+    w.temperature = cur["temperature_2m"] | 0.0f;
+    w.weatherCode = cur["weather_code"]   | -1;
+    w.condition   = weatherCodeToText(w.weatherCode);
+    w.tempMax     = doc["daily"]["temperature_2m_max"][0] | w.temperature;
+    w.tempMin     = doc["daily"]["temperature_2m_min"][0] | w.temperature;
+    w.valid       = true;
+    w.updatedAt   = millis();
+  }
+
+  {
+    StateLock lock;
+    cityWeather      = w;
+    weatherViewLabel = outName;
+  }
+  String c = w.condition;
+  c.toLowerCase();
+  outSummary = c + ", suhu " + String(w.temperature, 0) + " derajat, hari ini terendah " +
+               String(w.tempMin, 0) + " dan tertinggi " + String(w.tempMax, 0) + " derajat";
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+//  Aksi layar (dipanggil dengan StateLock)
+// ---------------------------------------------------------------------------
+static void voiceTextMode(bool on) { StateLock lock; voiceTextActive = on; }
+
+static void voiceClearScreens() {
+  mapRequested             = false;
+  hudActive                = false;
+  infoModeActive           = false;
+  companionActive          = false;
+  companionNextMenuActive  = false;
+  companionNextMenuPending = false;
+  conversationActive       = false;
+  hudSuppressUntil         = millis() + HUD_SUPPRESS_DURATION;
+}
+
+static void showWeatherView(bool custom) {
+  voiceClearScreens();
+  cancelThinking();
+  weatherViewCustom = custom;
+  infoModeActive    = true;
+  infoPage          = 1;
+  infoModeStarted   = millis();
+  if (!custom && !weatherData.valid) lastWeatherAttempt = 0;
+}
+
+static void voiceShowIntro() {
+  voiceClearScreens();
+  startupOnboardingActive = false;
+  bootTransitionActive    = false;
+  cancelThinking();
+  startIntroduction();
+}
+
+static void voiceShowCard(CompanionType type, const String& title, const String& text) {
+  voiceClearScreens();
+  if (type == COMPANION_CARD) {
+    String t = title.length() ? title : String("INFO");
+    t = stripNonAscii(t);
+    t.toUpperCase();
+    if (t.length() > 16) t = t.substring(0, 16);
+    cardTitle = t;
+  }
+  companionNextMenuDelayMs = 350;
+  currentCompanion = type;
+  finishCompanionGeneration(text, type);
+}
+
+static CharacterEmotion moodFromString(const String& m) {
+  if (m == "happy")    return CHARACTER_HAPPY;
+  if (m == "laugh")    return CHARACTER_LAUGH;
+  if (m == "confused") return CHARACTER_CONFUSED;
+  if (m == "angry")    return CHARACTER_ANGRY;
+  if (m == "tired")    return CHARACTER_TIRED;
+  return CHARACTER_HAPPY;
+}
+
+static void voiceApply(const VoiceAct& act) {
   StateLock lock;
-  if (t.indexOf("peta") >= 0 || t.indexOf("navigasi") >= 0) { handleCommand('M'); return "Oke, ini petanya."; }
-  if (t.indexOf("jam berapa") >= 0 || t.indexOf("cuaca") >= 0) { startInfoMode(); return "Ini jam dan cuacanya."; }
-  if (t.indexOf("lirik") >= 0)  { handleCommand('D'); return "Siap, kita putar lirik."; }
-  if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) { handleCommand('H'); return "Oke, siap-siap ketawa ya."; }
-  if (t.indexOf("trivia") >= 0) { handleCommand('T'); return "Oke, ini trivia buat kamu."; }
-  if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) { handleCommand('Q'); return "Oke, ini kuisnya."; }
-  if (t.indexOf("volume naik") >= 0 || t.indexOf("keras") >= 0) { audioVolumeStep(+1); return "Volume dinaikkan."; }
-  if (t.indexOf("volume turun") >= 0 || t.indexOf("pelan") >= 0) { audioVolumeStep(-1); return "Volume diturunkan."; }
-  if (t.indexOf("diam") >= 0 || t.indexOf("mute") >= 0) { audioToggleMute(); return ""; }
-  return "";
+  markUserActivity();
+
+  if      (act.volume == "up")     audioVolumeStep(+1);
+  else if (act.volume == "down")   audioVolumeStep(-1);
+  else if (act.volume == "mute")   { if (volumeLevel > 0) audioSetVolume(0); }
+  else if (act.volume == "unmute") { if (volumeLevel == 0) audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 3); }
+
+  const String& s = act.show;
+  const String  body = act.card.length() ? act.card : act.say;
+  voiceTextActive = (s == "none");   // teks balasan tampil per kalimat hanya kalau tidak ada layar khusus
+
+  if (quizWaitingAnswer && act.verdict.length() > 0) {
+    if      (act.verdict == "correct") handleQuizAnswer('J');
+    else if (act.verdict == "wrong")   handleQuizAnswer('K');
+    else                               handleQuizAnswer('L');
+    return;
+  }
+  if      (s == "map")     handleCommand('M');
+  else if (s == "clock")   startInfoMode();
+  else if (s == "weather") showWeatherView(act.customWeather);
+  else if (s == "lyrics")  handleCommand('D');
+  else if (s == "usage")   handleCommand('U');
+  else if (s == "intro")   voiceShowIntro();
+  else if (s == "quiz")    voiceShowCard(COMPANION_QUIZ,   "", body);
+  else if (s == "trivia")  voiceShowCard(COMPANION_TRIVIA, "", body);
+  else if (s == "humor")   voiceShowCard(COMPANION_HUMOR,  "", body);
+  else if (s == "story")   voiceShowCard(COMPANION_STORY,  "", body);
+  else if (s == "card")    voiceShowCard(COMPANION_CARD, act.title, body);
+
+  setCharacterEmotion(moodFromString(act.mood));
+}
+
+// ---------------------------------------------------------------------------
+//  Perintah lokal (instan, tanpa LLM) + cadangan kalau LLM gagal
+// ---------------------------------------------------------------------------
+static int wordCount(const String& s) {
+  int n = 0;
+  bool in = false;
+  for (size_t i = 0; i < s.length(); i++) {
+    bool sp = (s[i] == ' ');
+    if (!sp && !in) { n++; in = true; }
+    else if (sp)    in = false;
+  }
+  return n;
+}
+
+static String timeSentence() {
+  struct tm ti;
+  if (!getLocalTimeSafe(&ti)) return "Jamnya belum sinkron, tunggu sebentar ya.";
+  char b[64];
+  if (ti.tm_min == 0) snprintf(b, sizeof(b), "Sekarang jam %d tepat.", ti.tm_hour);
+  else snprintf(b, sizeof(b), "Sekarang jam %d lewat %d menit.", ti.tm_hour, ti.tm_min);
+  return String(b);
+}
+
+static String homeWeatherSentence() {
+  StateLock lock;
+  if (!weatherData.valid) return "Data cuaca belum tersedia, coba lagi sebentar lagi.";
+  String c = weatherData.condition;
+  c.toLowerCase();
+  return String("Cuaca di ") + HOME_CITY + " sekarang " + c + ", suhunya sekitar " +
+         String(weatherData.temperature, 0) + " derajat. Hari ini antara " +
+         String(weatherData.tempMin, 0) + " sampai " + String(weatherData.tempMax, 0) + " derajat.";
+}
+
+// allowContent=true dipakai saat LLM gagal: kuis/trivia/humor/cerita ikut dijalankan.
+static bool voiceLocalCommand(String t, String& say, bool allowContent) {
+  t.toLowerCase();
+  say = "";
+  StateLock lock;
+  markUserActivity();
+  voiceTextActive = false;
+
+  if (t.indexOf("diam") >= 0 || t.indexOf("mute") >= 0 || t.indexOf("bisu") >= 0) {
+    audioToggleMute();
+    say = (volumeLevel > 0) ? "Oke, suara aktif lagi." : "";
+    voiceTextActive = true;
+    return true;
+  }
+  if (t.indexOf("volume naik") >= 0 || t.indexOf("lebih keras") >= 0) {
+    audioVolumeStep(+1); say = "Volume dinaikkan."; voiceTextActive = true; return true;
+  }
+  if (t.indexOf("volume turun") >= 0 || t.indexOf("lebih pelan") >= 0) {
+    audioVolumeStep(-1); say = "Volume diturunkan."; voiceTextActive = true; return true;
+  }
+  if (t.indexOf("peta") >= 0 || t.indexOf("navigasi") >= 0) {
+    handleCommand('M'); say = "Oke, ini petanya."; return true;
+  }
+  if (t.indexOf("cuaca") >= 0) {
+    showWeatherView(false); say = homeWeatherSentence(); return true;
+  }
+  if (t.indexOf("jam") >= 0) {
+    startInfoMode(); say = timeSentence(); return true;
+  }
+  if (t.indexOf("lirik") >= 0) {
+    handleCommand('D'); say = "Siap, kita putar lirik."; return true;
+  }
+  if (t.indexOf("intro") >= 0) {
+    voiceShowIntro(); say = "Oke, kita mulai dari awal."; return true;
+  }
+  if (allowContent) {
+    if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) { handleCommand('Q'); say = "Oke, ini kuisnya."; return true; }
+    if (t.indexOf("trivia") >= 0)                         { handleCommand('T'); say = "Oke, ini trivia buat kamu."; return true; }
+    if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) { handleCommand('H'); say = "Oke, siap-siap ketawa ya."; return true; }
+    if (t.indexOf("cerita") >= 0)                         { handleCommand('S'); say = "Oke, aku ceritakan ya."; return true; }
+  }
+  return false;
 }
 
 // ===========================================================================
-//  VOICE TASK: STT -> (perintah lokal | LLM) -> TTS
+//  VOICE TASK: STT -> (perintah lokal | LLM JSON -> layar + suara)
 // ===========================================================================
 static void voiceReact(CharacterEmotion e)  { StateLock lock; triggerCharacterReaction(e); }
 static void voiceThinkOn()  { StateLock lock; setCharacterEmotion(CHARACTER_THINKING); beginThinkingVisual(); }
 static void voiceThinkOff() { StateLock lock; endThinkingVisual(); }
 static void voiceEmotion(CharacterEmotion e) { StateLock lock; setCharacterEmotion(e); }
 
+// Cadangan penilai kuis (kata kunci) kalau LLM tidak bisa dihubungi
+static String quizKeywordFallback(const String& transcript) {
+  String low = transcript;
+  low.toLowerCase();
+  if (low.indexOf("benar") >= 0 || low.indexOf("betul") >= 0) {
+    handleQuizAnswer('J'); return "Wah hebat, jawabanmu benar!";
+  }
+  if (low.indexOf("salah") >= 0) {
+    handleQuizAnswer('K'); return "Yah, sayang sekali salah.";
+  }
+  if (low.indexOf("tidak tahu") >= 0 || low.indexOf("gak tahu") >= 0 || low.indexOf("bingung") >= 0) {
+    handleQuizAnswer('L'); return "Tidak apa-apa, tetap semangat ya.";
+  }
+  handleQuizAnswer('L');
+  return "Aku belum bisa menilai jawaban itu, anggap tidak tahu ya.";
+}
+
 static void voiceProcess() {
+  voiceTextMode(false);
   if (WiFi.status() != WL_CONNECTED) {
     voiceReact(CHARACTER_CONFUSED);
+    voiceTextMode(true);
     speakText("Koneksi internet lagi putus, coba lagi nanti ya.");
     return;
   }
@@ -1661,67 +2123,89 @@ static void voiceProcess() {
   linkSend("{\"t\":\"stt_result\",\"ok\":1,\"text\":\"" + jsonEscape(transcript) + "\"}");
   Serial.printf("[VOICE] STT OK: %s\n", transcript.c_str());
 
-  // --- FITUR BARU: JAWAB KUIS LEWAT SUARA ---
-  if (quizWaitingAnswer) {
-    String low = transcript; low.toLowerCase();
-    if (low.indexOf("benar") >= 0 || low.indexOf("betul") >= 0) {
-      handleQuizAnswer('J');
-      currentVoiceReply = "Wah hebat, jawabanmu benar!";
-    } else if (low.indexOf("salah") >= 0) {
-      handleQuizAnswer('K');
-      currentVoiceReply = "Yah, sayang sekali salah.";
-    } else if (low.indexOf("tidak tahu") >= 0 || low.indexOf("gak tahu") >= 0 || low.indexOf("bingung") >= 0) {
-      handleQuizAnswer('L');
-      currentVoiceReply = "Tidak apa-apa, tetap semangat ya.";
-    } else {
-      // Jika jawabannya bukan benar/salah/tidak tahu, anggap tidak tahu
-      handleQuizAnswer('L');
-      currentVoiceReply = "Aku belum bisa menilai jawaban itu, anggap tidak tahu ya.";
+  // 1) Perintah pendek (<= 4 kata) yang jelas: langsung, tanpa LLM
+  String say;
+  if (!quizWaitingAnswer && wordCount(transcript) <= 4 && voiceLocalCommand(transcript, say, false)) {
+    voiceThinkOff();
+    if (say.length() > 0) {
+      voiceEmotion(CHARACTER_HAPPY);
+      speakText(say);
+      voiceEmotion(CHARACTER_DEFAULT);
     }
-    voiceThinkOff();
-    speakText(currentVoiceReply);
     return;
   }
 
-  // 1) Perintah lokal dulu (tanpa LLM)
-  String local = voiceLocalCommand(transcript);
-  if (local.length() > 0) {
-    voiceThinkOff();
-    voiceReact(CHARACTER_HAPPY);
-    currentVoiceReply = local; // TAMPILKAN DI OLED
-    speakText(local);
-    return;
+  // 2) Semua yang lain: LLM menjawab + memilih tampilan layar
+  groqEnsureModel();
+  VoiceAct act;
+  String quizExtra = "";
+  if (quizWaitingAnswer) {
+    quizExtra = " Kuis aktif di layar dengan pertanyaan: \"" + currentQuizQuestion +
+                "\". Jika pesan pengguna adalah jawaban kuis, nilai jawabannya, isi verdict "
+                "(correct, wrong, atau unknown bila pengguna menyerah), dan sebutkan jawaban yang benar. "
+                "Jika pesan bukan jawaban kuis, abaikan kuis dan kosongkan verdict.";
   }
-  
-  // "diam"/"mute" sudah ditangani di atas (balasan kosong) -> jangan lanjut ke LLM
-  {
-    String low = transcript; low.toLowerCase();
-    if (low.indexOf("diam") >= 0 || low.indexOf("mute") >= 0) { voiceThinkOff(); return; }
+  bool ok = groqAsk(transcript, quizExtra, act);
+
+  // Cuaca kota lain: ambil data nyata, lalu minta LLM menjawab dengan data itu
+  if (ok && act.show == "weather" && act.city.length() > 0) {
+    String resolved, summary;
+    if (fetchCityWeather(act.city, resolved, summary)) {
+      String extra = " Data cuaca terbaru untuk " + resolved + ": " + summary +
+                     ". Jawab pakai data ini dan set show=weather.";
+      VoiceAct act2;
+      if (groqAsk(transcript, extra, act2)) {
+        act = act2;
+        act.show = "weather";
+      } else {
+        act.say = "Cuaca di " + resolved + " sekarang " + summary + ".";
+        act.show = "weather";
+      }
+      act.customWeather = true;
+    } else {
+      act.say  = "Maaf, aku tidak menemukan data cuaca untuk " + act.city + ".";
+      act.show = "none";
+    }
   }
 
-  // 2) LLM dengan memori + konteks perjalanan (Chatbot Mode)
-  String reply = groqChat(transcript);
   voiceThinkOff();
 
-  if (reply.length() == 0) {
+  if (!ok) {
     Serial.printf("[VOICE] LLM gagal (HTTP %d)\n", lastLlmHttp);
+    if (quizWaitingAnswer) {
+      say = quizKeywordFallback(transcript);
+      voiceTextMode(true);
+      speakText(say);
+      return;
+    }
+    if (voiceLocalCommand(transcript, say, true)) {
+      if (say.length() > 0) { voiceEmotion(CHARACTER_HAPPY); speakText(say); voiceEmotion(CHARACTER_DEFAULT); }
+      return;
+    }
     voiceReact(CHARACTER_CONFUSED);
-    reply = llmErrorText();
-  } else {
-    linkSend("{\"t\":\"llm_reply\",\"ok\":1,\"text\":\"" + jsonEscape(reply) + "\"}");
-    Serial.printf("[VOICE] LLM OK: %s\n", reply.c_str());
-    voiceReact(CHARACTER_HAPPY);
+    voiceTextMode(true);
+    speakText(llmErrorText());
+    return;
   }
 
-  currentVoiceReply = reply; // TAMPILKAN DI OLED
-  voiceEmotion(CHARACTER_HAPPY);
-  speakText(reply);
+  histAdd(transcript, act.say);
+  linkSend("{\"t\":\"llm_reply\",\"ok\":1,\"show\":\"" + jsonEscape(act.show) +
+           "\",\"text\":\"" + jsonEscape(act.say) + "\"}");
+  Serial.printf("[VOICE] LLM OK (show=%s mood=%s): %s\n",
+                act.show.c_str(), act.mood.c_str(), act.say.c_str());
+
+  voiceApply(act);
+  speakText(act.say);
   voiceEmotion(CHARACTER_DEFAULT);
 }
 
 static void voiceTask(void* pv) {
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(3000)) == 0) {
+      // idle: cek model Groq di latar belakang setelah WiFi siap
+      if (!modelChecked && millis() > 6000) groqEnsureModel();
+      continue;
+    }
     voicePipelineActive = true;
     ttsStop = false;
     voiceProcess();
@@ -3192,10 +3676,15 @@ void ensureWeatherData() {
 }
 
 void renderWeatherScreen(const String& header) {
+  const WeatherData& w = weatherViewCustom ? cityWeather : weatherData;
+  String title = weatherViewCustom ? weatherViewLabel : (header + " " + String(HOME_CITY));
+  title = stripNonAscii(title);
+  title.toUpperCase();
+  if (title.length() > 20) title = title.substring(0, 20);
   beginFrame();
-  drawCenteredText(header, 1, 1);
+  drawCenteredText(title, 1, 1);
   gfxLine(10, 12, 117, 12);
-  if (!weatherData.valid) {
+  if (!w.valid) {
     if (weatherFetching) drawCenteredText("MEMUAT CUACA...", 30, 1);
     else {
       drawCenteredText("CUACA OFFLINE", 23, 1);
@@ -3205,11 +3694,10 @@ void renderWeatherScreen(const String& header) {
     presentFrame();
     return;
   }
-  String temp  = String(weatherData.temperature, 1) + " C";
-  String range = "H:" + String(weatherData.tempMax, 0) +
-                 "  L:" + String(weatherData.tempMin, 0);
+  String temp  = String(w.temperature, 1) + " C";
+  String range = "H:" + String(w.tempMax, 0) + "  L:" + String(w.tempMin, 0);
   drawCenteredText(temp, 18, 2);
-  drawCenteredText(weatherData.condition, 42, 1);
+  drawCenteredText(w.condition, 42, 1);
   drawCenteredText(range, 56, 1);
   presentFrame();
 }
@@ -3222,6 +3710,7 @@ void startInfoMode() {
   companionNextMenuActive  = false;
   companionNextMenuPending = false;
   conversationActive       = false;
+  weatherViewCustom = false;
   infoModeActive  = true;
   infoPage        = 0;
   infoModeStarted = millis();
@@ -3242,6 +3731,7 @@ void renderInfoMode() {
     if (elapsed >= INFO_WEATHER_DURATION) {
       infoModeActive = false;
       infoPage       = 0;
+      weatherViewCustom = false;
     }
   }
 }
@@ -3995,6 +4485,7 @@ void finishCompanionGeneration(const String& rawText, CompanionType type) {
 }
 
 void finishCompanion() {
+  const bool wasCard = (currentCompanion == COMPANION_CARD);
   currentLyricScene = 0;
   companionActive     = false;
   companionGenerating = false;
@@ -4004,7 +4495,8 @@ void finishCompanion() {
   hudActive        = false;
   hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
   roboEyes.blink();
-  openCompanionNextMenu(companionNextMenuDelayMs);
+  if (wasCard) lastUserActivityMs = millis();      // kartu bebas: tanpa menu "MAU LANJUT?"
+  else         openCompanionNextMenu(companionNextMenuDelayMs);
 }
 
 void openCompanionNextMenu(unsigned long delayMs) {
@@ -4204,9 +4696,11 @@ void networkTask(void* parameter) {
         http.addHeader("Authorization", authorization);
 
         JsonDocument requestDoc;
-        requestDoc["model"]      = GROQ_CHAT_MODEL;
+        const bool gptOss = activeChatModel.startsWith("openai/gpt-oss");
+        requestDoc["model"]      = activeChatModel;
         requestDoc["temperature"]= (job == NET_COMPANION) ? 0.8 : 0.3;
-        requestDoc["max_tokens"] = (job == NET_COMPANION) ? 160 : 100;
+        requestDoc["max_tokens"] = ((job == NET_COMPANION) ? 160 : 100) * (gptOss ? 5 : 1);
+        if (gptOss) requestDoc["reasoning_effort"] = "low";
 
         JsonArray messages = requestDoc["messages"].to<JsonArray>();
         JsonObject systemMessage = messages.add<JsonObject>();
@@ -4503,56 +4997,30 @@ void updateHUDLatch() {
 // ===========================================================================
 //  DISPLAY PRIORITY
 // ===========================================================================
-int lastVoiceTextY = -1;
-
-// Fungsi baru untuk merender teks balasan AI di layar OLED (Support Scroll)
+// Teks kalimat yang sedang diucapkan TTS (kalimat <= 100 karakter -> maks 5 baris)
 void renderVoiceText() {
   beginFrame();
-  drawCenteredText("ABOT:", 0, 1);
+  drawCenteredText("ABOT", 0, 1);
   gfxLine(12, 10, 115, 10);
 
-  String text = currentVoiceReply;
-  int maxChars = 21; 
-  int lineHeight = 9;
-  int maxLinesVisible = 5; 
-  int visibleHeight = maxLinesVisible * lineHeight;
-
-  int totalLines = (text.length() + maxChars - 1) / maxChars;
-  if (totalLines <= maxLinesVisible) {
-     if (lastVoiceTextY != 0) {
-        lastVoiceTextY = 0; // Reset scroll if new short text
-     }
-  }
-
-  int scrollY = 0;
-  if (totalLines > maxLinesVisible) {
-      int maxScroll = (totalLines - maxLinesVisible) * lineHeight;
-      scrollY = map(millis() % (maxScroll * 100), 0, (maxScroll * 100), 0, maxScroll);
-  }
-
-  int pos = 0;
-  int lineIndex = 0;
-  int yPos = 12;
-  
-  while (pos < (int)text.length() && lineIndex < totalLines) {
-    int spacePos = text.indexOf(' ', pos + maxChars);
-    if (spacePos == -1 || spacePos - pos > maxChars + 5) {
-      spacePos = pos + maxChars;
+  String text = stripNonAscii(currentTtsPart);
+  const int maxChars = 21;
+  const int len = text.length();
+  int pos = 0, lines = 0, y = 13;
+  while (pos < len && lines < 5) {
+    int end = pos + maxChars;
+    if (end >= len) end = len;
+    else {
+      int sp = text.lastIndexOf(' ', end);
+      if (sp > pos) end = sp;
     }
-    if (spacePos > (int)text.length()) spacePos = text.length();
-
-    String line = text.substring(pos, spacePos);
+    String line = text.substring(pos, end);
     line.trim();
-
-    int drawY = yPos - scrollY;
-    if (drawY > 8 && drawY < 64) { // Hanya gambar jika masuk area layar
-      gfxText(0, drawY, line);
-    }
-
-    pos = spacePos;
-    if (pos < (int)text.length() && text[pos] == ' ') pos++;
-    lineIndex++;
-    yPos += lineHeight;
+    gfxText(0, y, line);
+    y += 10;
+    lines++;
+    pos = end;
+    while (pos < len && text[pos] == ' ') pos++;
   }
   presentFrame();
 }
@@ -4570,13 +5038,13 @@ void updateDisplay() {
   if (!introductionFinished)                  { renderIntroduction(); return; }
   
   // TAMPILKAN TEKS JAWABAN SAAT TTS BERBUNYI
-  if (ttsActive && currentVoiceReply.length() > 0) { 
-    renderVoiceText(); 
-    return; 
+  if (ttsActive && voiceTextActive && currentTtsPart.length() > 0) {
+    renderVoiceText();
+    return;
   }
 
   if (companionGenerating || systemState == STATE_THINKING ||
-      voicePipelineActive)                    { renderThinking(); return; }
+      thinkingVisualPrepared)                 { renderThinking(); return; }
   if (conversationActive)                     { renderEyes(); return; }
   if (arrivalActive)                          { renderArrival(); return; }
   if (hudActive)                              { renderHUD(); return; }
@@ -4618,8 +5086,8 @@ void printHelp() {
   Serial.println("1-6 = preset mata | W = WINK | P/N/E = personality");
   Serial.println("R = RESET GPS | V = REKAM SUARA");
   Serial.println("+ / - = VOLUME | Z = MUTE");
-  Serial.println("SUARA : peta, jam berapa, cuaca, lirik, humor, trivia, kuis,");
-  Serial.println("        volume naik/turun, diam");
+  Serial.println("SUARA : tanya apa saja. Minta tampilkan peta/jam/cuaca (kota apa saja),");
+  Serial.println("        kuis, trivia, humor, cerita, lirik, intro, atau tulisan bebas");
   Serial.println("========================================");
 }
 
