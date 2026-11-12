@@ -1,32 +1,22 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.49.0 — VOICE AI CHATBOT + LAYAR DINAMIS
+   OJOL ASSISTEN (ABOT) V3.50.0 — VOICE AI CHATBOT + LAYAR DINAMIS + MUSIK
   ============================================================================
-   Fungsi    : Display navigasi + lyric slide + AI companion + voice chat
+   Fungsi    : Display navigasi + AI companion + voice chat + Music Player
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
    Display   : U8g2 full buffer (HW I2C) + FluxGarage RoboEyes
    Link      : JSON lines via Serial / MQTT (dari HP driver)
    Audio     : Mic INMP441 (i2s_std, port 0) + Speaker MAX98357A (audioI2S, port 1)
    Voice AI  : Groq Whisper (STT) + Groq GPT-OSS (LLM) + Google Translate TTS
-   Wajib     : secrets.h  ->  WIFI_SSID_STR, WIFI_PASS_STR, GROQ_API_KEY_STR
+   Wajib     : secrets.h  ->  WIFI_SSID_STR, WIFI_PASS_STR, GROQ_API_KEY_STR, JAMENDO_CLIENT_ID_STR
    Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
                ESP32-audioI2S
 
-   V3.49.0 PERUBAHAN:
-     • Semua ucapan dijawab LLM (chatbot bebas), LLM juga memilih tampilan OLED:
-       peta, jam, cuaca, kuis, trivia, humor, cerita, lirik, cara pakai, intro,
-       atau KARTU TEKS BEBAS (apa pun yang diminta pengguna).
-     • Cuaca kota mana pun (geocoding Open-Meteo), kota asal = HOME_CITY.
-     • Model Groq dicek otomatis lewat /models (tahan error 404 model_not_found).
-     • Kuis dinilai LLM (benar/salah/tidak tahu) lalu memicu reaksi mata.
-     • Teks OLED tampil per kalimat yang sedang diucapkan; peta/jam/cuaca tidak
-       lagi tertutup teks saat TTS.
-
-   V3.48.5 PERUBAHAN:
-     • OLED Sinkronisasi Per Kalimat: Teks di layar berganti sesuai 
-       dengan kalimat yang sedang diucapkan oleh TTS.
-     • Tidak ada scroll membingungkan. Kalimat dipecah maks 90 karakter.
-     • Model LLM openai/gpt-oss-120b (tersedia di Groq).
+   V3.50.0 PERUBAHAN:
+     • Fitur lirik dihapus total, diganti dengan Music Player Jamendo.
+     • Kontrol tombol ACTION: Tekan = Play/Pause, Tahan = Lagu Berikutnya.
+     • LLM bisa memilih show=music (query / genre / play / pause / next / stop).
+     • Cerita panjang bertahap (more=true) sepanjang yang diminta pengguna.
   ============================================================================
 */
 
@@ -72,7 +62,7 @@ enum DestinationStage       : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.49.0"
+#define FW_VERSION "3.50.0"
 
 #define OTA_SIMULATION_MODE 1
 
@@ -88,8 +78,9 @@ struct StateLock {
 
 // Hasil jawaban LLM (harus di atas: Arduino menaruh prototipe fungsi di sini)
 struct VoiceAct {
-  String say, show, title, card, city, mood, volume, verdict;
+  String say, show, title, card, city, mood, volume, verdict, music, query, genre;
   bool   customWeather = false;
+  bool   more          = false;   // cerita masih berlanjut
 };
 
 // ---------------------------------------------------------------------------
@@ -232,6 +223,7 @@ volatile bool ttsActive           = false;
 volatile bool voicePipelineActive = false;
 volatile bool ttsEof              = false;
 volatile bool ttsStop             = false;
+volatile bool speakAborted        = false;   // TTS dihentikan pengguna (barge-in)
 
 void audio_info(const char* info)       { Serial.printf("[AUDIO] %s\n", info); }
 void audio_eof_speech(const char* info) { ttsEof = true; }
@@ -451,12 +443,13 @@ static bool speakText(const String& text) {
   if (volumeLevel == 0) { Serial.println("[TTS] mute, skip"); return false; }
   if (text.length() == 0) return false;
 
-  String parts[8];
-  int n = splitSpeech(text, parts, 8);
+  String parts[12];
+  int n = splitSpeech(text, parts, 12);
   Serial.printf("[TTS] Speak %d bagian\n", n);
 
   ttsActive = true;
   ttsStop = false;
+  speakAborted = false;
   bool ok = false;
   
   for (int i = 0; i < n && !ttsStop; i++) {
@@ -473,6 +466,7 @@ static bool speakText(const String& text) {
   }
   
   audioI2S.stopSong();
+  speakAborted = ttsStop;
   ttsActive = false;
   ttsStop = false;
   return ok;
@@ -498,7 +492,7 @@ static void audioReportRecordingStats(bool emptyResult) {
                 (unsigned long)dur, recPeak);
 
   if (voiceTaskHandle) {
-    xTaskNotifyGive(voiceTaskHandle);
+    xTaskNotify(voiceTaskHandle, 0x01, eSetBits);
   } else {
     Serial.println("[VOICE] WARN: voiceTaskHandle NULL, STT dilewati");
     linkSend("{\"t\":\"stt_skip\",\"why\":\"voice_task_off\"}");
@@ -702,7 +696,7 @@ enum EyeMood                : unsigned char { EYE_DEFAULT, EYE_HAPPY, EYE_ANGRY,
 enum CharacterEmotion       : unsigned char { CHARACTER_DEFAULT, CHARACTER_LISTENING, CHARACTER_THINKING, CHARACTER_HAPPY, CHARACTER_LAUGH, CHARACTER_CONFUSED, CHARACTER_ANGRY, CHARACTER_TIRED };
 enum AbotPersonality        : unsigned char { ABOT_NEUTRAL, ABOT_MORNING, ABOT_DAY, ABOT_AFTERNOON, ABOT_NIGHT };
 enum PersonalityMode        : unsigned char { PERSONALITY_NORMAL, PERSONALITY_PLAYFUL, PERSONALITY_EXCITED };
-enum CompanionType          : unsigned char { COMPANION_NONE, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_HUMOR, COMPANION_STORY, COMPANION_CHALLENGE, COMPANION_CARD };
+enum CompanionType          : unsigned char { COMPANION_NONE, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_HUMOR, COMPANION_STORY, COMPANION_CARD };
 enum CompanionPlaybackState : unsigned char { COMPANION_IDLE, COMPANION_TYPING, COMPANION_HOLD };
 enum WakeIntroStage         : unsigned char { WAKE_DARK, WAKE_ABOT_HELLO, WAKE_ABOT_PERSONALITY, WAKE_FINISHED };
 enum NetworkJob             : unsigned char { NET_NONE, NET_OSRM, NET_NAVIGATION_AI, NET_COMPANION, NET_WEATHER, NET_GEOCODE };
@@ -733,21 +727,6 @@ struct WeatherData {
   String        condition    = "-";
   unsigned long updatedAt    = 0;
 };
-
-struct LyricScene {
-  const char*    text1;
-  const uint8_t* bitmap;
-  int            bmpWidth;
-  int            bmpHeight;
-};
-
-const LyricScene lyricScenes[] = {
-  {"RUMAHMU YANG DULU TOKO MINUMAN", NULL, 0, 0},
-  {"SEKARANG MENJADI MINI MARKET",   NULL, 0, 0},
-  {"", abotLyricFinalBitmap, 128, 64}
-};
-const int totalLyricScenes = sizeof(lyricScenes) / sizeof(lyricScenes[0]);
-int       currentLyricScene = 0;
 
 // ===========================================================================
 //  KONFIGURASI JARINGAN
@@ -928,18 +907,6 @@ int    companionPage       = 0;
 int    companionTypedChars = 0;
 String previousCompanionText = "";
 String cardTitle = "INFO";
-
-int           runTextX           = SCREEN_WIDTH;
-int           runTextTargetEndX  = 0;
-int           runTextWidth       = 0;
-bool          isTextAnimating    = false;
-unsigned long lastRunTextMillis  = 0;
-
-int           lyricSceneLoaded      = -1;
-bool          lyricTextReachedCenter= false;
-unsigned long lyricHoldStartAt      = 0;
-uint8_t       lyricBitmapFrameCache[1024];
-bool          lyricBitmapCacheValid = false;
 
 bool conversationActive = false;
 bool   voiceTextActive = false;   // true = teks balasan tampil di OLED saat TTS
@@ -1361,7 +1328,6 @@ String companionName(CompanionType type) {
     case COMPANION_TRIVIA:    return "TRIVIA";
     case COMPANION_HUMOR:     return "HUMOR";
     case COMPANION_STORY:     return "STORY";
-    case COMPANION_CHALLENGE: return "LIRIK";
     case COMPANION_CARD:      return cardTitle;
     default:                  return "COMPANION";
   }
@@ -1430,10 +1396,6 @@ void  finishCompanionGeneration(const String& text, CompanionType type);
 void  finishCompanion();
 void  renderCompanion();
 void  renderCompanionNextMenu();
-void  renderSeventeenLyrics();
-void  renderBitmapScene(const LyricScene& scene);
-void  startRunningText(const char* text);
-bool  updateRunningText(const char* text);
 void  openCompanionNextMenu(unsigned long delayMs);
 void  closeCompanionNextMenu();
 void  handleArrival();
@@ -1477,6 +1439,9 @@ void  onLinkPing();
 void  startOTAUpdate(const String& url, const String& requestId = "",
                      const String& targetVersion = "");
 void  updateDisplay();
+
+#define MUSIC_USE_VU 0
+#include "music_player.h"
 
 // ===========================================================================
 //  AI ASISTEN: model Groq otomatis + LLM berformat JSON (jawaban + aksi layar)
@@ -1630,7 +1595,7 @@ static String buildSystemPrompt(const String& extra) {
        "say: kalimat yang dibacakan suara. Tanpa emoji dan markdown, enak diucapkan, "
        "1-3 kalimat (cerita boleh sampai 5 kalimat).\n"
        "show: tampilan layar OLED, salah satu: none, map (peta rute), clock (jam), "
-       "weather (cuaca), quiz, trivia, humor, story, lyrics (animasi lirik), "
+       "weather (cuaca), quiz, trivia, humor, story, music (putar lagu), "
        "usage (cara pakai), intro (animasi perkenalan), card (teks bebas di layar).\n"
        "title: judul pendek huruf kapital maksimal 14 karakter, untuk card.\n"
        "card: teks di layar untuk show quiz, trivia, humor, story, atau card. "
@@ -1639,6 +1604,18 @@ static String buildSystemPrompt(const String& extra) {
        "mood: ekspresi mata sesuai nada jawaban: default, happy, laugh, confused, angry, tired.\n"
        "volume: none, up, down, mute, unmute.\n"
        "verdict: hanya saat ada kuis aktif dan pengguna menjawabnya: correct, wrong, atau unknown. Selain itu kosongkan.\n"
+       "music: hanya saat show=music: play, pause, resume, next, atau stop. Kalau pengguna minta putar lagu, isi play.\n"
+       "query: judul lagu atau nama artis kalau pengguna menyebutnya, selain itu kosongkan.\n"
+       "genre: tag musik Jamendo huruf kecil bahasa Inggris (pop, rock, lofi, chillout, lounge, jazz, "
+       "electronic, hiphop, classical, acoustic, ambient, relaxation, folk, reggae, blues, metal) "
+       "kalau pengguna minta suasana atau genre, selain itu kosongkan. Katalog Jamendo hanya berisi musik "
+       "bebas lisensi, bukan lagu populer. Kalau diminta lagu populer, tetap show=music dengan genre "
+       "terdekat dan jelaskan singkat di say.\n"
+       "more: true kalau kamu sedang menceritakan cerita panjang dan masih ada bagian berikutnya, selain itu false.\n"
+       "Cerita: kalau pengguna tidak menyebut panjang, ceritakan utuh dalam satu balasan (more=false). "
+       "Kalau pengguna minta cerita panjang atau menyebut durasi, ceritakan bertahap: tiap balasan satu "
+       "bagian 4-5 kalimat, show=none, more=true sampai bagian penutup yang more=false. "
+       "Satu bagian kira-kira 40 detik bicara, sesuaikan jumlah bagian dengan durasi yang diminta.\n"
        "Aturan: pakai show=card kalau pengguna minta sesuatu ditampilkan di layar "
        "(tulisan, daftar, angka, hasil hitungan, ringkasan, kata-kata) walau tidak ada di daftar. "
        "Kalau pengguna minta tampilan tertentu, pilih show yang sesuai (misal tampilkan peta -> map). "
@@ -1766,6 +1743,10 @@ static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) 
       act.mood   = lc(String((const char*)(j["mood"]   | "default")));
       act.volume = lc(String((const char*)(j["volume"] | "none")));
       act.verdict= lc(String((const char*)(j["verdict"]| "")));
+      act.music  = lc(String((const char*)(j["music"]   | "")));
+      act.query  = String((const char*)(j["query"]  | ""));
+      act.genre  = lc(String((const char*)(j["genre"]  | "")));
+      act.more   = j["more"] | false;
       parsed = true;
     }
   }
@@ -1779,10 +1760,14 @@ static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) 
   act.title.trim();
 
   const char* okShow[] = {"none", "map", "clock", "weather", "quiz", "trivia", "humor",
-                          "story", "lyrics", "usage", "intro", "card"};
+                          "story", "music", "usage", "intro", "card"};
   bool valid = false;
   for (auto s : okShow) if (act.show == s) valid = true;
   if (!valid) act.show = "none";
+  if (act.more && act.show != "none") act.show = "none";   // cerita bertahap tampil per kalimat
+  act.query.trim();
+  act.genre.trim();
+  
   return true;
 }
 
@@ -1951,7 +1936,7 @@ static void voiceApply(const VoiceAct& act) {
 
   const String& s = act.show;
   const String  body = act.card.length() ? act.card : act.say;
-  voiceTextActive = (s == "none");   // teks balasan tampil per kalimat hanya kalau tidak ada layar khusus
+  voiceTextActive = (s == "none" || act.more);   // teks balasan tampil per kalimat hanya kalau tidak ada layar khusus
 
   if (quizWaitingAnswer && act.verdict.length() > 0) {
     if      (act.verdict == "correct") handleQuizAnswer('J');
@@ -1962,7 +1947,7 @@ static void voiceApply(const VoiceAct& act) {
   if      (s == "map")     handleCommand('M');
   else if (s == "clock")   startInfoMode();
   else if (s == "weather") showWeatherView(act.customWeather);
-  else if (s == "lyrics")  handleCommand('D');
+  else if (s == "music")   { voiceClearScreens(); musicPostFromAct(act.music, act.query, act.genre); }
   else if (s == "usage")   handleCommand('U');
   else if (s == "intro")   voiceShowIntro();
   else if (s == "quiz")    voiceShowCard(COMPANION_QUIZ,   "", body);
@@ -2036,8 +2021,17 @@ static bool voiceLocalCommand(String t, String& say, bool allowContent) {
   if (t.indexOf("jam") >= 0) {
     startInfoMode(); say = timeSentence(); return true;
   }
-  if (t.indexOf("lirik") >= 0) {
-    handleCommand('D'); say = "Siap, kita putar lirik."; return true;
+  if (t.indexOf("lagu berikutnya") >= 0 || t.indexOf("lagu selanjutnya") >= 0 ||
+      t.indexOf("ganti lagu") >= 0 || t.indexOf("skip") >= 0) {
+    musicRequestPost(MCMD_NEXT, "", ""); say = "Oke, lagu berikutnya."; return true;
+  }
+  if (t.indexOf("stop musik") >= 0 || t.indexOf("matikan musik") >= 0 ||
+      t.indexOf("matikan lagu") >= 0 || t.indexOf("berhenti musik") >= 0) {
+    musicRequestPost(MCMD_STOP, "", ""); say = "Oke, musiknya kumatikan."; return true;
+  }
+  if (t.indexOf("lanjut musik") >= 0 || t.indexOf("lanjutkan musik") >= 0 ||
+      t.indexOf("lanjut lagu") >= 0 || t.indexOf("putar lagi") >= 0) {
+    musicRequestPost(MCMD_RESUME, "", ""); say = "Siap, kulanjutkan."; return true;
   }
   if (t.indexOf("intro") >= 0) {
     voiceShowIntro(); say = "Oke, kita mulai dari awal."; return true;
@@ -2076,7 +2070,39 @@ static String quizKeywordFallback(const String& transcript) {
   return "Aku belum bisa menilai jawaban itu, anggap tidak tahu ya.";
 }
 
+constexpr int STORY_MAX_SEGMENTS = 24;
+
+// Cerita panjang: LLM dipanggil per bagian, tiap bagian langsung diucapkan.
+static void storyContinue(const String& request, const VoiceAct& first) {
+  String told = first.say;
+  bool   more = first.more;
+  for (int seg = 1; seg < STORY_MAX_SEGMENTS && more; seg++) {
+    if (ttsStop || speakAborted || volumeLevel == 0) break;
+    String tail = (told.length() > 500) ? told.substring(told.length() - 500) : told;
+    String extra = " Kamu sedang menceritakan cerita bertahap untuk permintaan pengguna: \"" + request +
+                   "\". Ini bagian ke-" + String(seg + 1) +
+                   ". Bagian terakhir yang sudah kamu ceritakan: \"" + tail +
+                   "\". Lanjutkan 4-5 kalimat berikutnya tanpa mengulang. Isi more=true kalau cerita masih "
+                   "berlanjut, atau more=false kalau ini bagian penutup. show harus none.";
+    VoiceAct nxt;
+    if (!groqAsk("Lanjutkan ceritanya.", extra, nxt) || nxt.say.length() == 0) {
+      voiceTextMode(true);
+      speakText("Maaf, ceritanya terputus karena koneksi. Coba minta lagi nanti ya.");
+      break;
+    }
+    if (ttsStop || speakAborted) break;
+    told += " ";
+    told += nxt.say;
+    more = nxt.more;
+    voiceEmotion(moodFromString(nxt.mood));
+    voiceTextMode(true);
+    speakText(nxt.say);
+  }
+  ttsStop = false;
+}
+
 static void voiceProcess() {
+  musicDropStream();
   voiceTextMode(false);
   if (WiFi.status() != WL_CONNECTED) {
     voiceReact(CHARACTER_CONFUSED);
@@ -2196,20 +2222,32 @@ static void voiceProcess() {
 
   voiceApply(act);
   speakText(act.say);
+  if (act.more) storyContinue(transcript, act);
   voiceEmotion(CHARACTER_DEFAULT);
 }
 
 static void voiceTask(void* pv) {
+  unsigned long lastModelCheck = 0;
   for (;;) {
-    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(3000)) == 0) {
-      // idle: cek model Groq di latar belakang setelah WiFi siap
-      if (!modelChecked && millis() > 6000) groqEnsureModel();
+    uint32_t bits = 0;
+    const bool fast = (musicState == MUS_PLAYING || musicState == MUS_LOADING || musicStopReq);
+    const TickType_t wait = fast ? pdMS_TO_TICKS(2) : pdMS_TO_TICKS(500);
+
+    if (xTaskNotifyWait(0, 0xFFFFFFFF, &bits, wait) == pdFALSE) {
+      musicTick();                                   // jaga stream musik tetap mengalir
+      if (!fast && !modelChecked && millis() > 6000 && millis() - lastModelCheck > 3000) {
+        lastModelCheck = millis();
+        groqEnsureModel();
+      }
       continue;
     }
-    voicePipelineActive = true;
-    ttsStop = false;
-    voiceProcess();
-    voicePipelineActive = false;
+    if (bits & 0x01) {                               // rekaman suara selesai
+      voicePipelineActive = true;
+      ttsStop = false;
+      voiceProcess();
+      voicePipelineActive = false;
+    }
+    if (bits & 0x02) musicServiceRequest();          // permintaan musik (tombol/suara/serial)
   }
 }
 
@@ -2269,7 +2307,7 @@ void mqttUpdate() {
   mqttLastReconnectAttempt = now;
 
   char clientId[40];
-  snprintf(clientId, sizeof(clientId), "ABOT-V3485-%08lx%04x",
+  snprintf(clientId, sizeof(clientId), "ABOT-V3500-%08lx%04x",
            (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF),
            (unsigned)random(0xFFFF));
 
@@ -3243,7 +3281,7 @@ void updateSleepMode() {
     !companionGenerating && !companionActive && !companionNextMenuActive &&
     !companionNextMenuPending && !conversationActive &&
     systemState != STATE_THINKING && !mapRequested && !hudActive &&
-    !arrivalActive && !characterReactionActive && !otaActive;
+    !arrivalActive && !characterReactionActive && !otaActive && !musicScreenWanted();
   if (!safeForSleep) {
     lastUserActivityMs = millis();
     if (sleepModeActive) wakeFromSleep();
@@ -3313,6 +3351,7 @@ void startListening() {
     return;
   }
   if (voicePipelineActive) {
+    ttsStop = true;   // hentikan cerita panjang / pipeline
     Serial.println("[VOICE] Pipeline sibuk — tunggu selesai");
     return;
   }
@@ -3324,6 +3363,7 @@ void startListening() {
   companionNextMenuPending= false;
   cancelThinking();
 
+  musicStopForVoice();   // musik berhenti selama pengguna bicara
   conversationActive = true;
   listeningActive    = true;
   listeningState     = LISTENING_ACTIVE;
@@ -3380,8 +3420,10 @@ void startActionButtonFunction() {
   conversationActive      = false;
   hudActive               = false;
   cancelThinking();
-  startCompanion(COMPANION_CHALLENGE);
-  Serial.println("[BUTTON ACTION] SHORT -> LIRIK ANIMASI");
+  infoModeActive           = false;
+  mapRequested             = false;
+  musicRequestPost(MCMD_TOGGLE, "", "");
+  Serial.println("[BUTTON ACTION] SHORT -> MUSIK");
 }
 
 void startActionCompanionRandom() {
@@ -3441,7 +3483,8 @@ void updateButtons() {
       unsigned long held = now - actionPressedAt;
       if (listeningActive) return;
       if (held < BUTTON_HOLD_MS) startActionButtonFunction();
-      else                       startActionCompanionRandom();
+      else if (musicHasSession()) musicRequestPost(MCMD_NEXT, "", "");
+      else startActionCompanionRandom();
     }
   }
 }
@@ -3776,7 +3819,7 @@ void renderStartupOnboarding() {
     gfxLine(10, 13, 117, 13);
     gfxText(2, 20, "TALK tahan=bicara");
     gfxText(2, 32, "TALK tekan=jam/cuaca");
-    gfxText(2, 44, "ACTION tekan=LIRIK");
+    gfxText(2, 44, "ACTION tekan=MUSIK");
     gfxText(2, 56, "ACTION tahan=hiburan");
     presentFrame();
     unsigned long usageMs = fastLink ? STARTUP_USAGE_LINK_MS
@@ -4241,88 +4284,6 @@ int companionPageTotalChars() {
 }
 
 // ===========================================================================
-//  LYRIC ANIMATION
-// ===========================================================================
-void startRunningText(const char* text) {
-  runTextWidth        = gfxTextWidth(String(text), 2);
-  runTextTargetEndX   = -runTextWidth;
-  runTextX            = SCREEN_WIDTH;
-  isTextAnimating     = true;
-  lastRunTextMillis   = millis();
-}
-
-bool updateRunningText(const char* text) {
-  if (!isTextAnimating) return true;
-  gfxFillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_WHITE);
-  gfxTextScrolling(runTextX, 22, text, 2, COLOR_BLACK);
-  runTextX -= 3;
-  if (runTextX <= runTextTargetEndX) {
-    isTextAnimating = false;
-    return true;
-  }
-  return false;
-}
-
-void renderBitmapScene(const LyricScene& scene) {
-  gfxBitmap(0, 0, scene.bitmap, scene.bmpWidth, scene.bmpHeight, COLOR_WHITE);
-}
-
-void renderSeventeenLyrics() {
-  if (currentLyricScene >= totalLyricScenes) currentLyricScene = 0;
-  const LyricScene& scene = lyricScenes[currentLyricScene];
-  const bool newScene = (lyricSceneLoaded != currentLyricScene);
-  if (newScene) {
-    lyricSceneLoaded      = currentLyricScene;
-    lyricTextReachedCenter= false;
-    isTextAnimating       = false;
-    lyricHoldStartAt      = 0;
-    lyricBitmapCacheValid = false;
-    if (scene.bitmap == NULL) startRunningText(scene.text1);
-    else                      lyricHoldStartAt = millis();
-  }
-
-  if (scene.bitmap != NULL) {
-    if (!lyricBitmapCacheValid) {
-      beginFrame();
-      renderBitmapScene(scene);
-      memcpy(lyricBitmapFrameCache, u8g2.getBufferPtr(),
-             sizeof(lyricBitmapFrameCache));
-      lyricBitmapCacheValid = true;
-    } else {
-      memcpy(u8g2.getBufferPtr(), lyricBitmapFrameCache,
-             sizeof(lyricBitmapFrameCache));
-    }
-    if (lyricHoldStartAt > 0 && millis() - lyricHoldStartAt >= 1500) {
-      lyricHoldStartAt = 0;
-      currentLyricScene++;
-    }
-    presentFrame();
-  } else {
-    beginFrame();
-    if (!lyricTextReachedCenter) {
-      if (updateRunningText(scene.text1)) {
-        lyricTextReachedCenter = true;
-        lyricHoldStartAt       = millis();
-      }
-    } else {
-      gfxFillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_WHITE);
-      gfxTextScrolling(runTextX, 22, scene.text1, 2, COLOR_BLACK);
-      if (lyricHoldStartAt > 0 && millis() - lyricHoldStartAt >= 1200) {
-        lyricHoldStartAt = 0;
-        currentLyricScene++;
-      }
-    }
-    presentFrame();
-  }
-
-  if (currentLyricScene >= totalLyricScenes) {
-    currentLyricScene = 0;
-    lyricSceneLoaded  = -1;
-    finishCompanion();
-  }
-}
-
-// ===========================================================================
 //  NETWORK JOB STARTERS
 // ===========================================================================
 bool startNetworkJob(NetworkJob job, const char* taskName,
@@ -4424,18 +4385,6 @@ void startCompanion(CompanionType type) {
   companionGenerating = true;
   systemState       = STATE_THINKING;
 
-  if (type == COMPANION_CHALLENGE) {
-    lyricSceneLoaded       = -1;
-    lyricTextReachedCenter = false;
-    lyricHoldStartAt       = 0;
-    lyricBitmapCacheValid  = false;
-    currentLyricScene  = 0;
-    companionActive    = true;
-    companionGenerating= false;
-    systemState        = STATE_READY;
-    return;
-  }
-
   setEyeMood(EYE_DEFAULT);
   beginThinkingVisual();
   companionRequestCounter++;
@@ -4486,7 +4435,6 @@ void finishCompanionGeneration(const String& rawText, CompanionType type) {
 
 void finishCompanion() {
   const bool wasCard = (currentCompanion == COMPANION_CARD);
-  currentLyricScene = 0;
   companionActive     = false;
   companionGenerating = false;
   companionPlayback   = COMPANION_IDLE;
@@ -4539,10 +4487,6 @@ void updateCompanionNextMenu() {
 }
 
 void renderCompanion() {
-  if (currentCompanion == COMPANION_CHALLENGE) {
-    renderSeventeenLyrics();
-    return;
-  }
   beginFrame();
   String title = companionName(currentCompanion);
   int titleX = (128 - (int)title.length() * 6) / 2;
@@ -4581,7 +4525,7 @@ void renderCompanionNextMenu() {
     gfxText(5, 16, "Q  QUIZ LAGI");
     gfxText(5, 28, "T  TRIVIA");
     gfxText(5, 40, "S  STORY");
-    gfxText(5, 52, "D  LIRIK LAGU");
+    gfxText(5, 52, "D  MUSIK");
   } else {
     gfxText(5, 16, "H  HUMOR");
     gfxText(5, 28, "X  SELESAI");
@@ -4593,7 +4537,6 @@ void renderCompanionNextMenu() {
 
 void updateCompanion() {
   if (!companionActive) return;
-  if (currentCompanion == COMPANION_CHALLENGE) return;
   if (companionPlayback == COMPANION_TYPING) {
     if (millis() - companionLastType >= TYPING_INTERVAL) {
       companionLastType = millis();
@@ -5049,6 +4992,7 @@ void updateDisplay() {
   if (arrivalActive)                          { renderArrival(); return; }
   if (hudActive)                              { renderHUD(); return; }
   if (mapRequested)                           { renderMap(); return; }
+  if (musicScreenWanted())                    { renderMusic(); return; }
   if (sleepModeActive)                        { renderSleep(); return; }
   renderEyes();
 }
@@ -5077,17 +5021,17 @@ void printHelp() {
   Serial.println("========================================");
   Serial.println("COMMANDS:");
   Serial.println("TOMBOL TALK   : tahan=bicara (STT+LLM+TTS), tekan=jam/cuaca");
-  Serial.println("TOMBOL ACTION : tekan=lirik, tahan=companion acak");
+  Serial.println("TOMBOL ACTION : tekan=play/pause musik, tahan=lagu berikut / companion acak");
   Serial.println("M = MAP | U = CARA MENGGUNAKAN | G = TRIP BARU");
   Serial.println("C = CONVERSATION ON / X = OFF");
   Serial.println("Q = QUIZ | T = TRIVIA | H = HUMOR | S = STORY");
-  Serial.println("D = LIRIK SEVENTEEN | J/K/L = quiz answer");
+  Serial.println("D = MUSIK | > = LAGU BERIKUT | F = STOP MUSIK | J/K/L = quiz answer");
   Serial.println("A = NAVIGATION AI | B = THINKING DEMO");
   Serial.println("1-6 = preset mata | W = WINK | P/N/E = personality");
   Serial.println("R = RESET GPS | V = REKAM SUARA");
   Serial.println("+ / - = VOLUME | Z = MUTE");
   Serial.println("SUARA : tanya apa saja. Minta tampilkan peta/jam/cuaca (kota apa saja),");
-  Serial.println("        kuis, trivia, humor, cerita, lirik, intro, atau tulisan bebas");
+  Serial.println("        kuis, trivia, humor, cerita, musik, intro, atau tulisan bebas");
   Serial.println("========================================");
 }
 
@@ -5099,7 +5043,7 @@ void handleCommand(char cmd) {
       if (cmd == 'Q')      startCompanion(COMPANION_QUIZ);
       else if (cmd == 'T') startCompanion(COMPANION_TRIVIA);
       else if (cmd == 'S') startCompanion(COMPANION_STORY);
-      else if (cmd == 'D') startCompanion(COMPANION_CHALLENGE);
+      else if (cmd == 'D') musicRequestPost(MCMD_PLAY, "", "");
       else if (cmd == 'H') startCompanion(COMPANION_HUMOR);
       return;
     }
@@ -5141,7 +5085,9 @@ void handleCommand(char cmd) {
   if (cmd == 'T') { startCompanion(COMPANION_TRIVIA);    return; }
   if (cmd == 'H') { startCompanion(COMPANION_HUMOR);     return; }
   if (cmd == 'S') { startCompanion(COMPANION_STORY);     return; }
-  if (cmd == 'D') { startCompanion(COMPANION_CHALLENGE); return; }
+  if (cmd == 'D') { musicRequestPost(MCMD_TOGGLE, "", ""); return; }
+  if (cmd == '>') { musicRequestPost(MCMD_NEXT,   "", ""); return; }
+  if (cmd == 'F') { musicRequestPost(MCMD_STOP,   "", ""); return; }
   if (cmd >= '1' && cmd <= '6') {
     abotHoldUntil = millis() + 8000;
     if      (cmd == '1') setEyeMood(EYE_DEFAULT);
