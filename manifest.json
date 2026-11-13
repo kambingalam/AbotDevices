@@ -5,7 +5,7 @@
   "min_version": "3.51.0",
   "url": "https://github.com/kambingalam/AbotDevices/releases/download/v3.51.1/abot_3.51.1.ino.bin",
   "size": 2177024,
-  "sha256": "ed0de09fff42e0887177c8d763091d0b37b1e3b4ae297004186a16930a8bb0a9",
+  "sha256": "a762a165bc6e978bd5f0af085ab15a80cb037cc714e78fcf128acec81eee5b13",
   "min_battery": 30,
   "released": "2026-11-13",
   "notes": ["OTA beneran pertama"]
