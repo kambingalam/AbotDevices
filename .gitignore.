@@ -1,0 +1,4 @@
+secrets.h
+build/
+*.zip
+.DS_Store
