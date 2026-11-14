@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.51.2",
+  "version": "3.51.3",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/v3.51.2/abot_3_51_2.ino.bin",
-  "size": 2179056,
-  "sha256": "dac41b789ba47df7e55d3ea228c00e44a063a8854af3ffb9e388e8ed425cbd98",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/v3.51.3/abot_3_51_3.ino.bin",
+  "size": 2179360,
+  "sha256": "623ca3ea16c9f3e59429fc04927f7c85dcb6021a2296d184878591355fc945d2",
   "min_battery": 30,
   "released": "2026-11-13",
-  "notes": ["OTA beneran pertama"]
+  "notes": ["bug TTS,MUSIC,API KEY BARU GROQ"]
 }
