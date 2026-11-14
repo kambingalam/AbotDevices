@@ -1,6 +1,6 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.50.0 — VOICE AI CHATBOT + LAYAR DINAMIS + MUSIK
+   OJOL ASSISTEN (ABOT) V3.51.0 — VOICE AI CHATBOT + LAYAR DINAMIS + MUSIK
   ============================================================================
    Fungsi    : Display navigasi + AI companion + voice chat + Music Player
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
@@ -12,29 +12,31 @@
    Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
                ESP32-audioI2S
 
-   V3.50.0 PERUBAHAN:
-     • Fitur lirik dihapus total, diganti dengan Music Player Jamendo.
-     • Kontrol tombol ACTION: Tekan = Play/Pause, Tahan = Lagu Berikutnya.
-     • LLM bisa memilih show=music (query / genre / play / pause / next / stop).
-     • Cerita panjang bertahap (more=true) sepanjang yang diminta pengguna.
+   V3.51.0 PERUBAHAN:
+     • OTA BENERAN (bukan simulasi): download firmware dari URL, verify SHA256.
+     • sfxPlay() dipasang di event-event penting (boot, klik, record, reply, error).
+     • Perbaikan bug penumpukan pesan di mqttCallback.
+     • Cek heap dilewati saat voice pipeline sibuk (cegah restart palsu).
+     • Perketat deteksi perintah suara "jam".
+     • Tambah perintah serial '$' untuk tes buzzer.
   ============================================================================
 */
 
 // ---------------------------------------------------------------------------
 // Auto-prototype workaround untuk Arduino IDE
 // ---------------------------------------------------------------------------
-enum CompanionType          : unsigned char;
-enum AbotPersonality        : unsigned char;
-enum EyeMood                : unsigned char;
-enum NetworkJob             : unsigned char;
-enum SystemState            : unsigned char;
-enum CharacterEmotion       : unsigned char;
-enum PersonalityMode        : unsigned char;
-enum StartupStage           : unsigned char;
-enum ListeningState         : unsigned char;
+enum CompanionType : unsigned char;
+enum AbotPersonality : unsigned char;
+enum EyeMood : unsigned char;
+enum NetworkJob : unsigned char;
+enum SystemState : unsigned char;
+enum CharacterEmotion : unsigned char;
+enum PersonalityMode : unsigned char;
+enum StartupStage : unsigned char;
+enum ListeningState : unsigned char;
 enum CompanionPlaybackState : unsigned char;
-enum WakeIntroStage         : unsigned char;
-enum DestinationStage       : unsigned char;
+enum WakeIntroStage : unsigned char;
+enum DestinationStage : unsigned char;
 
 // ---------------------------------------------------------------------------
 // Includes
@@ -53,7 +55,11 @@ enum DestinationStage       : unsigned char;
 #include <freertos/semphr.h>
 #include <driver/i2s_std.h>
 #include <esp_heap_caps.h>
+#include <mbedtls/sha256.h>
 #include <Audio.h>
+
+#include <Preferences.h>
+#include <esp_ota_ops.h>
 
 #include "secrets.h"
 #include <FluxGarage_RoboEyes.h>
@@ -62,25 +68,30 @@ enum DestinationStage       : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.50.0"
+#define FW_VERSION "3.51.2"
 
-#define OTA_SIMULATION_MODE 1
+#define OTA_SIMULATION_MODE 0
 
 // ---------------------------------------------------------------------------
 // Shared state mutex
 // ---------------------------------------------------------------------------
 SemaphoreHandle_t stateMutex = nullptr;
+SemaphoreHandle_t mqttMutex = nullptr;
 
 struct StateLock {
-  StateLock()  { if (stateMutex) xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY); }
-  ~StateLock() { if (stateMutex) xSemaphoreGiveRecursive(stateMutex); }
+  StateLock() {
+    if (stateMutex) xSemaphoreTakeRecursive(stateMutex, portMAX_DELAY);
+  }
+  ~StateLock() {
+    if (stateMutex) xSemaphoreGiveRecursive(stateMutex);
+  }
 };
 
 // Hasil jawaban LLM (harus di atas: Arduino menaruh prototipe fungsi di sini)
 struct VoiceAct {
   String say, show, title, card, city, mood, volume, verdict, music, query, genre;
-  bool   customWeather = false;
-  bool   more          = false;   // cerita masih berlanjut
+  bool customWeather = false;
+  bool more = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -93,161 +104,163 @@ extern TaskHandle_t voiceTaskHandle;
 // MultiPartStream
 // ---------------------------------------------------------------------------
 class MultiPartStream : public Stream {
- public:
+public:
   MultiPartStream(const String& head, const uint8_t* body, size_t bodyLen,
                   const String& tail)
-      : head_(head), body_(body), bodyLen_(bodyLen), tail_(tail),
-        headPos_(0), bodyPos_(0), tailPos_(0) {
+    : head_(head), body_(body), bodyLen_(bodyLen), tail_(tail),
+      headPos_(0), bodyPos_(0), tailPos_(0) {
     totalLen_ = head_.length() + bodyLen_ + tail_.length();
   }
-
-  size_t totalLength() const { return totalLen_; }
-
+  size_t totalLength() const {
+    return totalLen_;
+  }
   int available() override {
     return (int)(totalLen_ - position());
   }
-
   int read() override {
     if (headPos_ < head_.length()) return (uint8_t)head_[headPos_++];
-    if (bodyPos_ < bodyLen_)       return (uint8_t)body_[bodyPos_++];
+    if (bodyPos_ < bodyLen_) return (uint8_t)body_[bodyPos_++];
     if (tailPos_ < tail_.length()) return (uint8_t)tail_[tailPos_++];
     return -1;
   }
-
   int peek() override {
     if (headPos_ < head_.length()) return (uint8_t)head_[headPos_];
-    if (bodyPos_ < bodyLen_)       return (uint8_t)body_[bodyPos_];
+    if (bodyPos_ < bodyLen_) return (uint8_t)body_[bodyPos_];
     if (tailPos_ < tail_.length()) return (uint8_t)tail_[tailPos_];
     return -1;
   }
-
   void flush() override {}
-  size_t write(uint8_t) override { return 0; }
+  size_t write(uint8_t) override {
+    return 0;
+  }
 
- private:
-  size_t position() const { return headPos_ + bodyPos_ + tailPos_; }
-
-  String         head_;
+private:
+  size_t position() const {
+    return headPos_ + bodyPos_ + tailPos_;
+  }
+  String head_;
   const uint8_t* body_;
-  size_t         bodyLen_;
-  String         tail_;
-  size_t         totalLen_;
-  size_t         headPos_;
-  size_t         bodyPos_;
-  size_t         tailPos_;
+  size_t bodyLen_;
+  String tail_;
+  size_t totalLen_;
+  size_t headPos_;
+  size_t bodyPos_;
+  size_t tailPos_;
 };
 
 // ===========================================================================
 //  KONFIGURASI HARDWARE
 // ===========================================================================
-constexpr int      SCREEN_WIDTH          = 128;
-constexpr int      SCREEN_HEIGHT         = 64;
-constexpr int      OLED_SDA              = 8;
-constexpr int      OLED_SCL              = 9;
-constexpr uint32_t OLED_I2C_CLOCK_HZ     = 400000;
-constexpr int      BUTTON_TALK           = 10;
-constexpr int      BUTTON_ACTION         = 11;
+constexpr int SCREEN_WIDTH = 128;
+constexpr int SCREEN_HEIGHT = 64;
+constexpr int OLED_SDA = 8;
+constexpr int OLED_SCL = 9;
+constexpr uint32_t OLED_I2C_CLOCK_HZ = 400000;
+constexpr int BUTTON_TALK = 10;
+constexpr int BUTTON_ACTION = 11;
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 35;
-constexpr unsigned long BUTTON_HOLD_MS     = 450;
+constexpr unsigned long BUTTON_HOLD_MS = 450;
 
 constexpr uint8_t COLOR_BLACK = 0;
 constexpr uint8_t COLOR_WHITE = 1;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
-    U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+  U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 // ===========================================================================
 //  AUDIO HARDWARE
 // ===========================================================================
-constexpr int MIC_SCK  = 5;
-constexpr int MIC_WS   = 4;
-constexpr int MIC_SD   = 6;
+constexpr int MIC_SCK = 5;
+constexpr int MIC_WS = 4;
+constexpr int MIC_SD = 6;
 constexpr int SPK_BCLK = 15;
-constexpr int SPK_LRC  = 16;
-constexpr int SPK_DIN  = 17;
+constexpr int SPK_LRC = 16;
+constexpr int SPK_DIN = 17;
 
 constexpr int AUDIO_SAMPLE_RATE = 16000;
 constexpr i2s_port_t AUDIO_MIC_PORT = I2S_NUM_0;
 
-constexpr int MIC_GAIN          = 8;
+constexpr int MIC_GAIN = 8;
 constexpr int REC_SECONDS_PSRAM = 20;
-constexpr int REC_SECONDS_HEAP  = 2;
+constexpr int REC_SECONDS_HEAP = 2;
 
-// --- Groq API ---
 #ifndef GROQ_API_KEY_STR
 #error "GROQ_API_KEY_STR wajib ada di secrets.h (ambil gratis di console.groq.com/keys)"
 #endif
-const char* GROQ_STT_URL      = "https://api.groq.com/openai/v1/audio/transcriptions";
-const char* GROQ_STT_MODEL    = "whisper-large-v3-turbo";
-const char* GROQ_CHAT_URL     = "https://api.groq.com/openai/v1/chat/completions";
-const char* GROQ_MODELS_URL   = "https://api.groq.com/openai/v1/models";
-const char* GROQ_CHAT_MODEL   = "openai/gpt-oss-120b"; 
-const char* GROQ_CHAT_MODEL_2 = "qwen/qwen3.8-27b";      
+const char* GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+const char* GROQ_STT_MODEL = "whisper-large-v3-turbo";
+const char* GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
+const char* GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models";
+const char* GROQ_CHAT_MODEL = "openai/gpt-oss-120b";
+const char* GROQ_CHAT_MODEL_2 = "qwen/qwen3.8-27b";
 
-const unsigned long STT_TIMEOUT_MS  = 15000;
+const unsigned long STT_TIMEOUT_MS = 15000;
 const unsigned long CHAT_TIMEOUT_MS = 10000;
-const size_t        STT_MIN_BYTES   = 19200;   // min 0,6 detik (hindari halusinasi "terima kasih")
+const size_t STT_MIN_BYTES = 19200;
 
 static int sttLastCode = 0;
 static int lastLlmHttp = 0;
 
-enum AudioCmdType : unsigned char { ACMD_REC_START = 1, ACMD_REC_STOP };
+enum AudioCmdType : unsigned char { ACMD_REC_START = 1,
+                                    ACMD_REC_STOP };
 
 struct AudioCmd {
   uint8_t type;
   uint8_t arg;
 };
 
-QueueHandle_t audioQueue    = nullptr;
+QueueHandle_t audioQueue = nullptr;
 volatile bool audioMicReady = false;
-volatile int  audioPending  = 0;
-volatile bool audioRecording= false;
-volatile int  audioMicBars  = 0;
+volatile int audioPending = 0;
+volatile bool audioRecording = false;
+volatile int audioMicBars = 0;
 
-int volumeLevel      = 3;
+int volumeLevel = 3;
 int volumeBeforeMute = 3;
 constexpr int VOLUME_LEVEL_MAX = 5;
 
-int16_t* recBuf      = nullptr;
-size_t   recCapacity = 0;
-size_t   recLength   = 0;
-int      recPeak     = 0;
-bool     recAutoFinished = false;
+int16_t* recBuf = nullptr;
+size_t recCapacity = 0;
+size_t recLength = 0;
+int recPeak = 0;
+bool recAutoFinished = false;
 
-// Audio I2S channel (mic)
 i2s_chan_handle_t micRxHandle = nullptr;
 
-// TTS object
 Audio audioI2S(I2S_NUM_1);
-volatile bool ttsActive           = false;
+volatile bool ttsActive = false;
 volatile bool voicePipelineActive = false;
-volatile bool ttsEof              = false;
-volatile bool ttsStop             = false;
-volatile bool speakAborted        = false;   // TTS dihentikan pengguna (barge-in)
+volatile bool ttsEof = false;
+volatile bool ttsStop = false;
+volatile bool speakAborted = false;
 
-void audio_info(const char* info)       { Serial.printf("[AUDIO] %s\n", info); }
-void audio_eof_speech(const char* info) { ttsEof = true; }
+void audio_info(const char* info) {
+  Serial.printf("[AUDIO] %s\n", info);
+}
+void audio_eof_speech(const char* info) {
+  ttsEof = true;
+}
 
 // ===========================================================================
-//  I2S DRIVER INIT (MIC — driver baru i2s_std)
+//  I2S DRIVER INIT (MIC)
 // ===========================================================================
 static bool audioMicDriverBegin() {
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(AUDIO_MIC_PORT, I2S_ROLE_MASTER);
-  chanCfg.dma_desc_num  = 6;
+  chanCfg.dma_desc_num = 6;
   chanCfg.dma_frame_num = 256;
-  chanCfg.auto_clear    = true;
+  chanCfg.auto_clear = true;
 
   if (i2s_new_channel(&chanCfg, NULL, &micRxHandle) != ESP_OK) return false;
 
   i2s_std_config_t stdCfg = {
-    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
     .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
     .gpio_cfg = {
       .mclk = I2S_GPIO_UNUSED,
       .bclk = (gpio_num_t)MIC_SCK,
-      .ws   = (gpio_num_t)MIC_WS,
+      .ws = (gpio_num_t)MIC_WS,
       .dout = I2S_GPIO_UNUSED,
-      .din  = (gpio_num_t)MIC_SD,
+      .din = (gpio_num_t)MIC_SD,
       .invert_flags = { false, false, false },
     },
   };
@@ -262,32 +275,32 @@ static bool audioMicDriverBegin() {
 //  STT (Groq Whisper)
 // ===========================================================================
 static void writeWavHeader(uint8_t* out, size_t pcmBytes, int sampleRate) {
-  const uint32_t chunkSize    = 36 + pcmBytes;
-  const uint32_t subchunk2    = pcmBytes;
-  const uint16_t audioFormat  = 1;
-  const uint16_t numChannels  = 1;
-  const uint16_t bitsPerSamp  = 16;
-  const uint32_t byteRate     = sampleRate * numChannels * bitsPerSamp / 8;
-  const uint16_t blockAlign   = numChannels * bitsPerSamp / 8;
+  const uint32_t chunkSize = 36 + pcmBytes;
+  const uint32_t subchunk2 = pcmBytes;
+  const uint16_t audioFormat = 1;
+  const uint16_t numChannels = 1;
+  const uint16_t bitsPerSamp = 16;
+  const uint32_t byteRate = sampleRate * numChannels * bitsPerSamp / 8;
+  const uint16_t blockAlign = numChannels * bitsPerSamp / 8;
 
-  memcpy(out + 0,  "RIFF", 4);
-  memcpy(out + 4,  &chunkSize,   4);
-  memcpy(out + 8,  "WAVE", 4);
+  memcpy(out + 0, "RIFF", 4);
+  memcpy(out + 4, &chunkSize, 4);
+  memcpy(out + 8, "WAVE", 4);
   memcpy(out + 12, "fmt ", 4);
   const uint32_t fmtSize = 16;
-  memcpy(out + 16, &fmtSize,     4);
+  memcpy(out + 16, &fmtSize, 4);
   memcpy(out + 20, &audioFormat, 2);
   memcpy(out + 22, &numChannels, 2);
-  memcpy(out + 24, &sampleRate,  4);
-  memcpy(out + 28, &byteRate,    4);
-  memcpy(out + 32, &blockAlign,  2);
+  memcpy(out + 24, &sampleRate, 4);
+  memcpy(out + 28, &byteRate, 4);
+  memcpy(out + 32, &blockAlign, 2);
   memcpy(out + 34, &bitsPerSamp, 2);
   memcpy(out + 36, "data", 4);
-  memcpy(out + 40, &subchunk2,   4);
+  memcpy(out + 40, &subchunk2, 4);
 }
 
 static String groqSttRequest(const uint8_t* wav, size_t wavLen,
-                              const char* language) {
+                             const char* language) {
   const String boundary = "----AbotBoundary" + String(millis());
 
   String head = "--" + boundary + "\r\n";
@@ -369,10 +382,10 @@ static String groqTranscribe(const int16_t* pcm, size_t samples) {
   if (samples == 0) return "";
 
   const size_t pcmBytes = samples * sizeof(int16_t);
-  const size_t wavLen   = 44 + pcmBytes;
+  const size_t wavLen = 44 + pcmBytes;
 
   uint8_t* wav = (uint8_t*)heap_caps_malloc(
-      wavLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    wavLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!wav) wav = (uint8_t*)malloc(wavLen);
   if (!wav) {
     Serial.println("[STT] OOM: gagal alokasi WAV buffer");
@@ -395,9 +408,8 @@ static String groqTranscribe(const int16_t* pcm, size_t samples) {
 }
 
 // ===========================================================================
-//  TTS (ESP32-audioI2S internal Google Translate)
+//  TTS
 // ===========================================================================
-// Dipotong lebih pendek (90 karakter) agar pasti muat 5 baris di OLED
 static int splitSpeech(const String& text, String* out, int maxOut) {
   int n = 0;
   String cur = "";
@@ -429,18 +441,27 @@ static bool speakChunk(const String& s) {
     audioI2S.loop();
     if (audioI2S.isRunning()) started = true;
     if (ttsEof) break;
-    if (ttsStop) { audioI2S.stopSong(); return true; }
-    if (!started && millis() - t0 > 6000) { Serial.println("[TTS] tidak mulai"); return false; }
+    if (ttsStop) {
+      audioI2S.stopSong();
+      return true;
+    }
+    if (!started && millis() - t0 > 6000) {
+      Serial.println("[TTS] tidak mulai");
+      return false;
+    }
     if (started && !audioI2S.isRunning()) break;
     vTaskDelay(1);
   }
   return true;
 }
 
-static String currentTtsPart = ""; // Variabel baru untuk sinkronisasi OLED
+static String currentTtsPart = "";
 
 static bool speakText(const String& text) {
-  if (volumeLevel == 0) { Serial.println("[TTS] mute, skip"); return false; }
+  if (volumeLevel == 0) {
+    Serial.println("[TTS] mute, skip");
+    return false;
+  }
   if (text.length() == 0) return false;
 
   String parts[12];
@@ -451,20 +472,20 @@ static bool speakText(const String& text) {
   ttsStop = false;
   speakAborted = false;
   bool ok = false;
-  
+
   for (int i = 0; i < n && !ttsStop; i++) {
     {
       StateLock lock;
-      currentTtsPart = parts[i]; // Update OLED dengan kalimat saat ini
+      currentTtsPart = parts[i];
     }
     if (speakChunk(parts[i])) ok = true;
   }
-  
+
   {
     StateLock lock;
-    currentTtsPart = ""; // Bersihkan setelah selesai
+    currentTtsPart = "";
   }
-  
+
   audioI2S.stopSong();
   speakAborted = ttsStop;
   ttsActive = false;
@@ -481,16 +502,13 @@ static inline void audioPendingDone() {
 
 static void audioReportRecordingStats(bool emptyResult) {
   audioMicBars = 0;
-
   if (emptyResult || recLength == 0) {
     Serial.println("[VOICE] rekaman kosong, tidak diproses");
     return;
   }
-
   const uint32_t dur = (uint32_t)((uint64_t)recLength * 1000ULL / AUDIO_SAMPLE_RATE);
   Serial.printf("[VOICE] rekaman selesai: %lu ms, peak %d\n",
                 (unsigned long)dur, recPeak);
-
   if (voiceTaskHandle) {
     xTaskNotify(voiceTaskHandle, 0x01, eSetBits);
   } else {
@@ -501,10 +519,10 @@ static void audioReportRecordingStats(bool emptyResult) {
 
 static void audioTask(void* pv) {
   AudioCmd cmd;
-  int32_t  blk[256];
-  float    dc = 0.0f, level = 0.0f;
-  bool     dcInit = false;
-  int      discardBlocks = 0;
+  int32_t blk[256];
+  float dc = 0.0f, level = 0.0f;
+  bool dcInit = false;
+  int discardBlocks = 0;
 
   for (;;) {
     if (!audioRecording) {
@@ -514,15 +532,19 @@ static void audioTask(void* pv) {
         recAutoFinished = false;
         if (audioMicReady && recBuf) {
           recLength = 0;
-          recPeak   = 0;
-          dcInit    = false;
-          level     = 0.0f;
+          recPeak = 0;
+          dcInit = false;
+          level = 0.0f;
           discardBlocks = 4;
           audioRecording = true;
         }
       } else if (cmd.type == ACMD_REC_STOP) {
         if (recAutoFinished) recAutoFinished = false;
-        else { recLength = 0; recPeak = 0; audioReportRecordingStats(true); }
+        else {
+          recLength = 0;
+          recPeak = 0;
+          audioReportRecordingStats(true);
+        }
       }
       audioPendingDone();
       continue;
@@ -533,27 +555,35 @@ static void audioTask(void* pv) {
       i2s_channel_read(micRxHandle, blk, sizeof(blk), &bytesRead, pdMS_TO_TICKS(40));
     }
     int n = (int)(bytesRead / sizeof(int32_t));
-    if (discardBlocks > 0) { discardBlocks--; n = 0; }
+    if (discardBlocks > 0) {
+      discardBlocks--;
+      n = 0;
+    }
 
     int blockPeak = 0;
     for (int i = 0; i < n; i++) {
       float s = (float)(blk[i] >> 16);
-      if (!dcInit) { dc = s; dcInit = true; }
+      if (!dcInit) {
+        dc = s;
+        dcInit = true;
+      }
       dc += (s - dc) / 512.0f;
 
       int32_t v = (int32_t)((s - dc) * MIC_GAIN);
-      if (v > 32767)  v = 32767;
+      if (v > 32767) v = 32767;
       if (v < -32768) v = -32768;
 
       if (recLength < recCapacity) recBuf[recLength++] = (int16_t)v;
       int a = (v < 0) ? -v : v;
-      if (a > recPeak)   recPeak = a;
+      if (a > recPeak) recPeak = a;
       if (a > blockPeak) blockPeak = a;
     }
 
     level = ((float)blockPeak > level * 0.80f) ? (float)blockPeak : level * 0.80f;
-    audioMicBars = (level >= 3500) ? 4 : (level >= 1200) ? 3 : (level >= 400) ? 2 :
-                   (level >= 120)  ? 1 : 0;
+    audioMicBars = (level >= 3500) ? 4 : (level >= 1200) ? 3
+                                       : (level >= 400)  ? 2
+                                       : (level >= 120)  ? 1
+                                                         : 0;
 
     bool stopNow = false;
     if (xQueueReceive(audioQueue, &cmd, 0) == pdTRUE) {
@@ -573,11 +603,13 @@ static void audioTask(void* pv) {
   }
 }
 
-bool audioIsBusy() { return audioPending > 0 || audioRecording; }
+bool audioIsBusy() {
+  return audioPending > 0 || audioRecording;
+}
 
 static bool audioEnqueue(uint8_t type, uint8_t arg) {
   if (!audioQueue) return false;
-  AudioCmd cmd = {type, arg};
+  AudioCmd cmd = { type, arg };
   __atomic_add_fetch(&audioPending, 1, __ATOMIC_SEQ_CST);
   if (xQueueSend(audioQueue, &cmd, 0) != pdTRUE) {
     __atomic_sub_fetch(&audioPending, 1, __ATOMIC_SEQ_CST);
@@ -604,9 +636,7 @@ void audioSetVolume(int level) {
   if (level > VOLUME_LEVEL_MAX) level = VOLUME_LEVEL_MAX;
   volumeLevel = level;
   if (level > 0) volumeBeforeMute = level;
-
   audioI2S.setVolume(min(level * 4, 21));
-
   Serial.printf("[AUDIO] Volume %d/%d%s\n", level, VOLUME_LEVEL_MAX,
                 level == 0 ? " MUTE" : "");
 }
@@ -632,14 +662,14 @@ void audioBegin() {
                 (unsigned)ESP.getPsramSize(),
                 psramFound());
 
-  audioQueue    = xQueueCreate(8, sizeof(AudioCmd));
+  audioQueue = xQueueCreate(8, sizeof(AudioCmd));
   audioMicReady = audioMicDriverBegin();
   Serial.printf("[AUDIO] Mic driver: %d\n", audioMicReady);
 
   if (audioMicReady) {
     const bool hasPsram = psramFound();
     size_t seconds = hasPsram ? REC_SECONDS_PSRAM : REC_SECONDS_HEAP;
-    size_t bytes   = seconds * AUDIO_SAMPLE_RATE * sizeof(int16_t);
+    size_t bytes = seconds * AUDIO_SAMPLE_RATE * sizeof(int16_t);
     Serial.printf("[AUDIO] Ingin alokasi %u bytes (%s)\n",
                   (unsigned)bytes, hasPsram ? "PSRAM" : "heap");
 
@@ -649,15 +679,15 @@ void audioBegin() {
     }
     if (!recBuf) {
       seconds = REC_SECONDS_HEAP;
-      bytes   = seconds * AUDIO_SAMPLE_RATE * sizeof(int16_t);
-      recBuf  = (int16_t*)malloc(bytes);
+      bytes = seconds * AUDIO_SAMPLE_RATE * sizeof(int16_t);
+      recBuf = (int16_t*)malloc(bytes);
       Serial.printf("[AUDIO] Heap alloc 2s %u bytes -> %p\n",
                     (unsigned)bytes, recBuf);
     }
     if (!recBuf) {
       seconds = 1;
-      bytes   = AUDIO_SAMPLE_RATE * sizeof(int16_t);
-      recBuf  = (int16_t*)malloc(bytes);
+      bytes = AUDIO_SAMPLE_RATE * sizeof(int16_t);
+      recBuf = (int16_t*)malloc(bytes);
       Serial.printf("[AUDIO] Heap alloc 1s %u bytes -> %p\n",
                     (unsigned)bytes, recBuf);
     }
@@ -676,9 +706,9 @@ void audioBegin() {
 
   if (audioQueue && audioMicReady) {
     BaseType_t r = xTaskCreatePinnedToCore(audioTask, "AudioTask", 6144,
-                                            NULL, 2, NULL, 0);
+                                           NULL, 2, NULL, 0);
     if (r != pdPASS) Serial.println("[AUDIO] FAIL: audioTask spawn");
-    else             Serial.println("[AUDIO] audioTask OK");
+    else Serial.println("[AUDIO] audioTask OK");
   }
 
   audioI2S.setPinout(SPK_BCLK, SPK_LRC, SPK_DIN);
@@ -689,18 +719,62 @@ void audioBegin() {
 // ===========================================================================
 //  TIPE DATA
 // ===========================================================================
-enum StartupStage           : unsigned char { STARTUP_NORMAL, STARTUP_USAGE, STARTUP_CLOCK, STARTUP_WEATHER };
-enum ListeningState         : unsigned char { LISTENING_IDLE, LISTENING_ACTIVE };
-enum SystemState            : unsigned char { STATE_BOOT, STATE_WIFI_CONNECTING, STATE_READY, STATE_GETTING_ROUTE, STATE_THINKING, STATE_AI_RESPONSE, STATE_ERROR };
-enum EyeMood                : unsigned char { EYE_DEFAULT, EYE_HAPPY, EYE_ANGRY, EYE_TIRED };
-enum CharacterEmotion       : unsigned char { CHARACTER_DEFAULT, CHARACTER_LISTENING, CHARACTER_THINKING, CHARACTER_HAPPY, CHARACTER_LAUGH, CHARACTER_CONFUSED, CHARACTER_ANGRY, CHARACTER_TIRED };
-enum AbotPersonality        : unsigned char { ABOT_NEUTRAL, ABOT_MORNING, ABOT_DAY, ABOT_AFTERNOON, ABOT_NIGHT };
-enum PersonalityMode        : unsigned char { PERSONALITY_NORMAL, PERSONALITY_PLAYFUL, PERSONALITY_EXCITED };
-enum CompanionType          : unsigned char { COMPANION_NONE, COMPANION_QUIZ, COMPANION_TRIVIA, COMPANION_HUMOR, COMPANION_STORY, COMPANION_CARD };
-enum CompanionPlaybackState : unsigned char { COMPANION_IDLE, COMPANION_TYPING, COMPANION_HOLD };
-enum WakeIntroStage         : unsigned char { WAKE_DARK, WAKE_ABOT_HELLO, WAKE_ABOT_PERSONALITY, WAKE_FINISHED };
-enum NetworkJob             : unsigned char { NET_NONE, NET_OSRM, NET_NAVIGATION_AI, NET_COMPANION, NET_WEATHER, NET_GEOCODE };
-enum DestinationStage       : unsigned char { DEST_ASK, DEST_GEOCODING, DEST_CONFIRMED, DEST_FAILED };
+enum StartupStage : unsigned char { STARTUP_NORMAL,
+                                    STARTUP_USAGE,
+                                    STARTUP_CLOCK,
+                                    STARTUP_WEATHER };
+enum ListeningState : unsigned char { LISTENING_IDLE,
+                                      LISTENING_ACTIVE };
+enum SystemState : unsigned char { STATE_BOOT,
+                                   STATE_WIFI_CONNECTING,
+                                   STATE_READY,
+                                   STATE_GETTING_ROUTE,
+                                   STATE_THINKING,
+                                   STATE_AI_RESPONSE,
+                                   STATE_ERROR };
+enum EyeMood : unsigned char { EYE_DEFAULT,
+                               EYE_HAPPY,
+                               EYE_ANGRY,
+                               EYE_TIRED };
+enum CharacterEmotion : unsigned char { CHARACTER_DEFAULT,
+                                        CHARACTER_LISTENING,
+                                        CHARACTER_THINKING,
+                                        CHARACTER_HAPPY,
+                                        CHARACTER_LAUGH,
+                                        CHARACTER_CONFUSED,
+                                        CHARACTER_ANGRY,
+                                        CHARACTER_TIRED };
+enum AbotPersonality : unsigned char { ABOT_NEUTRAL,
+                                       ABOT_MORNING,
+                                       ABOT_DAY,
+                                       ABOT_AFTERNOON,
+                                       ABOT_NIGHT };
+enum PersonalityMode : unsigned char { PERSONALITY_NORMAL,
+                                       PERSONALITY_PLAYFUL,
+                                       PERSONALITY_EXCITED };
+enum CompanionType : unsigned char { COMPANION_NONE,
+                                     COMPANION_QUIZ,
+                                     COMPANION_TRIVIA,
+                                     COMPANION_HUMOR,
+                                     COMPANION_STORY,
+                                     COMPANION_CARD };
+enum CompanionPlaybackState : unsigned char { COMPANION_IDLE,
+                                              COMPANION_TYPING,
+                                              COMPANION_HOLD };
+enum WakeIntroStage : unsigned char { WAKE_DARK,
+                                      WAKE_ABOT_HELLO,
+                                      WAKE_ABOT_PERSONALITY,
+                                      WAKE_FINISHED };
+enum NetworkJob : unsigned char { NET_NONE,
+                                  NET_OSRM,
+                                  NET_NAVIGATION_AI,
+                                  NET_COMPANION,
+                                  NET_WEATHER,
+                                  NET_GEOCODE };
+enum DestinationStage : unsigned char { DEST_ASK,
+                                        DEST_GEOCODING,
+                                        DEST_CONFIRMED,
+                                        DEST_FAILED };
 
 struct RoutePoint {
   double lat;
@@ -712,20 +786,20 @@ struct NavigationStep {
   String road;
   String type;
   String modifier;
-  float  distance;
-  int    routeIndex;
-  float  routeDistance;
-  bool   important;
+  float distance;
+  int routeIndex;
+  float routeDistance;
+  bool important;
 };
 
 struct WeatherData {
-  bool          valid        = false;
-  float         temperature  = 0.0f;
-  float         tempMax      = 0.0f;
-  float         tempMin      = 0.0f;
-  int           weatherCode  = -1;
-  String        condition    = "-";
-  unsigned long updatedAt    = 0;
+  bool valid = false;
+  float temperature = 0.0f;
+  float tempMax = 0.0f;
+  float tempMin = 0.0f;
+  int weatherCode = -1;
+  String condition = "-";
+  unsigned long updatedAt = 0;
 };
 
 // ===========================================================================
@@ -735,12 +809,12 @@ struct WeatherData {
 #define WIFI_SSID_STR "Imam"
 #define WIFI_PASS_STR "12345678"
 #endif
-const char* WIFI_SSID     = WIFI_SSID_STR;
+const char* WIFI_SSID = WIFI_SSID_STR;
 const char* WIFI_PASSWORD = WIFI_PASS_STR;
 
-#define HOME_CITY "Medan"        // kota asal: ganti sesuai kotamu
-#define HOME_LAT  "3.5952"
-#define HOME_LON  "98.6722"
+#define HOME_CITY "Medan"
+#define HOME_LAT "3.5952"
+#define HOME_LON "98.6722"
 const char* WEATHER_URL =
   "https://api.open-meteo.com/v1/forecast"
   "?latitude=" HOME_LAT "&longitude=" HOME_LON
@@ -751,299 +825,309 @@ const char* WEATHER_URL =
 const char* MQTT_HOST = "broker.emqx.io";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_TOPIC_COMMAND = "abot/wokwi/477375325542330369/v337/command";
-const char* MQTT_TOPIC_STATUS  = "abot/wokwi/477375325542330369/v337/status";
+const char* MQTT_TOPIC_STATUS = "abot/wokwi/477375325542330369/v337/status";
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
-const size_t        MQTT_PACKET_BUFFER_SIZE    = 10000;
+const size_t MQTT_PACKET_BUFFER_SIZE = 10000;
 
 const char* AUTH_TOKEN = "abot-secret-2025";
 
 // ===========================================================================
 //  KONFIGURASI TIMING
 // ===========================================================================
-const unsigned long INITIAL_MAP_DURATION    = 8000;
-const unsigned long USER_MAP_DURATION       = 8000;
-const unsigned long ROUTE_MAP_DURATION      = 5000;
-const unsigned long HUD_SUPPRESS_DURATION   = 2500;
+const unsigned long INITIAL_MAP_DURATION = 8000;
+const unsigned long USER_MAP_DURATION = 8000;
+const unsigned long ROUTE_MAP_DURATION = 5000;
+const unsigned long HUD_SUPPRESS_DURATION = 2500;
 
 const unsigned long COMPANION_HOLD_DURATION = 4000;
-const unsigned long COMPANION_FINAL_HOLD    = 6000;
-const unsigned long TYPING_INTERVAL         = 16;
+const unsigned long COMPANION_FINAL_HOLD = 6000;
+const unsigned long TYPING_INTERVAL = 16;
 const unsigned long COMPANION_NEXT_MENU_PAGE_MS = 2600;
 const unsigned long COMPANION_NEXT_MENU_TIMEOUT = 20000;
 
-const unsigned long STARTUP_USAGE_DURATION   = 7500;
-const unsigned long STARTUP_USAGE_LINK_MS    = 3000;
-const unsigned long STARTUP_CLOCK_DURATION   = 4000;
+const unsigned long STARTUP_USAGE_DURATION = 7500;
+const unsigned long STARTUP_USAGE_LINK_MS = 3000;
+const unsigned long STARTUP_CLOCK_DURATION = 4000;
 const unsigned long STARTUP_WEATHER_DURATION = 4500;
-const unsigned long INFO_CLOCK_DURATION      = 3500;
-const unsigned long INFO_WEATHER_DURATION    = 4500;
+const unsigned long INFO_CLOCK_DURATION = 3500;
+const unsigned long INFO_WEATHER_DURATION = 4500;
 
-const unsigned long SLEEP_IDLE_TIMEOUT       = 20000;
+const unsigned long SLEEP_IDLE_TIMEOUT = 20000;
 const unsigned long ARRIVAL_DISPLAY_DURATION = 10000;
-const unsigned long TRIP_INTRO_DURATION      = 3300;
+const unsigned long TRIP_INTRO_DURATION = 3300;
 const unsigned long TRIP_INTRO_LINK_DURATION = 1200;
-const unsigned long BOOT_TRANSITION_MS       = 1400;
+const unsigned long BOOT_TRANSITION_MS = 1400;
 
-const unsigned long WAKE_DARK_MS             = 250;
-const unsigned long WAKE_ABOT_HELLO_MS       = 1700;
+const unsigned long WAKE_DARK_MS = 250;
+const unsigned long WAKE_ABOT_HELLO_MS = 1700;
 const unsigned long WAKE_ABOT_PERSONALITY_MS = 1900;
 
-const unsigned long DEST_ASK_TIMEOUT         = 12000;
-const unsigned long DEST_CONFIRM_DURATION    = 2200;
-const unsigned long DEST_FAILED_DURATION     = 3000;
+const unsigned long DEST_ASK_TIMEOUT = 12000;
+const unsigned long DEST_CONFIRM_DURATION = 2200;
+const unsigned long DEST_FAILED_DURATION = 3000;
 
-const unsigned long LLM_COOLDOWN             = 2000;
-const unsigned long WEATHER_REFRESH_MS       = 10UL * 60UL * 1000UL;
-const unsigned long WEATHER_RETRY_MS         = 60UL * 1000UL;
-const unsigned long OSRM_RETRY_MS            = 10000;
-const int           OSRM_MAX_RETRIES         = 3;
-const unsigned long WIFI_CHECK_INTERVAL_MS   = 2000;
-const unsigned long WIFI_RETRY_INTERVAL_MS   = 5000;
-const unsigned long HEAP_CHECK_INTERVAL_MS   = 10000;
-const uint32_t      HEAP_CRITICAL_BYTES      = 15000;
+const unsigned long LLM_COOLDOWN = 2000;
+const unsigned long WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
+const unsigned long WEATHER_RETRY_MS = 60UL * 1000UL;
+const unsigned long OSRM_RETRY_MS = 10000;
+const int OSRM_MAX_RETRIES = 3;
+const unsigned long WIFI_CHECK_INTERVAL_MS = 2000;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
+const unsigned long HEAP_CHECK_INTERVAL_MS = 10000;
+const uint32_t HEAP_CRITICAL_BYTES = 15000;
 
-const unsigned long CHARACTER_REACTION_HAPPY_MS    = 1200;
+const unsigned long CHARACTER_REACTION_HAPPY_MS = 1200;
 const unsigned long CHARACTER_REACTION_CONFUSED_MS = 1400;
-const unsigned long CHARACTER_REACTION_ANGRY_MS    = 1200;
-const unsigned long CHARACTER_REACTION_LAUGH_MS    = 1700;
+const unsigned long CHARACTER_REACTION_ANGRY_MS = 1200;
+const unsigned long CHARACTER_REACTION_LAUGH_MS = 1700;
 
-const unsigned long NATURAL_EYE_FIRST_ACTION_MS    = 4200;
+const unsigned long NATURAL_EYE_FIRST_ACTION_MS = 4200;
 const unsigned long NATURAL_EYE_ACTION_INTERVAL_MS = 5200;
-const unsigned long NATURAL_EYE_GAZE_DURATION_MS   = 850;
-const unsigned long NATURAL_EYE_WINK_INTERVAL_MS   = 18000;
+const unsigned long NATURAL_EYE_GAZE_DURATION_MS = 850;
+const unsigned long NATURAL_EYE_WINK_INTERVAL_MS = 18000;
 
 // ===========================================================================
 //  KONFIGURASI TUNING
 // ===========================================================================
-const float         HUD_LEAD_SECONDS   = 7.0f;
-const float         HUD_MIN_TRIGGER_M  = 40.0f;
-const float         HUD_MAX_TRIGGER_M  = 140.0f;
-const unsigned long HUD_MAX_SHOW_MS    = 7000;
-const float         HUD_PASSED_MARGIN_M = 3.0f;
-const float         HUD_PREEMPT_MAP_M   = 60.0f;
+const float HUD_LEAD_SECONDS = 7.0f;
+const float HUD_MIN_TRIGGER_M = 40.0f;
+const float HUD_MAX_TRIGGER_M = 140.0f;
+const unsigned long HUD_MAX_SHOW_MS = 7000;
+const float HUD_PASSED_MARGIN_M = 3.0f;
+const float HUD_PREEMPT_MAP_M = 60.0f;
 
-const float         GPS_SPEED_MPS         = 12.0;
-const float         OFFROUTE_METERS       = 60.0f;
-const unsigned long OFFROUTE_REPORT_MS    = 5000;
-const unsigned long LINK_GPS_FRESH_MS     = 3000;
-const unsigned long LINK_STATUS_MS        = 5000;
-const unsigned long LINK_TIMEOUT_MS       = 30000;
-const unsigned long DEAD_RECKON_MAX_MS    = 1500;
-const unsigned long MIN_GPS_INTERVAL_MS   = 100;
+const float GPS_SPEED_MPS = 12.0;
+const float OFFROUTE_METERS = 60.0f;
+const unsigned long OFFROUTE_REPORT_MS = 5000;
+const unsigned long LINK_GPS_FRESH_MS = 3000;
+const unsigned long LINK_STATUS_MS = 5000;
+const unsigned long LINK_TIMEOUT_MS = 30000;
+const unsigned long DEAD_RECKON_MAX_MS = 1500;
+const unsigned long MIN_GPS_INTERVAL_MS = 100;
 const unsigned long MIN_ROUTE_INTERVAL_MS = 1000;
-const size_t        LINK_LINE_MAX         = 8192;
-const bool          SIM_WHEN_NO_GPS       = false;
-const bool          NAV_AI_ON_ROUTE       = false;
+const size_t LINK_LINE_MAX = 8192;
+const bool SIM_WHEN_NO_GPS = false;
+const bool NAV_AI_ON_ROUTE = false;
 
 #define MAX_ROUTE_POINTS 120
-#define MAX_NAV_STEPS    40
-#define LOG_RING_SIZE    20
-#define LOG_LINE_MAX     96
+#define MAX_NAV_STEPS 40
+#define LOG_RING_SIZE 20
+#define LOG_LINE_MAX 96
 
 const int MAX_COMPANION_PAGES = 8;
 const int MAX_COMPANION_LINES = 6;
-const int MAX_LINE_CHARS      = 20;
+const int MAX_LINE_CHARS = 20;
 
 // ===========================================================================
 //  STATE GLOBAL
 // ===========================================================================
-StartupStage  startupStage              = STARTUP_NORMAL;
-unsigned long startupStageStarted       = 0;
-bool          startupOnboardingActive   = false;
-bool          startupOnboardingCompleted= false;
-bool          startupOnboardingManual   = false;
-bool          infoModeActive            = false;
-unsigned long infoModeStarted           = 0;
-int           infoPage                  = 0;
+StartupStage startupStage = STARTUP_NORMAL;
+unsigned long startupStageStarted = 0;
+bool startupOnboardingActive = false;
+bool startupOnboardingCompleted = false;
+bool startupOnboardingManual = false;
+bool infoModeActive = false;
+unsigned long infoModeStarted = 0;
+int infoPage = 0;
 
-ListeningState listeningState       = LISTENING_IDLE;
-bool           listeningActive      = false;
+ListeningState listeningState = LISTENING_IDLE;
+bool listeningActive = false;
 
-bool          talkLastReading  = HIGH, talkStableState  = HIGH, talkLongTriggered = false;
-bool          actionLastReading= HIGH, actionStableState= HIGH;
-unsigned long talkLastChange   = 0,    talkPressedAt    = 0;
-unsigned long actionLastChange = 0,    actionPressedAt  = 0;
+bool talkLastReading = HIGH, talkStableState = HIGH, talkLongTriggered = false;
+bool actionLastReading = HIGH, actionStableState = HIGH;
+unsigned long talkLastChange = 0, talkPressedAt = 0;
+unsigned long actionLastChange = 0, actionPressedAt = 0;
 
-SystemState        systemState              = STATE_BOOT;
-EyeMood            currentEyeMood           = EYE_DEFAULT;
-CharacterEmotion   currentCharacterEmotion  = CHARACTER_DEFAULT;
-unsigned long      characterReactionUntil   = 0;
-bool               characterReactionActive  = false;
+SystemState systemState = STATE_BOOT;
+EyeMood currentEyeMood = EYE_DEFAULT;
+CharacterEmotion currentCharacterEmotion = CHARACTER_DEFAULT;
+unsigned long characterReactionUntil = 0;
+bool characterReactionActive = false;
 
-AbotPersonality    currentAbotPersonality   = ABOT_NEUTRAL;
-AbotPersonality    appliedAbotPersonality   = ABOT_NEUTRAL;
-unsigned long      abotHoldUntil            = 0;
+AbotPersonality currentAbotPersonality = ABOT_NEUTRAL;
+AbotPersonality appliedAbotPersonality = ABOT_NEUTRAL;
+unsigned long abotHoldUntil = 0;
 
-bool               naturalEyeBehaviorEnabled= true;
-unsigned long      naturalEyeNextActionAt   = 0;
-unsigned long      naturalEyeReturnAt       = 0;
-unsigned long      naturalEyeNextWinkAt     = 0;
-bool               naturalEyeGazeActive     = false;
-int                naturalEyeSequence       = 0;
+bool naturalEyeBehaviorEnabled = true;
+unsigned long naturalEyeNextActionAt = 0;
+unsigned long naturalEyeReturnAt = 0;
+unsigned long naturalEyeNextWinkAt = 0;
+bool naturalEyeGazeActive = false;
+int naturalEyeSequence = 0;
 
-unsigned long      thinkingGazeNextAt       = 0;
-int                thinkingGazeStep         = 0;
-bool               thinkingVisualPrepared   = false;
-unsigned long      thinkingDemoUntil        = 0;
+unsigned long thinkingGazeNextAt = 0;
+int thinkingGazeStep = 0;
+bool thinkingVisualPrepared = false;
+unsigned long thinkingDemoUntil = 0;
 
-PersonalityMode        personalityMode        = PERSONALITY_NORMAL;
-CompanionType          currentCompanion       = COMPANION_NONE;
-CompanionPlaybackState companionPlayback      = COMPANION_IDLE;
+PersonalityMode personalityMode = PERSONALITY_NORMAL;
+CompanionType currentCompanion = COMPANION_NONE;
+CompanionPlaybackState companionPlayback = COMPANION_IDLE;
 
-bool   quizWaitingAnswer   = false;
+bool quizWaitingAnswer = false;
 String currentQuizQuestion = "";
 
-bool          companionNextMenuActive   = false;
-bool          companionNextMenuPending  = false;
-unsigned long companionNextMenuAt       = 0;
-unsigned long companionNextMenuPageAt   = 0;
+bool companionNextMenuActive = false;
+bool companionNextMenuPending = false;
+unsigned long companionNextMenuAt = 0;
+unsigned long companionNextMenuPageAt = 0;
 unsigned long companionNextMenuOpenedAt = 0;
-unsigned long companionNextMenuDelayMs  = 350;
-int           companionNextMenuPage     = 0;
+unsigned long companionNextMenuDelayMs = 350;
+int companionNextMenuPage = 0;
 
 String companionPages[MAX_COMPANION_PAGES][MAX_COMPANION_LINES];
-int    companionPageCount  = 0;
-int    companionPage       = 0;
-int    companionTypedChars = 0;
+int companionPageCount = 0;
+int companionPage = 0;
+int companionTypedChars = 0;
 String previousCompanionText = "";
 String cardTitle = "INFO";
 
 bool conversationActive = false;
-bool   voiceTextActive = false;   // true = teks balasan tampil di OLED saat TTS
+bool voiceTextActive = false;
 
-bool mapRequested       = false;
-bool companionActive    = false;
-bool companionGenerating= false;
-bool initialMapShown    = false;
+bool mapRequested = false;
+bool companionActive = false;
+bool companionGenerating = false;
+bool initialMapShown = false;
 bool introductionFinished = false;
-bool wifiConnected      = false;
+bool wifiConnected = false;
 
-bool          tripActive       = false;
-bool          tripArrived      = false;
-bool          arrivalActive    = false;
-bool          tripMapPending   = false;
+bool tripActive = false;
+bool tripArrived = false;
+bool arrivalActive = false;
+bool tripMapPending = false;
 unsigned long arrivalStartedAt = 0;
-bool          tripIntroActive  = false;
-unsigned long tripIntroStartedAt=0;
-bool          tripIntroTriggerAsk=false;
+bool tripIntroActive = false;
+unsigned long tripIntroStartedAt = 0;
+bool tripIntroTriggerAsk = false;
 
-bool          sleepModeActive     = false;
-unsigned long lastUserActivityMs  = 0;
-unsigned long mapStartTime        = 0;
+bool sleepModeActive = false;
+unsigned long lastUserActivityMs = 0;
+unsigned long mapStartTime = 0;
 unsigned long companionStateStart = 0;
-unsigned long companionLastType   = 0;
-unsigned long hudSuppressUntil    = 0;
+unsigned long companionLastType = 0;
+unsigned long hudSuppressUntil = 0;
 
-WakeIntroStage wakeIntroStage          = WAKE_DARK;
-unsigned long  wakeIntroStageStartedAt = 0;
+WakeIntroStage wakeIntroStage = WAKE_DARK;
+unsigned long wakeIntroStageStartedAt = 0;
 
-bool          bootTransitionActive    = false;
+bool bootTransitionActive = false;
 unsigned long bootTransitionStartedAt = 0;
 
-bool              destinationAskActive    = false;
-DestinationStage  destinationStage        = DEST_ASK;
-unsigned long     destinationStageStarted = 0;
-float             destLat                 = 0.0f;
-float             destLon                 = 0.0f;
-String            destName                = "";
-String            destAddress             = "";
-bool              destinationResolved     = false;
-float             originLat               = -6.175400f;
-float             originLon               = 106.827202f;
+bool destinationAskActive = false;
+DestinationStage destinationStage = DEST_ASK;
+unsigned long destinationStageStarted = 0;
+float destLat = 0.0f;
+float destLon = 0.0f;
+String destName = "";
+String destAddress = "";
+bool destinationResolved = false;
+float originLat = -6.175400f;
+float originLon = 106.827202f;
 
-String        activeOsrmUrl   = "";
-int           osrmFailCount   = 0;
-unsigned long osrmGaveUpAt    = 0;
+String activeOsrmUrl = "";
+int osrmFailCount = 0;
+unsigned long osrmGaveUpAt = 0;
 unsigned long lastOsrmAttempt = 0;
 
-unsigned long lastWiFiCheck   = 0;
+unsigned long lastWiFiCheck = 0;
 unsigned long lastWiFiAttempt = 0;
-unsigned long lastHeapCheck   = 0;
+unsigned long lastHeapCheck = 0;
 
-RoutePoint    routePoints[MAX_ROUTE_POINTS];
-float         routeCumulativeDistance[MAX_ROUTE_POINTS];
-int           routePointCount      = 0;
+RoutePoint routePoints[MAX_ROUTE_POINTS];
+float routeCumulativeDistance[MAX_ROUTE_POINTS];
+int routePointCount = 0;
 NavigationStep navSteps[MAX_NAV_STEPS];
-int           navStepCount        = 0;
-int           activeStep          = 0;
-float         osrmTotalDistance   = 0;
-float         osrmTotalDuration   = 0;
-float         routeGeometryDistance = 0;
-float         simulatedRouteDistance = 0;
-int           simulatedRouteIndex   = 0;
-unsigned long gpsLastMs             = 0;
+int navStepCount = 0;
+int activeStep = 0;
+float osrmTotalDistance = 0;
+float osrmTotalDuration = 0;
+float routeGeometryDistance = 0;
+float simulatedRouteDistance = 0;
+int simulatedRouteIndex = 0;
+unsigned long gpsLastMs = 0;
 
-bool routeReady         = false;
-bool routeRequested     = false;
-bool navigationAIStarted= false;
-bool pendingNavigationAI= false;
+bool routeReady = false;
+bool routeRequested = false;
+bool navigationAIStarted = false;
+bool pendingNavigationAI = false;
 
-bool          hudActive         = false;
-int           hudLockedStep     = -1;
-int           hudCompletedStep  = -1;
-unsigned long hudShownAt        = 0;
+bool hudActive = false;
+int hudLockedStep = -1;
+int hudCompletedStep = -1;
+unsigned long hudShownAt = 0;
 
-unsigned long   lastLlmRequest = 0;
-volatile bool   networkBusy       = false;
-volatile bool   networkDone       = false;
-volatile bool   networkSuccess    = false;
-volatile int    networkHttpCode   = -1;
-volatile NetworkJob networkJob    = NET_NONE;
-volatile uint32_t   networkRequestId = 0;
-String          networkPrompt     = "";
-String          networkResponse   = "";
-uint32_t        activeCompanionRequestId = 0;
-uint32_t        companionRequestCounter  = 0;
-unsigned long   networkJobStartedAt = 0;
-bool            networkJobWasBusy    = false;
+unsigned long lastLlmRequest = 0;
+volatile bool networkBusy = false;
+volatile bool networkDone = false;
+volatile bool networkSuccess = false;
+volatile int networkHttpCode = -1;
+volatile NetworkJob networkJob = NET_NONE;
+volatile uint32_t networkRequestId = 0;
+String networkPrompt = "";
+String networkResponse = "";
+uint32_t activeCompanionRequestId = 0;
+uint32_t companionRequestCounter = 0;
+unsigned long networkJobStartedAt = 0;
+bool networkJobWasBusy = false;
 
-WeatherData   weatherData;
-WeatherData   cityWeather;            // cuaca kota pilihan lewat suara
-String        weatherViewLabel = "";
-bool          weatherViewCustom = false;
-bool          weatherFetching    = false;
+WeatherData weatherData;
+WeatherData cityWeather;
+String weatherViewLabel = "";
+bool weatherViewCustom = false;
+bool weatherFetching = false;
 unsigned long lastWeatherAttempt = 0;
 
-WiFiClient   mqttNetworkClient;
+WiFiClient mqttNetworkClient;
 PubSubClient mqttClient(mqttNetworkClient);
-String       mqttPendingDispatch   = "";
+String mqttPendingDispatch = "";
 unsigned long mqttLastReconnectAttempt = 0;
-unsigned long mqttBackoffMs        = MQTT_RECONNECT_INTERVAL_MS;
+unsigned long mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
 
-bool          isAuthorized       = false;
-bool          linkEnabled        = true;
-bool          linkRouteReceived  = false;
-bool          hpConnected        = false;
-unsigned long lastLinkMessageAt  = 0;
-unsigned long lastGpsMsgAt       = 0;
-unsigned long lastRouteMsgAt     = 0;
-unsigned long lastLinkGpsAt      = 0;
+bool isAuthorized = false;
+bool linkEnabled = true;
+bool linkRouteReceived = false;
+bool hpConnected = false;
+unsigned long lastLinkMessageAt = 0;
+unsigned long lastGpsMsgAt = 0;
+unsigned long lastRouteMsgAt = 0;
+unsigned long lastLinkGpsAt = 0;
 unsigned long lastOffRouteReportAt = 0;
-bool          routeFromLink      = false;
-int           routeStride        = 1;
-float         linkDistScale      = 1.0f;
+bool routeFromLink = false;
+int routeStride = 1;
+float linkDistScale = 1.0f;
 
-bool          mapForNewRoute     = false;
-float         speedMps           = 8.0f;
-unsigned long speedLastAt        = 0;
-float         speedLastDist      = 0;
-unsigned long drLastMs           = 0;
+bool mapForNewRoute = false;
+float speedMps = 8.0f;
+unsigned long speedLastAt = 0;
+float speedLastDist = 0;
+unsigned long drLastMs = 0;
 
-bool          otaActive          = false;
-String        otaReportedVersion = FW_VERSION;
+bool otaActive = false;
+
+Preferences otaPrefs;
+bool pendingOtaVerification = false;
+String otaTargetVersion = "";
+unsigned long bootTimeMs = 0;
+
+String otaReportedVersion = FW_VERSION;
 
 TaskHandle_t displayTaskHandle = NULL;
-TaskHandle_t voiceTaskHandle   = NULL;
+TaskHandle_t voiceTaskHandle = NULL;
 
-char    logRing[LOG_RING_SIZE][LOG_LINE_MAX];
-uint8_t logRingHead  = 0;
+char logRing[LOG_RING_SIZE][LOG_LINE_MAX];
+uint8_t logRingHead = 0;
 uint8_t logRingCount = 0;
 
 // ===========================================================================
 //  LAYER GRAFIS
 // ===========================================================================
-void beginFrame()            { u8g2.clearBuffer(); }
-void presentFrame()          { u8g2.sendBuffer(); }
+void beginFrame() {
+  u8g2.clearBuffer();
+}
+void presentFrame() {
+  u8g2.sendBuffer();
+}
 
 void gfxSelectFont(uint8_t size) {
   u8g2.setFont(size >= 2 ? u8g2_font_10x20_tr : u8g2_font_6x10_tr);
@@ -1061,27 +1145,6 @@ void gfxText(int x, int y, const String& text, uint8_t size = 1,
   gfxSelectFont(size);
   u8g2.setDrawColor(color);
   u8g2.drawStr(x, y, text.c_str());
-}
-
-void gfxTextScrolling(int x, int y, const char* text, uint8_t size, uint8_t color) {
-  gfxSelectFont(size);
-  u8g2.setDrawColor(color);
-  const int advance = u8g2.getStrWidth("M");
-  if (advance <= 0) return;
-
-  int len = strlen(text);
-  int firstVisible = 0;
-  int lastVisible  = len - 1;
-  if (x < 0) firstVisible = (-x) / advance;
-
-  int maxIdx = (SCREEN_WIDTH - x) / advance;
-  if (maxIdx < lastVisible) lastVisible = maxIdx;
-  if (firstVisible > lastVisible) return;
-
-  for (int i = firstVisible; i <= lastVisible; i++) {
-    int cx = x + i * advance;
-    u8g2.drawGlyph(cx, y, (uint16_t)(uint8_t)text[i]);
-  }
 }
 
 void gfxPixel(int x, int y, uint8_t color = COLOR_WHITE) {
@@ -1109,7 +1172,7 @@ void gfxFillRoundRect(int x, int y, int w, int h, int r,
   if (r > maxRadius) r = maxRadius;
   u8g2.setDrawColor(color);
   if (r <= 0) u8g2.drawBox(x, y, w, h);
-  else        u8g2.drawRBox(x, y, w, h, r);
+  else u8g2.drawRBox(x, y, w, h, r);
 }
 
 void gfxRoundFrame(int x, int y, int w, int h, int r,
@@ -1119,7 +1182,7 @@ void gfxRoundFrame(int x, int y, int w, int h, int r,
   if (r > maxRadius) r = maxRadius;
   u8g2.setDrawColor(color);
   if (r <= 0) u8g2.drawFrame(x, y, w, h);
-  else        u8g2.drawRFrame(x, y, w, h, r);
+  else u8g2.drawRFrame(x, y, w, h, r);
 }
 
 void gfxFillTriangle(int x0, int y0, int x1, int y1, int x2, int y2,
@@ -1144,8 +1207,10 @@ bool gfxClipLine(int& x0, int& y0, int& x1, int& y1) {
 
   auto outcode = [](int x, int y) {
     int code = 0;
-    if (x < 0) code |= 1; else if (x > XMAX) code |= 2;
-    if (y < 0) code |= 4; else if (y > YMAX) code |= 8;
+    if (x < 0) code |= 1;
+    else if (x > XMAX) code |= 2;
+    if (y < 0) code |= 4;
+    else if (y > YMAX) code |= 8;
     return code;
   };
 
@@ -1154,19 +1219,35 @@ bool gfxClipLine(int& x0, int& y0, int& x1, int& y1) {
 
   while (true) {
     if ((c0 | c1) == 0) return true;
-    if (c0 & c1)        return false;
+    if (c0 & c1) return false;
 
     bool first = (c0 != 0);
     int code = first ? c0 : c1;
     int64_t x = 0, y = 0;
 
-    if (code & 8)      { x = x0 + (int64_t)(x1 - x0) * (YMAX - y0) / (y1 - y0); y = YMAX; }
-    else if (code & 4) { x = x0 + (int64_t)(x1 - x0) * (0   - y0) / (y1 - y0); y = 0;   }
-    else if (code & 2) { y = y0 + (int64_t)(y1 - y0) * (XMAX - x0) / (x1 - x0); x = XMAX; }
-    else               { y = y0 + (int64_t)(y1 - y0) * (0    - x0) / (x1 - x0); x = 0;   }
+    if (code & 8) {
+      x = x0 + (int64_t)(x1 - x0) * (YMAX - y0) / (y1 - y0);
+      y = YMAX;
+    } else if (code & 4) {
+      x = x0 + (int64_t)(x1 - x0) * (0 - y0) / (y1 - y0);
+      y = 0;
+    } else if (code & 2) {
+      y = y0 + (int64_t)(y1 - y0) * (XMAX - x0) / (x1 - x0);
+      x = XMAX;
+    } else {
+      y = y0 + (int64_t)(y1 - y0) * (0 - x0) / (x1 - x0);
+      x = 0;
+    }
 
-    if (first) { x0 = (int)x; y0 = (int)y; c0 = outcode(x0, y0); }
-    else       { x1 = (int)x; y1 = (int)y; c1 = outcode(x1, y1); }
+    if (first) {
+      x0 = (int)x;
+      y0 = (int)y;
+      c0 = outcode(x0, y0);
+    } else {
+      x1 = (int)x;
+      y1 = (int)y;
+      c1 = outcode(x1, y1);
+    }
   }
 }
 
@@ -1204,12 +1285,15 @@ void gfxBitmap(int x, int y, const uint8_t* bitmap, int w, int h,
 //  ROBOEYES PROXY
 // ===========================================================================
 volatile bool overlayListening = false;
-volatile bool overlayThinking  = false;
+volatile bool overlayThinking = false;
 
 class RoboEyesDisplayProxy {
- public:
-  explicit RoboEyesDisplayProxy(U8G2& target) : gfx_(&target) {}
-  void clearDisplay() { gfx_->clearBuffer(); }
+public:
+  explicit RoboEyesDisplayProxy(U8G2& target)
+    : gfx_(&target) {}
+  void clearDisplay() {
+    gfx_->clearBuffer();
+  }
   void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h,
                      int16_t r, uint16_t color) {
     gfxFillRoundRect(x, y, w, h, r, (uint8_t)color);
@@ -1219,12 +1303,12 @@ class RoboEyesDisplayProxy {
     gfxFillTriangle(x0, y0, x1, y1, x2, y2, (uint8_t)color);
   }
   void display() {
-    if (overlayListening)      drawListeningOverlay();
-    else if (overlayThinking)  drawThinkingOverlay();
+    if (overlayListening) drawListeningOverlay();
+    else if (overlayThinking) drawThinkingOverlay();
     gfx_->sendBuffer();
   }
 
- private:
+private:
   U8G2* gfx_;
 
   static void drawListeningOverlay() {
@@ -1247,7 +1331,8 @@ class RoboEyesDisplayProxy {
 
   static void drawThinkingOverlay() {
     const int phase = (millis() / 450UL) % 3;
-    const char* dots = (phase == 0) ? "." : (phase == 1) ? ".." : "...";
+    const char* dots = (phase == 0) ? "." : (phase == 1) ? ".."
+                                                         : "...";
     gfxFillRect(0, 0, 20, 8, COLOR_BLACK);
     gfxText(2, 0, dots, 1, COLOR_WHITE);
   }
@@ -1278,14 +1363,14 @@ class RoboEyesDisplayProxy {
 #undef NW
 #endif
 
-constexpr uint8_t OJOL_POS_N  = 1;
+constexpr uint8_t OJOL_POS_N = 1;
 constexpr uint8_t OJOL_POS_NE = 2;
-constexpr uint8_t OJOL_POS_E  = 3;
-constexpr uint8_t OJOL_POS_W  = 7;
+constexpr uint8_t OJOL_POS_E = 3;
+constexpr uint8_t OJOL_POS_W = 7;
 constexpr uint8_t OJOL_POS_NW = 8;
 
-RoboEyesDisplayProxy             roboEyesDisplay(u8g2);
-RoboEyes<RoboEyesDisplayProxy>   roboEyes(roboEyesDisplay);
+RoboEyesDisplayProxy roboEyesDisplay(u8g2);
+RoboEyes<RoboEyesDisplayProxy> roboEyes(roboEyesDisplay);
 
 // ===========================================================================
 //  HELPER UMUM
@@ -1320,22 +1405,24 @@ bool getLocalTimeSafe(struct tm* out) {
   return localtime_r(&now, out) != nullptr;
 }
 
-bool networkIsBusy() { return networkBusy || networkDone; }
+bool networkIsBusy() {
+  return networkBusy || networkDone;
+}
 
 String companionName(CompanionType type) {
   switch (type) {
-    case COMPANION_QUIZ:      return "QUIZ";
-    case COMPANION_TRIVIA:    return "TRIVIA";
-    case COMPANION_HUMOR:     return "HUMOR";
-    case COMPANION_STORY:     return "STORY";
-    case COMPANION_CARD:      return cardTitle;
-    default:                  return "COMPANION";
+    case COMPANION_QUIZ: return "QUIZ";
+    case COMPANION_TRIVIA: return "TRIVIA";
+    case COMPANION_HUMOR: return "HUMOR";
+    case COMPANION_STORY: return "STORY";
+    case COMPANION_CARD: return cardTitle;
+    default: return "COMPANION";
   }
 }
 
-const char* HARI_NAMA[]  = {"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"};
-const char* BULAN_NAMA[] = {"Jan","Feb","Mar","Apr","Mei","Jun",
-                            "Jul","Agu","Sep","Okt","Nov","Des"};
+const char* HARI_NAMA[] = { "Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu" };
+const char* BULAN_NAMA[] = { "Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
+                             "Jul", "Agu", "Sep", "Okt", "Nov", "Des" };
 
 void abotLog(const char* level, const char* fmt, ...) {
   char msg[LOG_LINE_MAX];
@@ -1365,11 +1452,16 @@ void flushLogRing() {
       memcpy(lines[i], logRing[(start + i) % LOG_RING_SIZE], LOG_LINE_MAX);
     }
     logRingCount = 0;
-    logRingHead  = 0;
+    logRingHead = 0;
   }
-  for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++) {
     String out = "{\"t\":\"log\",\"l\":\"" + jsonEscape(String(lines[i])) + "\"}";
-    mqttClient.publish(MQTT_TOPIC_STATUS, out.c_str());
+    
+    // Tambahkan palang pintu di sini
+    if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
+      mqttClient.publish(MQTT_TOPIC_STATUS, out.c_str());
+      xSemaphoreGive(mqttMutex);
+    }
     delay(10);
   }
 }
@@ -1377,91 +1469,96 @@ void flushLogRing() {
 // ===========================================================================
 //  FORWARD DECLARATIONS
 // ===========================================================================
-void  setEyeMood(EyeMood mood);
-void  setCharacterEmotion(CharacterEmotion emotion);
-void  triggerCharacterReaction(CharacterEmotion emotion);
-void  resetNaturalEyeBehavior();
-void  triggerNaturalWink();
-void  markUserActivity();
-void  wakeFromSleep();
-void  startMapDisplay();
-void  startInfoMode();
-void  startStartupOnboarding();
-void  finishStartupOnboarding();
-void  startIntroduction();
-void  startTripIntroduction();
-void  startNewTrip();
-void  startCompanion(CompanionType type);
-void  finishCompanionGeneration(const String& text, CompanionType type);
-void  finishCompanion();
-void  renderCompanion();
-void  renderCompanionNextMenu();
-void  openCompanionNextMenu(unsigned long delayMs);
-void  closeCompanionNextMenu();
-void  handleArrival();
-void  startNavigationAI();
-void  startOSRM();
-void  startWeatherFetch();
-void  beginThinkingVisual();
-void  endThinkingVisual();
-void  cancelThinking();
-void  networkTask(void* parameter);
-bool  isImportantStep(const NavigationStep& step);
-int   nextImportantStep();
-void  startDestinationAsk();
-void  finishDestinationAsk();
-void  renderDestinationAsk();
-void  startGeocode(const String& placeName);
+void setEyeMood(EyeMood mood);
+void setCharacterEmotion(CharacterEmotion emotion);
+void triggerCharacterReaction(CharacterEmotion emotion);
+void resetNaturalEyeBehavior();
+void triggerNaturalWink();
+void markUserActivity();
+void wakeFromSleep();
+void startMapDisplay();
+void startInfoMode();
+void startStartupOnboarding();
+void finishStartupOnboarding();
+void startIntroduction();
+void startTripIntroduction();
+void startNewTrip();
+void startCompanion(CompanionType type);
+void finishCompanionGeneration(const String& text, CompanionType type);
+void finishCompanion();
+void renderCompanion();
+void renderCompanionNextMenu();
+void openCompanionNextMenu(unsigned long delayMs);
+void closeCompanionNextMenu();
+void handleArrival();
+void startNavigationAI();
+void startOSRM();
+void startWeatherFetch();
+void beginThinkingVisual();
+void endThinkingVisual();
+void cancelThinking();
+void networkTask(void* parameter);
+bool isImportantStep(const NavigationStep& step);
+int nextImportantStep();
+void startDestinationAsk();
+void finishDestinationAsk();
+void renderDestinationAsk();
+void startGeocode(const String& placeName);
 String buildOsrmUrl(float fromLat, float fromLon, float toLat, float toLon);
-int   decodePolyline(const String& encoded, RoutePoint* out, int maxPoints);
-void  handleCommand(char cmd);
+int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints);
+void handleCommand(char cmd);
 String abotPromptHint();
 
-void  linkBegin();
-void  linkUpdate();
-void  linkDispatchLine(const String& line);
-void  linkReportStatus();
-void  mqttBegin();
-void  mqttUpdate();
-void  mqttCallback(char* topic, byte* payload, unsigned int length);
+void linkBegin();
+void linkUpdate();
+void linkDispatchLine(const String& line);
+void linkReportStatus();
+void mqttBegin();
+void mqttUpdate();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 float snapToRoute(double lat, double lon, int from, int to, float& along);
-void  skipStartupSequence();
-void  syncRouteProgress();
-void  updateSpeedEstimate(float newDist);
-void  deadReckonStep();
+void skipStartupSequence();
+void syncRouteProgress();
+void updateSpeedEstimate(float newDist);
+void deadReckonStep();
 float hudTriggerDistance();
-void  onLinkRoute(JsonDocument& doc);
-void  onLinkGps(JsonDocument& doc);
-void  onLinkTripStart();
-void  onLinkTripEnd();
-void  onLinkReset();
-void  onLinkPing();
-void  startOTAUpdate(const String& url, const String& requestId = "",
-                     const String& targetVersion = "");
-void  updateDisplay();
+void onLinkRoute(JsonDocument& doc);
+void onLinkGps(JsonDocument& doc);
+void onLinkTripStart();
+void onLinkTripEnd();
+void onLinkReset();
+void onLinkPing();
+void startOTAUpdate(const String& url, const String& requestId = "",
+                    const String& targetVersion = "",
+                    const String& expectedSha256 = "");
+void updateDisplay();
 
+// ===========================================================================
+//  INCLUDE MODUL EKSTERNAL
+// ===========================================================================
 #define MUSIC_USE_VU 0
+#include "buzzer_sfx.h"
 #include "music_player.h"
 
 // ===========================================================================
-//  AI ASISTEN: model Groq otomatis + LLM berformat JSON (jawaban + aksi layar)
+//  AI ASISTEN
 // ===========================================================================
-String weatherCodeToText(int code);   // didefinisikan di bagian cuaca
+String weatherCodeToText(int code);
 void handleQuizAnswer(char cmd);
 
 static String activeChatModel = GROQ_CHAT_MODEL;
-static bool   modelChecked    = false;
+static bool modelChecked = false;
 
 static bool groqModelUsable(const String& id) {
   String s = id;
   s.toLowerCase();
-  const char* bad[] = {"whisper", "orpheus", "guard", "tts", "safeguard",
-                       "embed", "distil", "playai", "compound"};
-  for (auto b : bad) if (s.indexOf(b) >= 0) return false;
+  const char* bad[] = { "whisper", "orpheus", "guard", "tts", "safeguard",
+                        "embed", "distil", "playai", "compound" };
+  for (auto b : bad)
+    if (s.indexOf(b) >= 0) return false;
   return true;
 }
 
-// Tanya Groq model apa saja yang boleh dipakai key ini, lalu pilih yang terbaik.
 static void groqEnsureModel(bool force = false) {
   static unsigned long lastTry = 0;
   if (modelChecked && !force) return;
@@ -1491,29 +1588,37 @@ static void groqEnsureModel(bool force = false) {
   DeserializationError err =
     deserializeJson(doc, http.getString(), DeserializationOption::Filter(filter));
   http.end();
-  if (err) { Serial.printf("[MODELS] JSON error: %s\n", err.c_str()); return; }
+  if (err) {
+    Serial.printf("[MODELS] JSON error: %s\n", err.c_str());
+    return;
+  }
 
-  const String pref[5] = {String(GROQ_CHAT_MODEL), String(GROQ_CHAT_MODEL_2),
-                          String("openai/gpt-oss-20b"), String("llama-3.3-70b-versatile"),
-                          String("llama-3.1-8b-instant")};
-  bool found[5] = {false, false, false, false, false};
+  const String pref[5] = { String(GROQ_CHAT_MODEL), String(GROQ_CHAT_MODEL_2),
+                           String("openai/gpt-oss-20b"), String("llama-3.3-70b-versatile"),
+                           String("llama-3.1-8b-instant") };
+  bool found[5] = { false, false, false, false, false };
   String firstOther = "";
   String all = "";
   for (JsonObject m : doc["data"].as<JsonArray>()) {
     String id = String((const char*)(m["id"] | ""));
     all += id;
     all += " ";
-    for (int i = 0; i < 5; i++) if (id == pref[i]) found[i] = true;
+    for (int i = 0; i < 5; i++)
+      if (id == pref[i]) found[i] = true;
     if (firstOther.length() == 0 && groqModelUsable(id)) firstOther = id;
   }
   Serial.printf("[MODELS] tersedia: %s\n", all.c_str());
 
   String pick = "";
-  for (int i = 0; i < 5; i++) if (found[i]) { pick = pref[i]; break; }
+  for (int i = 0; i < 5; i++)
+    if (found[i]) {
+      pick = pref[i];
+      break;
+    }
   if (pick.length() == 0) pick = firstOther;
   if (pick.length() > 0) {
     activeChatModel = pick;
-    modelChecked    = true;
+    modelChecked = true;
     Serial.printf("[MODELS] dipakai: %s\n", activeChatModel.c_str());
   } else {
     Serial.println("[MODELS] tidak ada model chat yang bisa dipakai key ini");
@@ -1529,18 +1634,20 @@ static int histCount = 0;
 
 static void histAdd(const String& u, const String& b) {
   if (histCount == HIST_TURNS) {
-    for (int i = 1; i < HIST_TURNS; i++) { histUser[i-1] = histUser[i]; histBot[i-1] = histBot[i]; }
+    for (int i = 1; i < HIST_TURNS; i++) {
+      histUser[i - 1] = histUser[i];
+      histBot[i - 1] = histBot[i];
+    }
     histCount--;
   }
   histUser[histCount] = u;
-  histBot[histCount]  = b;
+  histBot[histCount] = b;
   histCount++;
 }
 
 static String buildContext() {
   String c = "";
   StateLock lock;
-
   c += " Kota asal perangkat: ";
   c += HOME_CITY;
   c += ".";
@@ -1557,8 +1664,7 @@ static String buildContext() {
     c += " Cuaca di ";
     c += HOME_CITY;
     c += " sekarang " + w + ", " + String(weatherData.temperature, 0) + " derajat";
-    c += ", hari ini terendah " + String(weatherData.tempMin, 0) +
-         " dan tertinggi " + String(weatherData.tempMax, 0) + " derajat.";
+    c += ", hari ini terendah " + String(weatherData.tempMin, 0) + " dan tertinggi " + String(weatherData.tempMax, 0) + " derajat.";
   }
   if (routeReady && tripActive) {
     float remain = routeGeometryDistance - simulatedRouteDistance;
@@ -1629,18 +1735,15 @@ static String buildSystemPrompt(const String& extra) {
   return p;
 }
 
-// ---------------------------------------------------------------------------
-//  Panggilan Groq chat
-// ---------------------------------------------------------------------------
 static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, String& out) {
   doc["model"] = model;
   const bool gptOss = model.startsWith("openai/gpt-oss");
   const bool thinky = gptOss || model.indexOf("qwen") >= 0;
-  doc["max_tokens"] = thinky ? 900 : 380;       // model "berpikir" butuh jatah token lebih
+  doc["max_tokens"] = thinky ? 900 : 380;
   if (jsonMode && gptOss) doc["reasoning_effort"] = "low";
-  else                    doc.remove("reasoning_effort");
+  else doc.remove("reasoning_effort");
   if (jsonMode) doc["response_format"]["type"] = "json_object";
-  else          doc.remove("response_format");
+  else doc.remove("response_format");
 
   String payload;
   serializeJson(doc, payload);
@@ -1649,7 +1752,10 @@ static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, Strin
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(CHAT_TIMEOUT_MS);
-  if (!http.begin(client, GROQ_CHAT_URL)) { lastLlmHttp = -1; return -1; }
+  if (!http.begin(client, GROQ_CHAT_URL)) {
+    lastLlmHttp = -1;
+    return -1;
+  }
 
   String auth = "Bearer ";
   auth += GROQ_API_KEY_STR;
@@ -1676,7 +1782,10 @@ static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, Strin
   return code;
 }
 
-static String lc(String s) { s.toLowerCase(); return s; }
+static String lc(String s) {
+  s.toLowerCase();
+  return s;
+}
 
 static void cleanSpeech(String& s) {
   s.replace("*", "");
@@ -1691,34 +1800,36 @@ static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) 
   JsonArray msgs = doc["messages"].to<JsonArray>();
 
   JsonObject sys = msgs.add<JsonObject>();
-  sys["role"]    = "system";
+  sys["role"] = "system";
   sys["content"] = buildSystemPrompt(extra);
 
   for (int i = 0; i < histCount; i++) {
-    JsonObject u = msgs.add<JsonObject>(); u["role"] = "user";      u["content"] = histUser[i];
-    JsonObject a = msgs.add<JsonObject>(); a["role"] = "assistant"; a["content"] = histBot[i];
+    JsonObject u = msgs.add<JsonObject>();
+    u["role"] = "user";
+    u["content"] = histUser[i];
+    JsonObject a = msgs.add<JsonObject>();
+    a["role"] = "assistant";
+    a["content"] = histBot[i];
   }
   JsonObject usr = msgs.add<JsonObject>();
-  usr["role"]    = "user";
+  usr["role"] = "user";
   usr["content"] = userText;
 
   String content = "";
-  String model   = activeChatModel;
+  String model = activeChatModel;
   int code = groqPost(model, true, doc, content);
-  if (code == 400) code = groqPost(model, false, doc, content);   // model tanpa JSON mode
+  if (code == 400) code = groqPost(model, false, doc, content);
 
   if ((code == 404 || code == 403) && content.length() == 0) {
-    // Model tidak bisa diakses: cek daftar model asli dari Groq
     modelChecked = false;
     groqEnsureModel(true);
     if (activeChatModel != model) {
       model = activeChatModel;
-      code  = groqPost(model, true, doc, content);
+      code = groqPost(model, true, doc, content);
       if (code == 400) code = groqPost(model, false, doc, content);
     }
   }
-  if (content.length() == 0 && code > 0 && code != 401 &&
-      model != String(GROQ_CHAT_MODEL_2)) {
+  if (content.length() == 0 && code > 0 && code != 401 && model != String(GROQ_CHAT_MODEL_2)) {
     code = groqPost(String(GROQ_CHAT_MODEL_2), true, doc, content);
     if (code == 400) code = groqPost(String(GROQ_CHAT_MODEL_2), false, doc, content);
   }
@@ -1735,22 +1846,25 @@ static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) 
   if (a >= 0 && b > a) {
     JsonDocument j;
     if (!deserializeJson(j, content.substring(a, b + 1))) {
-      act.say    = String((const char*)(j["say"]    | ""));
-      act.show   = lc(String((const char*)(j["show"]   | "none")));
-      act.title  = String((const char*)(j["title"]  | ""));
-      act.card   = String((const char*)(j["card"]   | ""));
-      act.city   = String((const char*)(j["city"]   | ""));
-      act.mood   = lc(String((const char*)(j["mood"]   | "default")));
+      act.say = String((const char*)(j["say"] | ""));
+      act.show = lc(String((const char*)(j["show"] | "none")));
+      act.title = String((const char*)(j["title"] | ""));
+      act.card = String((const char*)(j["card"] | ""));
+      act.city = String((const char*)(j["city"] | ""));
+      act.mood = lc(String((const char*)(j["mood"] | "default")));
       act.volume = lc(String((const char*)(j["volume"] | "none")));
-      act.verdict= lc(String((const char*)(j["verdict"]| "")));
-      act.music  = lc(String((const char*)(j["music"]   | "")));
-      act.query  = String((const char*)(j["query"]  | ""));
-      act.genre  = lc(String((const char*)(j["genre"]  | "")));
-      act.more   = j["more"] | false;
+      act.verdict = lc(String((const char*)(j["verdict"] | "")));
+      act.music = lc(String((const char*)(j["music"] | "")));
+      act.query = String((const char*)(j["query"] | ""));
+      act.genre = lc(String((const char*)(j["genre"] | "")));
+      act.more = j["more"] | false;
       parsed = true;
     }
   }
-  if (!parsed) { act.say = content; act.show = "none"; }
+  if (!parsed) {
+    act.say = content;
+    act.show = "none";
+  }
   if (act.say.length() == 0 && act.card.length() > 0) act.say = act.card;
   if (act.say.length() == 0) return false;
 
@@ -1759,22 +1873,22 @@ static bool groqAsk(const String& userText, const String& extra, VoiceAct& act) 
   act.city.trim();
   act.title.trim();
 
-  const char* okShow[] = {"none", "map", "clock", "weather", "quiz", "trivia", "humor",
-                          "story", "music", "usage", "intro", "card"};
+  const char* okShow[] = { "none", "map", "clock", "weather", "quiz", "trivia", "humor",
+                           "story", "music", "usage", "intro", "card" };
   bool valid = false;
-  for (auto s : okShow) if (act.show == s) valid = true;
+  for (auto s : okShow)
+    if (act.show == s) valid = true;
   if (!valid) act.show = "none";
-  if (act.more && act.show != "none") act.show = "none";   // cerita bertahap tampil per kalimat
+  if (act.more && act.show != "none") act.show = "none";
   act.query.trim();
   act.genre.trim();
-  
   return true;
 }
 
 static String llmErrorText() {
   if (WiFi.status() != WL_CONNECTED || lastLlmHttp < 0)
     return "Koneksi internet lagi putus, coba lagi nanti ya.";
-  if (lastLlmHttp == 0)   return "Koneksi ke server lagi lambat, coba ulangi ya.";
+  if (lastLlmHttp == 0) return "Koneksi ke server lagi lambat, coba ulangi ya.";
   if (lastLlmHttp == 429) return "Aku lagi kebanyakan mikir, tunggu sebentar ya.";
   if (lastLlmHttp == 401) return "Kunci API-nya bermasalah, tolong dicek.";
   if (lastLlmHttp == 404 || lastLlmHttp == 403)
@@ -1785,14 +1899,15 @@ static String llmErrorText() {
 static bool isWhisperHallucination(String t) {
   t.toLowerCase();
   if (t.length() < 2) return true;
-  const char* bad[] = {"terima kasih telah menonton", "terima kasih sudah menonton",
-                       "thanks for watching", "amara.org", "subtitle", "www."};
-  for (auto b : bad) if (t.indexOf(b) >= 0) return true;
+  const char* bad[] = { "terima kasih telah menonton", "terima kasih sudah menonton",
+                        "thanks for watching", "amara.org", "subtitle", "www." };
+  for (auto b : bad)
+    if (t.indexOf(b) >= 0) return true;
   return false;
 }
 
 // ---------------------------------------------------------------------------
-//  Cuaca kota mana saja (Open-Meteo geocoding + forecast)
+//  Cuaca kota
 // ---------------------------------------------------------------------------
 static String urlEncode(const String& s) {
   String o = "";
@@ -1800,7 +1915,11 @@ static String urlEncode(const String& s) {
   for (size_t i = 0; i < s.length(); i++) {
     uint8_t c = (uint8_t)s[i];
     if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
-    else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+    else {
+      o += '%';
+      o += hex[c >> 4];
+      o += hex[c & 15];
+    }
   }
   return o;
 }
@@ -1817,12 +1936,15 @@ static bool fetchCityWeather(const String& city, String& outName, String& outSum
     if (!http.begin(client, url)) return false;
     int code = http.GET();
     Serial.printf("[GEO] HTTP %d (%s)\n", code, city.c_str());
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) {
+      http.end();
+      return false;
+    }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, http.getString());
     http.end();
     if (err || doc["results"][0].isNull()) return false;
-    lat = doc["results"][0]["latitude"]  | 0.0;
+    lat = doc["results"][0]["latitude"] | 0.0;
     lon = doc["results"][0]["longitude"] | 0.0;
     outName = String((const char*)(doc["results"][0]["name"] | city.c_str()));
   }
@@ -1833,14 +1955,15 @@ static bool fetchCityWeather(const String& city, String& outName, String& outSum
     client.setInsecure();
     HTTPClient http;
     http.setTimeout(8000);
-    String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
-                 "&longitude=" + String(lon, 4) +
-                 "&current=temperature_2m,weather_code"
-                 "&daily=temperature_2m_max,temperature_2m_min&timezone=auto";
+    String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4) + "&current=temperature_2m,weather_code"
+                                                                                                                        "&daily=temperature_2m_max,temperature_2m_min&timezone=auto";
     if (!http.begin(client, url)) return false;
     int code = http.GET();
     Serial.printf("[WX] HTTP %d (%s)\n", code, outName.c_str());
-    if (code != 200) { http.end(); return false; }
+    if (code != 200) {
+      http.end();
+      return false;
+    }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, http.getString());
     http.end();
@@ -1848,56 +1971,58 @@ static bool fetchCityWeather(const String& city, String& outName, String& outSum
     JsonObject cur = doc["current"];
     if (cur.isNull()) return false;
     w.temperature = cur["temperature_2m"] | 0.0f;
-    w.weatherCode = cur["weather_code"]   | -1;
-    w.condition   = weatherCodeToText(w.weatherCode);
-    w.tempMax     = doc["daily"]["temperature_2m_max"][0] | w.temperature;
-    w.tempMin     = doc["daily"]["temperature_2m_min"][0] | w.temperature;
-    w.valid       = true;
-    w.updatedAt   = millis();
+    w.weatherCode = cur["weather_code"] | -1;
+    w.condition = weatherCodeToText(w.weatherCode);
+    w.tempMax = doc["daily"]["temperature_2m_max"][0] | w.temperature;
+    w.tempMin = doc["daily"]["temperature_2m_min"][0] | w.temperature;
+    w.valid = true;
+    w.updatedAt = millis();
   }
 
   {
     StateLock lock;
-    cityWeather      = w;
+    cityWeather = w;
     weatherViewLabel = outName;
   }
   String c = w.condition;
   c.toLowerCase();
-  outSummary = c + ", suhu " + String(w.temperature, 0) + " derajat, hari ini terendah " +
-               String(w.tempMin, 0) + " dan tertinggi " + String(w.tempMax, 0) + " derajat";
+  outSummary = c + ", suhu " + String(w.temperature, 0) + " derajat, hari ini terendah " + String(w.tempMin, 0) + " dan tertinggi " + String(w.tempMax, 0) + " derajat";
   return true;
 }
 
 // ---------------------------------------------------------------------------
-//  Aksi layar (dipanggil dengan StateLock)
+//  Aksi layar
 // ---------------------------------------------------------------------------
-static void voiceTextMode(bool on) { StateLock lock; voiceTextActive = on; }
+static void voiceTextMode(bool on) {
+  StateLock lock;
+  voiceTextActive = on;
+}
 
 static void voiceClearScreens() {
-  mapRequested             = false;
-  hudActive                = false;
-  infoModeActive           = false;
-  companionActive          = false;
-  companionNextMenuActive  = false;
+  mapRequested = false;
+  hudActive = false;
+  infoModeActive = false;
+  companionActive = false;
+  companionNextMenuActive = false;
   companionNextMenuPending = false;
-  conversationActive       = false;
-  hudSuppressUntil         = millis() + HUD_SUPPRESS_DURATION;
+  conversationActive = false;
+  hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
 }
 
 static void showWeatherView(bool custom) {
   voiceClearScreens();
   cancelThinking();
   weatherViewCustom = custom;
-  infoModeActive    = true;
-  infoPage          = 1;
-  infoModeStarted   = millis();
+  infoModeActive = true;
+  infoPage = 1;
+  infoModeStarted = millis();
   if (!custom && !weatherData.valid) lastWeatherAttempt = 0;
 }
 
 static void voiceShowIntro() {
   voiceClearScreens();
   startupOnboardingActive = false;
-  bootTransitionActive    = false;
+  bootTransitionActive = false;
   cancelThinking();
   startIntroduction();
 }
@@ -1917,11 +2042,11 @@ static void voiceShowCard(CompanionType type, const String& title, const String&
 }
 
 static CharacterEmotion moodFromString(const String& m) {
-  if (m == "happy")    return CHARACTER_HAPPY;
-  if (m == "laugh")    return CHARACTER_LAUGH;
+  if (m == "happy") return CHARACTER_HAPPY;
+  if (m == "laugh") return CHARACTER_LAUGH;
   if (m == "confused") return CHARACTER_CONFUSED;
-  if (m == "angry")    return CHARACTER_ANGRY;
-  if (m == "tired")    return CHARACTER_TIRED;
+  if (m == "angry") return CHARACTER_ANGRY;
+  if (m == "tired") return CHARACTER_TIRED;
   return CHARACTER_HAPPY;
 }
 
@@ -1929,46 +2054,53 @@ static void voiceApply(const VoiceAct& act) {
   StateLock lock;
   markUserActivity();
 
-  if      (act.volume == "up")     audioVolumeStep(+1);
-  else if (act.volume == "down")   audioVolumeStep(-1);
-  else if (act.volume == "mute")   { if (volumeLevel > 0) audioSetVolume(0); }
-  else if (act.volume == "unmute") { if (volumeLevel == 0) audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 3); }
+  if (act.volume == "up") audioVolumeStep(+1);
+  else if (act.volume == "down") audioVolumeStep(-1);
+  else if (act.volume == "mute") {
+    if (volumeLevel > 0) audioSetVolume(0);
+  } else if (act.volume == "unmute") {
+    if (volumeLevel == 0) audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 3);
+  }
 
   const String& s = act.show;
-  const String  body = act.card.length() ? act.card : act.say;
-  voiceTextActive = (s == "none" || act.more);   // teks balasan tampil per kalimat hanya kalau tidak ada layar khusus
+  const String body = act.card.length() ? act.card : act.say;
+  voiceTextActive = (s == "none" || act.more);
 
   if (quizWaitingAnswer && act.verdict.length() > 0) {
-    if      (act.verdict == "correct") handleQuizAnswer('J');
-    else if (act.verdict == "wrong")   handleQuizAnswer('K');
-    else                               handleQuizAnswer('L');
+    if (act.verdict == "correct") handleQuizAnswer('J');
+    else if (act.verdict == "wrong") handleQuizAnswer('K');
+    else handleQuizAnswer('L');
     return;
   }
-  if      (s == "map")     handleCommand('M');
-  else if (s == "clock")   startInfoMode();
+  if (s == "map") handleCommand('M');
+  else if (s == "clock") startInfoMode();
   else if (s == "weather") showWeatherView(act.customWeather);
-  else if (s == "music")   { voiceClearScreens(); musicPostFromAct(act.music, act.query, act.genre); }
-  else if (s == "usage")   handleCommand('U');
-  else if (s == "intro")   voiceShowIntro();
-  else if (s == "quiz")    voiceShowCard(COMPANION_QUIZ,   "", body);
-  else if (s == "trivia")  voiceShowCard(COMPANION_TRIVIA, "", body);
-  else if (s == "humor")   voiceShowCard(COMPANION_HUMOR,  "", body);
-  else if (s == "story")   voiceShowCard(COMPANION_STORY,  "", body);
-  else if (s == "card")    voiceShowCard(COMPANION_CARD, act.title, body);
+  else if (s == "music") {
+    voiceClearScreens();
+    musicPostFromAct(act.music, act.query, act.genre);
+  } else if (s == "usage") handleCommand('U');
+  else if (s == "intro") voiceShowIntro();
+  else if (s == "quiz") voiceShowCard(COMPANION_QUIZ, "", body);
+  else if (s == "trivia") voiceShowCard(COMPANION_TRIVIA, "", body);
+  else if (s == "humor") voiceShowCard(COMPANION_HUMOR, "", body);
+  else if (s == "story") voiceShowCard(COMPANION_STORY, "", body);
+  else if (s == "card") voiceShowCard(COMPANION_CARD, act.title, body);
 
   setCharacterEmotion(moodFromString(act.mood));
 }
 
 // ---------------------------------------------------------------------------
-//  Perintah lokal (instan, tanpa LLM) + cadangan kalau LLM gagal
+//  Perintah lokal
 // ---------------------------------------------------------------------------
 static int wordCount(const String& s) {
   int n = 0;
   bool in = false;
   for (size_t i = 0; i < s.length(); i++) {
     bool sp = (s[i] == ' ');
-    if (!sp && !in) { n++; in = true; }
-    else if (sp)    in = false;
+    if (!sp && !in) {
+      n++;
+      in = true;
+    } else if (sp) in = false;
   }
   return n;
 }
@@ -1987,12 +2119,9 @@ static String homeWeatherSentence() {
   if (!weatherData.valid) return "Data cuaca belum tersedia, coba lagi sebentar lagi.";
   String c = weatherData.condition;
   c.toLowerCase();
-  return String("Cuaca di ") + HOME_CITY + " sekarang " + c + ", suhunya sekitar " +
-         String(weatherData.temperature, 0) + " derajat. Hari ini antara " +
-         String(weatherData.tempMin, 0) + " sampai " + String(weatherData.tempMax, 0) + " derajat.";
+  return String("Cuaca di ") + HOME_CITY + " sekarang " + c + ", suhunya sekitar " + String(weatherData.temperature, 0) + " derajat. Hari ini antara " + String(weatherData.tempMin, 0) + " sampai " + String(weatherData.tempMax, 0) + " derajat.";
 }
 
-// allowContent=true dipakai saat LLM gagal: kuis/trivia/humor/cerita ikut dijalankan.
 static bool voiceLocalCommand(String t, String& say, bool allowContent) {
   t.toLowerCase();
   say = "";
@@ -2007,64 +2136,112 @@ static bool voiceLocalCommand(String t, String& say, bool allowContent) {
     return true;
   }
   if (t.indexOf("volume naik") >= 0 || t.indexOf("lebih keras") >= 0) {
-    audioVolumeStep(+1); say = "Volume dinaikkan."; voiceTextActive = true; return true;
+    audioVolumeStep(+1);
+    say = "Volume dinaikkan.";
+    voiceTextActive = true;
+    return true;
   }
   if (t.indexOf("volume turun") >= 0 || t.indexOf("lebih pelan") >= 0) {
-    audioVolumeStep(-1); say = "Volume diturunkan."; voiceTextActive = true; return true;
+    audioVolumeStep(-1);
+    say = "Volume diturunkan.";
+    voiceTextActive = true;
+    return true;
   }
   if (t.indexOf("peta") >= 0 || t.indexOf("navigasi") >= 0) {
-    handleCommand('M'); say = "Oke, ini petanya."; return true;
+    handleCommand('M');
+    say = "Oke, ini petanya.";
+    return true;
   }
   if (t.indexOf("cuaca") >= 0) {
-    showWeatherView(false); say = homeWeatherSentence(); return true;
+    showWeatherView(false);
+    say = homeWeatherSentence();
+    return true;
   }
-  if (t.indexOf("jam") >= 0) {
-    startInfoMode(); say = timeSentence(); return true;
+  if (t == "jam" || t.indexOf("jam berapa") >= 0 || t.indexOf("sekarang jam") >= 0) {
+    startInfoMode();
+    say = timeSentence();
+    return true;
   }
-  if (t.indexOf("lagu berikutnya") >= 0 || t.indexOf("lagu selanjutnya") >= 0 ||
-      t.indexOf("ganti lagu") >= 0 || t.indexOf("skip") >= 0) {
-    musicRequestPost(MCMD_NEXT, "", ""); say = "Oke, lagu berikutnya."; return true;
+  if (t.indexOf("lagu berikutnya") >= 0 || t.indexOf("lagu selanjutnya") >= 0 || t.indexOf("ganti lagu") >= 0 || t.indexOf("skip") >= 0) {
+    musicRequestPost(MCMD_NEXT, "", "");
+    say = "Oke, lagu berikutnya.";
+    return true;
   }
-  if (t.indexOf("stop musik") >= 0 || t.indexOf("matikan musik") >= 0 ||
-      t.indexOf("matikan lagu") >= 0 || t.indexOf("berhenti musik") >= 0) {
-    musicRequestPost(MCMD_STOP, "", ""); say = "Oke, musiknya kumatikan."; return true;
+  if (t.indexOf("stop musik") >= 0 || t.indexOf("matikan musik") >= 0 || t.indexOf("matikan lagu") >= 0 || t.indexOf("berhenti musik") >= 0) {
+    musicRequestPost(MCMD_STOP, "", "");
+    say = "Oke, musiknya kumatikan.";
+    return true;
   }
-  if (t.indexOf("lanjut musik") >= 0 || t.indexOf("lanjutkan musik") >= 0 ||
-      t.indexOf("lanjut lagu") >= 0 || t.indexOf("putar lagi") >= 0) {
-    musicRequestPost(MCMD_RESUME, "", ""); say = "Siap, kulanjutkan."; return true;
+  if (t.indexOf("lanjut musik") >= 0 || t.indexOf("lanjutkan musik") >= 0 || t.indexOf("lanjut lagu") >= 0 || t.indexOf("putar lagi") >= 0) {
+    musicRequestPost(MCMD_RESUME, "", "");
+    say = "Siap, kulanjutkan.";
+    return true;
   }
   if (t.indexOf("intro") >= 0) {
-    voiceShowIntro(); say = "Oke, kita mulai dari awal."; return true;
+    voiceShowIntro();
+    say = "Oke, kita mulai dari awal.";
+    return true;
   }
   if (allowContent) {
-    if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) { handleCommand('Q'); say = "Oke, ini kuisnya."; return true; }
-    if (t.indexOf("trivia") >= 0)                         { handleCommand('T'); say = "Oke, ini trivia buat kamu."; return true; }
-    if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) { handleCommand('H'); say = "Oke, siap-siap ketawa ya."; return true; }
-    if (t.indexOf("cerita") >= 0)                         { handleCommand('S'); say = "Oke, aku ceritakan ya."; return true; }
+    if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) {
+      handleCommand('Q');
+      say = "Oke, ini kuisnya.";
+      return true;
+    }
+    if (t.indexOf("trivia") >= 0) {
+      handleCommand('T');
+      say = "Oke, ini trivia buat kamu.";
+      return true;
+    }
+    if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) {
+      handleCommand('H');
+      say = "Oke, siap-siap ketawa ya.";
+      return true;
+    }
+    if (t.indexOf("cerita") >= 0) {
+      handleCommand('S');
+      say = "Oke, aku ceritakan ya.";
+      return true;
+    }
   }
   return false;
 }
 
 // ===========================================================================
-//  VOICE TASK: STT -> (perintah lokal | LLM JSON -> layar + suara)
+//  VOICE TASK
 // ===========================================================================
-static void voiceReact(CharacterEmotion e)  { StateLock lock; triggerCharacterReaction(e); }
-static void voiceThinkOn()  { StateLock lock; setCharacterEmotion(CHARACTER_THINKING); beginThinkingVisual(); }
-static void voiceThinkOff() { StateLock lock; endThinkingVisual(); }
-static void voiceEmotion(CharacterEmotion e) { StateLock lock; setCharacterEmotion(e); }
+static void voiceReact(CharacterEmotion e) {
+  StateLock lock;
+  triggerCharacterReaction(e);
+}
+static void voiceThinkOn() {
+  StateLock lock;
+  setCharacterEmotion(CHARACTER_THINKING);
+  beginThinkingVisual();
+}
+static void voiceThinkOff() {
+  StateLock lock;
+  endThinkingVisual();
+}
+static void voiceEmotion(CharacterEmotion e) {
+  StateLock lock;
+  setCharacterEmotion(e);
+}
 
-// Cadangan penilai kuis (kata kunci) kalau LLM tidak bisa dihubungi
 static String quizKeywordFallback(const String& transcript) {
   String low = transcript;
   low.toLowerCase();
   if (low.indexOf("benar") >= 0 || low.indexOf("betul") >= 0) {
-    handleQuizAnswer('J'); return "Wah hebat, jawabanmu benar!";
+    handleQuizAnswer('J');
+    return "Wah hebat, jawabanmu benar!";
   }
   if (low.indexOf("salah") >= 0) {
-    handleQuizAnswer('K'); return "Yah, sayang sekali salah.";
+    handleQuizAnswer('K');
+    return "Yah, sayang sekali salah.";
   }
   if (low.indexOf("tidak tahu") >= 0 || low.indexOf("gak tahu") >= 0 || low.indexOf("bingung") >= 0) {
-    handleQuizAnswer('L'); return "Tidak apa-apa, tetap semangat ya.";
+    handleQuizAnswer('L');
+    return "Tidak apa-apa, tetap semangat ya.";
   }
   handleQuizAnswer('L');
   return "Aku belum bisa menilai jawaban itu, anggap tidak tahu ya.";
@@ -2072,18 +2249,14 @@ static String quizKeywordFallback(const String& transcript) {
 
 constexpr int STORY_MAX_SEGMENTS = 24;
 
-// Cerita panjang: LLM dipanggil per bagian, tiap bagian langsung diucapkan.
 static void storyContinue(const String& request, const VoiceAct& first) {
   String told = first.say;
-  bool   more = first.more;
+  bool more = first.more;
   for (int seg = 1; seg < STORY_MAX_SEGMENTS && more; seg++) {
     if (ttsStop || speakAborted || volumeLevel == 0) break;
     String tail = (told.length() > 500) ? told.substring(told.length() - 500) : told;
-    String extra = " Kamu sedang menceritakan cerita bertahap untuk permintaan pengguna: \"" + request +
-                   "\". Ini bagian ke-" + String(seg + 1) +
-                   ". Bagian terakhir yang sudah kamu ceritakan: \"" + tail +
-                   "\". Lanjutkan 4-5 kalimat berikutnya tanpa mengulang. Isi more=true kalau cerita masih "
-                   "berlanjut, atau more=false kalau ini bagian penutup. show harus none.";
+    String extra = " Kamu sedang menceritakan cerita bertahap untuk permintaan pengguna: \"" + request + "\". Ini bagian ke-" + String(seg + 1) + ". Bagian terakhir yang sudah kamu ceritakan: \"" + tail + "\". Lanjutkan 4-5 kalimat berikutnya tanpa mengulang. Isi more=true kalau cerita masih "
+                                                                                                                                                                                                             "berlanjut, atau more=false kalau ini bagian penutup. show harus none.";
     VoiceAct nxt;
     if (!groqAsk("Lanjutkan ceritanya.", extra, nxt) || nxt.say.length() == 0) {
       voiceTextMode(true);
@@ -2129,7 +2302,10 @@ static void voiceProcess() {
     }
     snapshot = (int16_t*)heap_caps_malloc(samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (!snapshot) snapshot = (int16_t*)malloc(samples * sizeof(int16_t));
-    if (!snapshot) { Serial.println("[VOICE] OOM snapshot"); return; }
+    if (!snapshot) {
+      Serial.println("[VOICE] OOM snapshot");
+      return;
+    }
     memcpy(snapshot, recBuf, samples * sizeof(int16_t));
   }
 
@@ -2143,13 +2319,13 @@ static void voiceProcess() {
     voiceReact(CHARACTER_CONFUSED);
     linkSend("{\"t\":\"stt_result\",\"ok\":0}");
     if (sttLastCode != 200 && sttLastCode != 0) speakText("Aku kurang jelas dengar, coba ulangi ya.");
+    sfxPlay(SFX_ERROR);
     return;
   }
 
   linkSend("{\"t\":\"stt_result\",\"ok\":1,\"text\":\"" + jsonEscape(transcript) + "\"}");
   Serial.printf("[VOICE] STT OK: %s\n", transcript.c_str());
 
-  // 1) Perintah pendek (<= 4 kata) yang jelas: langsung, tanpa LLM
   String say;
   if (!quizWaitingAnswer && wordCount(transcript) <= 4 && voiceLocalCommand(transcript, say, false)) {
     voiceThinkOff();
@@ -2161,24 +2337,20 @@ static void voiceProcess() {
     return;
   }
 
-  // 2) Semua yang lain: LLM menjawab + memilih tampilan layar
   groqEnsureModel();
   VoiceAct act;
   String quizExtra = "";
   if (quizWaitingAnswer) {
-    quizExtra = " Kuis aktif di layar dengan pertanyaan: \"" + currentQuizQuestion +
-                "\". Jika pesan pengguna adalah jawaban kuis, nilai jawabannya, isi verdict "
-                "(correct, wrong, atau unknown bila pengguna menyerah), dan sebutkan jawaban yang benar. "
-                "Jika pesan bukan jawaban kuis, abaikan kuis dan kosongkan verdict.";
+    quizExtra = " Kuis aktif di layar dengan pertanyaan: \"" + currentQuizQuestion + "\". Jika pesan pengguna adalah jawaban kuis, nilai jawabannya, isi verdict "
+                                                                                     "(correct, wrong, atau unknown bila pengguna menyerah), dan sebutkan jawaban yang benar. "
+                                                                                     "Jika pesan bukan jawaban kuis, abaikan kuis dan kosongkan verdict.";
   }
   bool ok = groqAsk(transcript, quizExtra, act);
 
-  // Cuaca kota lain: ambil data nyata, lalu minta LLM menjawab dengan data itu
   if (ok && act.show == "weather" && act.city.length() > 0) {
     String resolved, summary;
     if (fetchCityWeather(act.city, resolved, summary)) {
-      String extra = " Data cuaca terbaru untuk " + resolved + ": " + summary +
-                     ". Jawab pakai data ini dan set show=weather.";
+      String extra = " Data cuaca terbaru untuk " + resolved + ": " + summary + ". Jawab pakai data ini dan set show=weather.";
       VoiceAct act2;
       if (groqAsk(transcript, extra, act2)) {
         act = act2;
@@ -2189,7 +2361,7 @@ static void voiceProcess() {
       }
       act.customWeather = true;
     } else {
-      act.say  = "Maaf, aku tidak menemukan data cuaca untuk " + act.city + ".";
+      act.say = "Maaf, aku tidak menemukan data cuaca untuk " + act.city + ".";
       act.show = "none";
     }
   }
@@ -2198,6 +2370,7 @@ static void voiceProcess() {
 
   if (!ok) {
     Serial.printf("[VOICE] LLM gagal (HTTP %d)\n", lastLlmHttp);
+    sfxPlay(SFX_ERROR);
     if (quizWaitingAnswer) {
       say = quizKeywordFallback(transcript);
       voiceTextMode(true);
@@ -2205,7 +2378,11 @@ static void voiceProcess() {
       return;
     }
     if (voiceLocalCommand(transcript, say, true)) {
-      if (say.length() > 0) { voiceEmotion(CHARACTER_HAPPY); speakText(say); voiceEmotion(CHARACTER_DEFAULT); }
+      if (say.length() > 0) {
+        voiceEmotion(CHARACTER_HAPPY);
+        speakText(say);
+        voiceEmotion(CHARACTER_DEFAULT);
+      }
       return;
     }
     voiceReact(CHARACTER_CONFUSED);
@@ -2215,11 +2392,11 @@ static void voiceProcess() {
   }
 
   histAdd(transcript, act.say);
-  linkSend("{\"t\":\"llm_reply\",\"ok\":1,\"show\":\"" + jsonEscape(act.show) +
-           "\",\"text\":\"" + jsonEscape(act.say) + "\"}");
+  linkSend("{\"t\":\"llm_reply\",\"ok\":1,\"show\":\"" + jsonEscape(act.show) + "\",\"text\":\"" + jsonEscape(act.say) + "\"}");
   Serial.printf("[VOICE] LLM OK (show=%s mood=%s): %s\n",
                 act.show.c_str(), act.mood.c_str(), act.say.c_str());
 
+  sfxPlay(SFX_REPLY);
   voiceApply(act);
   speakText(act.say);
   if (act.more) storyContinue(transcript, act);
@@ -2234,20 +2411,20 @@ static void voiceTask(void* pv) {
     const TickType_t wait = fast ? pdMS_TO_TICKS(2) : pdMS_TO_TICKS(500);
 
     if (xTaskNotifyWait(0, 0xFFFFFFFF, &bits, wait) == pdFALSE) {
-      musicTick();                                   // jaga stream musik tetap mengalir
+      musicTick();
       if (!fast && !modelChecked && millis() > 6000 && millis() - lastModelCheck > 3000) {
         lastModelCheck = millis();
         groqEnsureModel();
       }
       continue;
     }
-    if (bits & 0x01) {                               // rekaman suara selesai
+    if (bits & 0x01) {
       voicePipelineActive = true;
       ttsStop = false;
       voiceProcess();
       voicePipelineActive = false;
     }
-    if (bits & 0x02) musicServiceRequest();          // permintaan musik (tombol/suara/serial)
+    if (bits & 0x02) musicServiceRequest();
   }
 }
 
@@ -2271,6 +2448,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, MQTT_TOPIC_COMMAND) != 0) return;
   if (length == 0 || length >= LINK_LINE_MAX) return;
   if (payload[0] != '{') return;
+  mqttPendingDispatch = "";
   mqttPendingDispatch.reserve(length + 1);
   for (unsigned int i = 0; i < length; i++) mqttPendingDispatch += (char)payload[i];
   mqttPendingDispatch.trim();
@@ -2286,13 +2464,23 @@ void mqttHeartbeat() {
            "{\"t\":\"hb\",\"ver\":\"%s\",\"up\":%lu,\"heap\":%u,\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
            otaReportedVersion.c_str(), millis() / 1000UL,
            (unsigned)ESP.getFreeHeap(), routeReady ? 1 : 0, tripActive ? 1 : 0);
-  mqttClient.publish(MQTT_TOPIC_STATUS, buf);
+           
+  // Tambahkan palang pintu di sini
+  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
+    mqttClient.publish(MQTT_TOPIC_STATUS, buf);
+    xSemaphoreGive(mqttMutex);
+  }
 }
 
 void mqttUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
+  
   if (mqttClient.connected()) {
-    mqttClient.loop();
+    if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
+      mqttClient.loop();
+      xSemaphoreGive(mqttMutex);
+    }
+    
     if (mqttPendingDispatch.length() > 0) {
       String msg = mqttPendingDispatch;
       mqttPendingDispatch = "";
@@ -2301,6 +2489,8 @@ void mqttUpdate() {
     mqttHeartbeat();
     return;
   }
+  
+  // ... (sisa kode mqttUpdate di bawahnya biarkan sama)
 
   unsigned long now = millis();
   if (now - mqttLastReconnectAttempt < mqttBackoffMs) return;
@@ -2321,8 +2511,7 @@ void mqttUpdate() {
     if (!mqttClient.subscribe(MQTT_TOPIC_COMMAND, 0)) {
       Serial.println("[MQTT] Subscribe FAILED");
     }
-    String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") +
-                       otaReportedVersion + "\"}";
+    String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") + otaReportedVersion + "\"}";
     mqttClient.publish(MQTT_TOPIC_STATUS, onlineMsg.c_str(), true);
   } else {
     Serial.print("[MQTT] Connect failed, state=");
@@ -2335,8 +2524,8 @@ void mqttUpdate() {
 //  LINK LAYER
 // ===========================================================================
 void linkBegin() {
-  linkEnabled       = true;
-  hpConnected       = false;
+  linkEnabled = true;
+  hpConnected = false;
   linkRouteReceived = false;
   Serial.println("[LINK] Serial mode ready");
 }
@@ -2344,17 +2533,24 @@ void linkBegin() {
 void linkSend(const String& json) {
   Serial.print("[HP] ");
   Serial.println(json);
-  if (mqttClient.connected()) {
-    bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
-    if (!ok) Serial.println("[MQTT] Publish status gagal");
+  
+  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
+    if (mqttClient.connected()) {
+      bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
+      if (!ok) Serial.println("[MQTT] Publish status gagal");
+    }
+    xSemaphoreGive(mqttMutex);
   }
 }
 
 void linkUpdate() {
   static String buffer;
-  static bool   overflow = false;
-  static bool   reserved = false;
-  if (!reserved) { buffer.reserve(LINK_LINE_MAX); reserved = true; }
+  static bool overflow = false;
+  static bool reserved = false;
+  if (!reserved) {
+    buffer.reserve(LINK_LINE_MAX);
+    reserved = true;
+  }
 
   while (Serial.available()) {
     char c = Serial.read();
@@ -2373,7 +2569,10 @@ void linkUpdate() {
       continue;
     }
     if (overflow) continue;
-    if (buffer.length() >= LINK_LINE_MAX) { overflow = true; continue; }
+    if (buffer.length() >= LINK_LINE_MAX) {
+      overflow = true;
+      continue;
+    }
     buffer += c;
   }
 }
@@ -2406,7 +2605,7 @@ void linkDispatchLine(const String& line) {
     const char* token = doc["token"] | "";
     if (strcmp(token, AUTH_TOKEN) == 0) {
       isAuthorized = true;
-      hpConnected  = true;
+      hpConnected = true;
       abotLog("INFO", "AUTH OK. HP terhubung & diotorisasi.");
       linkSend("{\"t\":\"auth_ok\"}");
     } else {
@@ -2434,28 +2633,51 @@ void linkDispatchLine(const String& line) {
     lastGpsMsgAt = millis();
     onLinkGps(doc);
   } else if (strcmp(t, "trip_start") == 0) onLinkTripStart();
-  else if (strcmp(t, "trip_end") == 0)     onLinkTripEnd();
-  else if (strcmp(t, "reset") == 0)        onLinkReset();
-  else if (strcmp(t, "ping") == 0)         onLinkPing();
+  else if (strcmp(t, "trip_end") == 0) onLinkTripEnd();
+  else if (strcmp(t, "reset") == 0) onLinkReset();
+  else if (strcmp(t, "ping") == 0) onLinkPing();
   else if (strcmp(t, "ota_start") == 0) {
-    const char* requestId     = doc["id"]  | "";
+    const char* requestId = doc["id"] | "";
     const char* targetVersion = doc["ver"] | "";
-#if OTA_SIMULATION_MODE
-    startOTAUpdate("", String(requestId), String(targetVersion));
-#else
-    abotLog("ERR", "OTA sungguhan membutuhkan URL firmware");
-    String errMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId +
-                    "\",\"code\":\"url_required\"}";
-    linkSend(errMsg);
-#endif
+    const char* firmwareUrl = doc["url"] | "";
+    const char* firmwareSha = doc["sha256"] | "";
+
+    // 1. Wajibkan SHA256 (Keamanan)
+    if (strlen(firmwareSha) != 64) {
+      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"bad_hash\",\"message\":\"sha256 wajib 64 karakter\"}");
+      return;
+    }
+
+    // 2. Guard: Jangan OTA kalau sedang sibuk (Musik/Rekam)
+    if (voicePipelineActive || listeningActive || musicState != MUS_STOPPED) {
+      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"busy\",\"message\":\"Selesaikan aktivitas saat ini\"}");
+      return;
+    }
+
+    if (strlen(firmwareUrl) == 0) {
+      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"manifest_invalid\",\"message\":\"URL kosong\"}");
+    } else {
+      // 3. Jalankan OTA di Task Terpisah agar layar & MQTT tidak freeze
+      struct OtaParams {
+        String url;
+        String id;
+        String ver;
+        String sha;
+      };
+      OtaParams* params = new OtaParams{ String(firmwareUrl), String(requestId), String(targetVersion), String(firmwareSha) };
+
+      xTaskCreatePinnedToCore([](void* pv) {
+        OtaParams* p = (OtaParams*)pv;
+        startOTAUpdate(p->url, p->id, p->ver, p->sha);
+        delete p;
+        vTaskDelete(NULL);
+      },
+                              "OtaTask", 8192, params, 1, NULL, 0);
+    }
   } else if (strcmp(t, "ota_cancel") == 0) {
     const char* requestId = doc["id"] | "";
-    String cancelMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId +
-                       "\",\"code\":\"cancelled\",\"message\":\"OTA dibatalkan\"}";
+    String cancelMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"cancelled\",\"message\":\"OTA dibatalkan\"}";
     linkSend(cancelMsg);
-  } else if (strcmp(t, "ota") == 0) {
-    const char* url = doc["url"] | "";
-    startOTAUpdate(String(url), "", "");
   } else if (strcmp(t, "vol") == 0) {
     if (!doc["v"].isNull()) audioSetVolume(doc["v"].as<int>());
     char volBuf[64];
@@ -2481,28 +2703,25 @@ void linkReportStatus() {
 }
 
 // ===========================================================================
-//  OTA
+//  OTA (BENERAN)
 // ===========================================================================
 void startOTAUpdate(const String& url, const String& requestId,
-                    const String& targetVersion) {
+                    const String& targetVersion, const String& expectedSha256) {
 #if OTA_SIMULATION_MODE
   if (otaActive) {
-    String busyMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId +
-                     "\",\"code\":\"busy\"}";
+    String busyMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"busy\"}";
     linkSend(busyMsg);
     return;
   }
 
   otaActive = true;
   String effectiveTarget = targetVersion.length() ? targetVersion : otaReportedVersion;
-  String accepted = String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId +
-                    "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" +
-                    effectiveTarget + "\",\"sim\":true}";
+  String accepted = String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId + "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}";
   linkSend(accepted);
   abotLog("INFO", "OTA Simulation Mode aktif; target=%s", effectiveTarget.c_str());
 
-  const char* stages[]        = {"wifi", "manifest", "download", "verify", "install"};
-  const int   stageProgress[] = {100, 100, 25, 75, 100};
+  const char* stages[] = { "wifi", "manifest", "download", "verify", "install" };
+  const int stageProgress[] = { 100, 100, 25, 75, 100 };
 
   for (int i = 0; i < 5; i++) {
     beginFrame();
@@ -2511,9 +2730,7 @@ void startOTAUpdate(const String& url, const String& requestId,
     drawCenteredText(stages[i], 52, 1);
     presentFrame();
 
-    String progressMsg = String("{\"t\":\"ota_progress\",\"id\":\"") + requestId +
-                         "\",\"stage\":\"" + stages[i] + "\",\"progress\":" +
-                         String(stageProgress[i]) + ",\"sim\":true}";
+    String progressMsg = String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"" + stages[i] + "\",\"progress\":" + String(stageProgress[i]) + ",\"sim\":true}";
     linkSend(progressMsg);
     delay(i < 2 ? 300 : 500);
   }
@@ -2524,87 +2741,191 @@ void startOTAUpdate(const String& url, const String& requestId,
   drawCenteredText("SELESAI", 38, 2);
   presentFrame();
 
-  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId +
-           "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}");
+  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId + "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}");
   delay(900);
-  linkSend(String("{\"t\":\"ota_result\",\"id\":\"") + requestId +
-           "\",\"ok\":true,\"ver\":\"" + effectiveTarget + "\",\"sim\":true}");
-  linkSend(String("{\"t\":\"ota_simulated\",\"id\":\"") + requestId +
-           "\",\"ver\":\"" + effectiveTarget + "\"}");
+  linkSend(String("{\"t\":\"ota_result\",\"id\":\"") + requestId + "\",\"ok\":true,\"ver\":\"" + effectiveTarget + "\",\"sim\":true}");
+  linkSend(String("{\"t\":\"ota_simulated\",\"id\":\"") + requestId + "\",\"ver\":\"" + effectiveTarget + "\"}");
   abotLog("INFO", "Simulasi OTA selesai; versi virtual=%s", effectiveTarget.c_str());
   otaActive = false;
   return;
 #else
+  // ---------- OTA BENERAN ----------
   if (url.length() == 0) {
-    abotLog("ERR", "OTA URL kosong");
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"url_required\"}");
+    linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"manifest_invalid\",\"message\":\"URL kosong\"}");
+    return;
+  }
+  if (otaActive) {
+    linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"busy\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"no_wifi\"}");
     return;
   }
 
   otaActive = true;
-  abotLog("INFO", "Memulai OTA Update dari: %s", url.c_str());
-  linkSend("{\"t\":\"ota_start\"}");
+  const String effectiveTarget =
+    targetVersion.length() ? targetVersion : otaReportedVersion;
+  
+  abotLog("INFO", "OTA mulai: %s -> %s", otaReportedVersion.c_str(),
+          effectiveTarget.c_str());
+          
+  // Simpan target versi ke NVS sebelum mulai
+  otaPrefs.begin("ota", false);
+  otaPrefs.putString("target", effectiveTarget);
+  otaPrefs.putBool("pending", true);
+  otaPrefs.end();
+
+  linkSend(String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId +
+           "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" +
+           effectiveTarget + "\"}");
+
+  auto sendError = [&](const char* code, const String& msg) {
+    String errMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"" + code + "\"";
+    if (msg.length() > 0) errMsg += ",\"message\":\"" + jsonEscape(msg) + "\"";
+    errMsg += "}";
+    linkSend(errMsg);
+    otaActive = false;
+  };
+
+  linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":0}");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  WiFiClient plainClient;
 
   HTTPClient http;
-  http.setTimeout(15000);
-  if (!http.begin(url)) {
-    abotLog("ERR", "HTTP Begin OTA gagal");
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"begin_failed\"}");
-    otaActive = false;
+  http.setTimeout(30000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  bool begun = url.startsWith("https")
+                 ? http.begin(secureClient, url)
+                 : http.begin(plainClient, url);
+  if (!begun) {
+    sendError("download_failed", "begin gagal");
     return;
   }
 
   int httpCode = http.GET();
   if (httpCode != 200) {
-    abotLog("ERR", "OTA HTTP %d", httpCode);
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"http_error\"}");
+    sendError("download_failed", "HTTP " + String(httpCode));
     http.end();
-    otaActive = false;
     return;
   }
 
   int contentLength = http.getSize();
   if (contentLength <= 0) {
-    abotLog("ERR", "OTA Content-Length invalid");
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"no_content_length\"}");
+    sendError("download_failed", "Content-Length invalid");
     http.end();
-    otaActive = false;
     return;
   }
 
   if (!Update.begin(contentLength)) {
-    abotLog("ERR", "Update.begin gagal");
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"update_begin_failed\"}");
+    sendError("no_space", "Update.begin gagal");
     http.end();
-    otaActive = false;
     return;
   }
 
+  mbedtls_sha256_context shaCtx;
+  mbedtls_sha256_init(&shaCtx);
+  mbedtls_sha256_starts(&shaCtx, 0);
+
   WiFiClient* stream = http.getStreamPtr();
-  size_t written = Update.writeStream(*stream);
-  if (written == contentLength) {
-    abotLog("INFO", "OTA Berhasil diunduh (%u bytes)", written);
-  } else {
-    abotLog("ERR", "OTA Gagal unduh (%u / %d)", written, contentLength);
-  }
+  size_t written = 0;
+  uint8_t buffer[1024];
+  const unsigned long dlStart = millis();
+  int lastProgress = -1;
 
-  if (Update.end()) {
-    if (Update.isFinished()) {
-      abotLog("INFO", "OTA Selesai. Restarting...");
-      linkSend("{\"t\":\"ota_success\"}");
-      delay(1000);
-      ESP.restart();
-    } else {
-      abotLog("ERR", "Update tidak selesai");
-      linkSend("{\"t\":\"ota_fail\",\"why\":\"not_finished\"}");
+  while (written < (size_t)contentLength) {
+    esp_task_wdt_reset();  // <--- TAMBAHKAN BARIS INI (Lapor WDT)
+
+    if (!http.connected()) break;
+    size_t avail = stream->available();
+    if (avail == 0) {
+      if (millis() - dlStart > 120000UL) {
+        Update.abort();
+        mbedtls_sha256_free(&shaCtx);
+        http.end();
+        sendError("download_failed", "timeout 120s");
+        return;
+      }
+      delay(1);
+      continue;
     }
-  } else {
-    abotLog("ERR", "Update error: %s", Update.errorString());
-    linkSend("{\"t\":\"ota_fail\",\"why\":\"update_error\"}");
+
+    size_t toRead = avail > sizeof(buffer) ? sizeof(buffer) : avail;
+
+    size_t readBytes = stream->readBytes(buffer, toRead);
+    if (readBytes == 0) continue;
+
+    mbedtls_sha256_update(&shaCtx, buffer, readBytes);
+
+    if (Update.write(buffer, readBytes) != readBytes) {
+      Update.abort();
+      mbedtls_sha256_free(&shaCtx);
+      http.end();
+      sendError("write_failed", "Update.write gagal");
+      return;
+    }
+    written += readBytes;
+
+    int progress = (int)((written * 100) / (size_t)contentLength);
+    if (progress / 5 != lastProgress / 5) {
+      lastProgress = progress;
+      linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":" + String(progress) + "}");
+    }
+  }
+  http.end();
+
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&shaCtx, digest);
+  mbedtls_sha256_free(&shaCtx);
+
+  if (written != (size_t)contentLength) {
+    Update.abort();
+    sendError("download_failed",
+              "terunduh " + String((unsigned)written) + "/" + String(contentLength));
+    return;
   }
 
-  http.end();
-  otaActive = false;
+  linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"verify\",\"progress\":100}");
+
+  if (expectedSha256.length() > 0) {
+    String calcHex = "";
+    char hexBuf[3];
+    for (int i = 0; i < 32; i++) {
+      snprintf(hexBuf, sizeof(hexBuf), "%02x", digest[i]);
+      calcHex += hexBuf;
+    }
+    String expected = expectedSha256;
+    expected.toLowerCase();
+    if (calcHex != expected) {
+      Update.abort();
+      sendError("bad_hash", "sha256 mismatch");
+      return;
+    }
+    abotLog("INFO", "SHA256 cocok");
+  }
+
+  linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"install\",\"progress\":100}");
+
+  if (!Update.end(true)) {
+    sendError("write_failed", Update.errorString());
+    return;
+  }
+  if (!Update.isFinished()) {
+    sendError("write_failed", "Update tidak selesai");
+    return;
+  }
+
+  abotLog("INFO", "OTA selesai, restart...");
+  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId +
+           "\",\"to\":\"" + effectiveTarget + "\"}");
+  delay(1500);
+  
+  // Matikan sementara watchdog sebelum restart agar tidak bentrok
+  esp_task_wdt_delete(NULL); 
+  ESP.restart();
 #endif
 }
 
@@ -2614,14 +2935,14 @@ void startOTAUpdate(const String& url, const String& requestId,
 void skipStartupSequence() {
   if (bootTransitionActive) bootTransitionActive = false;
   if (!introductionFinished) {
-    wakeIntroStage      = WAKE_FINISHED;
+    wakeIntroStage = WAKE_FINISHED;
     introductionFinished = true;
     roboEyes.setAutoblinker(ON, 3, 2);
     roboEyes.setIdleMode(ON, 2, 1);
   }
   if (startupOnboardingActive) {
     startupOnboardingActive = false;
-    startupStage            = STARTUP_NORMAL;
+    startupStage = STARTUP_NORMAL;
     startupOnboardingManual = false;
   }
   startupOnboardingCompleted = true;
@@ -2631,8 +2952,7 @@ void skipStartupSequence() {
 }
 
 void syncRouteProgress() {
-  while (simulatedRouteIndex < routePointCount - 1 &&
-         routeCumulativeDistance[simulatedRouteIndex + 1] < simulatedRouteDistance) {
+  while (simulatedRouteIndex < routePointCount - 1 && routeCumulativeDistance[simulatedRouteIndex + 1] < simulatedRouteDistance) {
     simulatedRouteIndex++;
   }
   int newStep = 0;
@@ -2656,18 +2976,21 @@ void updateSpeedEstimate(float newDist) {
     float dt = (now - speedLastAt) / 1000.0f;
     if (dt >= 0.2f && dt <= 5.0f) {
       float v = (newDist - speedLastDist) / dt;
-      if (v < 0.0f)  v = 0.0f;
+      if (v < 0.0f) v = 0.0f;
       if (v > 35.0f) v = 35.0f;
       speedMps = speedMps * 0.6f + v * 0.4f;
     }
   }
-  speedLastAt   = now;
+  speedLastAt = now;
   speedLastDist = newDist;
 }
 
 void deadReckonStep() {
   unsigned long now = millis();
-  if (drLastMs == 0) { drLastMs = now; return; }
+  if (drLastMs == 0) {
+    drLastMs = now;
+    return;
+  }
   float dt = (now - drLastMs) / 1000.0f;
   drLastMs = now;
   if (dt > 0.25f) dt = 0.25f;
@@ -2696,7 +3019,7 @@ void onLinkRoute(JsonDocument& doc) {
   Serial.printf("[LINK] >>> ROUTE dari HP (%u titik)\n", (unsigned)total);
 
   osrmTotalDistance = doc["dist"] | 0.0f;
-  osrmTotalDuration = doc["dur"]  | 0.0f;
+  osrmTotalDuration = doc["dur"] | 0.0f;
 
   routeStride = (int)((total + MAX_ROUTE_POINTS - 1) / MAX_ROUTE_POINTS);
   if (routeStride < 1) routeStride = 1;
@@ -2707,7 +3030,8 @@ void onLinkRoute(JsonDocument& doc) {
     bool isLast = (i == total - 1);
     if ((i % routeStride) == 0 || isLast) {
       int slot = (routePointCount < MAX_ROUTE_POINTS)
-                 ? routePointCount++ : (MAX_ROUTE_POINTS - 1);
+                   ? routePointCount++
+                   : (MAX_ROUTE_POINTS - 1);
       routePoints[slot].lon = c[0].as<double>();
       routePoints[slot].lat = c[1].as<double>();
     }
@@ -2716,8 +3040,7 @@ void onLinkRoute(JsonDocument& doc) {
 
   int validCount = 0;
   for (int k = 0; k < routePointCount; k++) {
-    if (routePoints[k].lat < -90.0 || routePoints[k].lat > 90.0 ||
-        routePoints[k].lon < -180.0 || routePoints[k].lon > 180.0) continue;
+    if (routePoints[k].lat < -90.0 || routePoints[k].lat > 90.0 || routePoints[k].lon < -180.0 || routePoints[k].lon > 180.0) continue;
     if (validCount != k) routePoints[validCount] = routePoints[k];
     validCount++;
   }
@@ -2728,7 +3051,7 @@ void onLinkRoute(JsonDocument& doc) {
     return;
   }
 
-  routeGeometryDistance    = 0;
+  routeGeometryDistance = 0;
   routeCumulativeDistance[0] = 0;
   for (int k = 1; k < routePointCount; k++) {
     double lat1 = routePoints[k - 1].lat;
@@ -2758,14 +3081,14 @@ void onLinkRoute(JsonDocument& doc) {
     if (navStepCount >= MAX_NAV_STEPS) break;
     NavigationStep& nav = navSteps[navStepCount];
     nav.instruction = s["instr"] | "LANJUT";
-    nav.road        = s["road"]  | "";
-    nav.distance    = s["dist"]  | 0.0f;
+    nav.road = s["road"] | "";
+    nav.distance = s["dist"] | 0.0f;
     int idx = (s["idx"] | 0) / routeStride;
     if (idx >= routePointCount) idx = routePointCount - 1;
-    if (idx < 0)                idx = 0;
-    nav.routeIndex    = idx;
+    if (idx < 0) idx = 0;
+    nav.routeIndex = idx;
     nav.routeDistance = (s["routeDist"] | 0.0f) * linkDistScale;
-    nav.important     = s["imp"] | false;
+    nav.important = s["imp"] | false;
     navStepCount++;
   }
 
@@ -2779,42 +3102,42 @@ void onLinkRoute(JsonDocument& doc) {
     navSteps[b + 1] = key;
   }
 
-  routeReady         = true;
-  routeRequested     = false;
-  routeFromLink      = true;
-  linkRouteReceived  = true;
-  activeOsrmUrl      = "";
-  osrmFailCount      = 0;
-  tripIntroTriggerAsk= false;
-  tripActive         = true;
-  tripArrived        = false;
-  arrivalActive      = false;
-  initialMapShown    = true;
+  routeReady = true;
+  routeRequested = false;
+  routeFromLink = true;
+  linkRouteReceived = true;
+  activeOsrmUrl = "";
+  osrmFailCount = 0;
+  tripIntroTriggerAsk = false;
+  tripActive = true;
+  tripArrived = false;
+  arrivalActive = false;
+  initialMapShown = true;
   destinationAskActive = false;
 
   simulatedRouteDistance = 0;
-  simulatedRouteIndex    = 0;
-  gpsLastMs              = 0;
-  activeStep             = 0;
-  hudLockedStep          = -1;
-  hudCompletedStep       = -1;
-  hudActive              = false;
-  hudShownAt             = 0;
-  navigationAIStarted    = false;
-  systemState            = STATE_READY;
+  simulatedRouteIndex = 0;
+  gpsLastMs = 0;
+  activeStep = 0;
+  hudLockedStep = -1;
+  hudCompletedStep = -1;
+  hudActive = false;
+  hudShownAt = 0;
+  navigationAIStarted = false;
+  systemState = STATE_READY;
 
-  speedMps    = 8.0f;
+  speedMps = 8.0f;
   speedLastAt = 0;
   speedLastDist = 0;
-  drLastMs    = 0;
+  drLastMs = 0;
   lastLinkGpsAt = 0;
 
   skipStartupSequence();
   tripIntroActive = false;
-  tripMapPending  = false;
+  tripMapPending = false;
 
   startMapDisplay();
-  mapForNewRoute     = true;
+  mapForNewRoute = true;
   pendingNavigationAI = NAV_AI_ON_ROUTE;
 
   char buf[128];
@@ -2826,14 +3149,14 @@ void onLinkRoute(JsonDocument& doc) {
 
 float snapToRoute(double lat, double lon, int from, int to, float& along) {
   double cosLat = cos(lat * DEG_TO_RAD);
-  float  best   = 1e9f;
+  float best = 1e9f;
   along = simulatedRouteDistance;
   if (from < 0) from = 0;
   if (to > routePointCount - 2) to = routePointCount - 2;
 
   for (int i = from; i <= to; i++) {
-    double ax = (routePoints[i].lon     - lon) * 111320.0 * cosLat;
-    double ay = (routePoints[i].lat     - lat) * 110540.0;
+    double ax = (routePoints[i].lon - lon) * 111320.0 * cosLat;
+    double ay = (routePoints[i].lat - lat) * 110540.0;
     double bx = (routePoints[i + 1].lon - lon) * 111320.0 * cosLat;
     double by = (routePoints[i + 1].lat - lat) * 110540.0;
     double dx = bx - ax, dy = by - ay;
@@ -2844,9 +3167,8 @@ float snapToRoute(double lat, double lon, int from, int to, float& along) {
     double px = ax + t * dx, py = ay + t * dy;
     float d = (float)sqrt(px * px + py * py);
     if (d < best) {
-      best  = d;
-      along = routeCumulativeDistance[i] +
-              (float)t * (routeCumulativeDistance[i + 1] - routeCumulativeDistance[i]);
+      best = d;
+      along = routeCumulativeDistance[i] + (float)t * (routeCumulativeDistance[i + 1] - routeCumulativeDistance[i]);
     }
   }
   return best;
@@ -2866,11 +3188,10 @@ void onLinkGps(JsonDocument& doc) {
   } else if (!doc["lat"].isNull() && !doc["lon"].isNull()) {
     double lat = doc["lat"].as<double>();
     double lon = doc["lon"].as<double>();
-    if (isnan(lat) || isinf(lat) || isnan(lon) || isinf(lon) ||
-        lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
+    if (isnan(lat) || isinf(lat) || isnan(lon) || isinf(lon) || lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return;
     float along = 0;
     int from = simulatedRouteIndex - 2;
-    int to   = simulatedRouteIndex + 30;
+    int to = simulatedRouteIndex + 30;
     float off = snapToRoute(lat, lon, from, to, along);
     if (off > OFFROUTE_METERS) off = snapToRoute(lat, lon, 0, routePointCount - 2, along);
     if (off > OFFROUTE_METERS) {
@@ -2892,7 +3213,7 @@ void onLinkGps(JsonDocument& doc) {
   }
 
   lastLinkGpsAt = millis();
-  drLastMs      = millis();
+  drLastMs = millis();
   if (dist < 0) dist = 0;
   if (dist > routeGeometryDistance) dist = routeGeometryDistance;
   updateSpeedEstimate(dist);
@@ -2906,65 +3227,65 @@ void onLinkGps(JsonDocument& doc) {
 void onLinkTripStart() {
   markUserActivity();
   skipStartupSequence();
-  tripActive        = true;
-  tripArrived       = false;
-  arrivalActive     = false;
-  tripMapPending    = false;
-  routeReady        = false;
-  routeRequested    = false;
-  routePointCount   = 0;
-  navStepCount      = 0;
+  tripActive = true;
+  tripArrived = false;
+  arrivalActive = false;
+  tripMapPending = false;
+  routeReady = false;
+  routeRequested = false;
+  routePointCount = 0;
+  navStepCount = 0;
   simulatedRouteDistance = 0;
-  simulatedRouteIndex    = 0;
-  gpsLastMs              = 0;
-  activeStep             = 0;
-  hudLockedStep          = -1;
-  hudCompletedStep       = -1;
-  hudActive              = false;
-  hudShownAt             = 0;
-  mapRequested           = false;
-  navigationAIStarted    = false;
-  pendingNavigationAI    = false;
-  activeOsrmUrl          = "";
-  osrmFailCount          = 0;
-  linkRouteReceived      = false;
-  routeFromLink          = false;
-  tripIntroTriggerAsk    = false;
-  lastLinkGpsAt          = 0;
-  speedMps               = 8.0f;
-  speedLastAt            = 0;
-  drLastMs               = 0;
-  destinationAskActive   = false;
-  tripIntroActive     = true;
-  tripIntroStartedAt  = millis();
+  simulatedRouteIndex = 0;
+  gpsLastMs = 0;
+  activeStep = 0;
+  hudLockedStep = -1;
+  hudCompletedStep = -1;
+  hudActive = false;
+  hudShownAt = 0;
+  mapRequested = false;
+  navigationAIStarted = false;
+  pendingNavigationAI = false;
+  activeOsrmUrl = "";
+  osrmFailCount = 0;
+  linkRouteReceived = false;
+  routeFromLink = false;
+  tripIntroTriggerAsk = false;
+  lastLinkGpsAt = 0;
+  speedMps = 8.0f;
+  speedLastAt = 0;
+  drLastMs = 0;
+  destinationAskActive = false;
+  tripIntroActive = true;
+  tripIntroStartedAt = millis();
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
 }
 
 void onLinkTripEnd() {
-  tripActive    = false;
-  tripArrived   = false;
+  tripActive = false;
+  tripArrived = false;
   arrivalActive = false;
-  tripMapPending= false;
-  routeReady       = false;
-  routeRequested   = false;
-  routeFromLink    = false;
-  linkRouteReceived= false;
-  mapRequested     = false;
+  tripMapPending = false;
+  routeReady = false;
+  routeRequested = false;
+  routeFromLink = false;
+  linkRouteReceived = false;
+  mapRequested = false;
   routePointCount = 0;
-  navStepCount    = 0;
-  activeStep      = 0;
-  hudLockedStep   = -1;
-  hudCompletedStep= -1;
+  navStepCount = 0;
+  activeStep = 0;
+  hudLockedStep = -1;
+  hudCompletedStep = -1;
   simulatedRouteDistance = 0;
-  simulatedRouteIndex    = 0;
-  gpsLastMs              = 0;
-  lastLinkGpsAt          = 0;
+  simulatedRouteIndex = 0;
+  gpsLastMs = 0;
+  lastLinkGpsAt = 0;
   pendingNavigationAI = false;
   navigationAIStarted = false;
-  activeOsrmUrl       = "";
-  hudActive        = false;
-  initialMapShown  = false;
+  activeOsrmUrl = "";
+  hudActive = false;
+  initialMapShown = false;
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
   linkSend("{\"t\":\"trip_ended\",\"route\":0,\"trip\":0}");
@@ -2972,18 +3293,18 @@ void onLinkTripEnd() {
 
 void onLinkReset() {
   simulatedRouteDistance = 0;
-  simulatedRouteIndex    = 0;
-  gpsLastMs              = 0;
-  activeStep             = 0;
-  hudLockedStep          = -1;
-  hudCompletedStep       = -1;
-  hudActive              = false;
-  hudShownAt             = 0;
-  arrivalActive          = false;
-  tripArrived            = false;
-  tripActive             = true;
-  speedLastAt            = 0;
-  drLastMs               = 0;
+  simulatedRouteIndex = 0;
+  gpsLastMs = 0;
+  activeStep = 0;
+  hudLockedStep = -1;
+  hudCompletedStep = -1;
+  hudActive = false;
+  hudShownAt = 0;
+  arrivalActive = false;
+  tripArrived = false;
+  tripActive = true;
+  speedLastAt = 0;
+  drLastMs = 0;
 }
 
 void onLinkPing() {
@@ -3002,7 +3323,8 @@ int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
   int len = encoded.length();
   while (idx < len && count < maxPoints) {
     int b, shift, result;
-    shift = 0; result = 0;
+    shift = 0;
+    result = 0;
     do {
       if (idx >= len) return count;
       b = encoded.charAt(idx++) - 63;
@@ -3011,7 +3333,8 @@ int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
     } while (b >= 0x20);
     int dlat = ((result & 1) ? ~(result >> 1) : (result >> 1));
     lat += dlat;
-    shift = 0; result = 0;
+    shift = 0;
+    result = 0;
     do {
       if (idx >= len) return count;
       b = encoded.charAt(idx++) - 63;
@@ -3030,7 +3353,7 @@ int decodePolyline(const String& encoded, RoutePoint* out, int maxPoints) {
 String buildOsrmUrl(float fromLat, float fromLon, float toLat, float toLon) {
   String url = "http://router.project-osrm.org/route/v1/driving/";
   url += String(fromLon, 6) + "," + String(fromLat, 6) + ";";
-  url += String(toLon,   6) + "," + String(toLat,   6);
+  url += String(toLon, 6) + "," + String(toLat, 6);
   url += "?overview=simplified&geometries=polyline&steps=true";
   return url;
 }
@@ -3040,16 +3363,16 @@ String buildOsrmUrl(float fromLat, float fromLon, float toLat, float toLon) {
 // ===========================================================================
 const char* abotPersonalityName(AbotPersonality p) {
   switch (p) {
-    case ABOT_MORNING:   return "PAGI / SEMANGAT";
-    case ABOT_DAY:       return "SIANG / LELAH";
+    case ABOT_MORNING: return "PAGI / SEMANGAT";
+    case ABOT_DAY: return "SIANG / LELAH";
     case ABOT_AFTERNOON: return "SORE / LEMAS";
-    case ABOT_NIGHT:     return "MALAM / NGANTUK";
-    default:             return "NETRAL";
+    case ABOT_NIGHT: return "MALAM / NGANTUK";
+    default: return "NETRAL";
   }
 }
 
 AbotPersonality abotPersonalityByHour(int hour) {
-  if (hour >= 5  && hour < 11) return ABOT_MORNING;
+  if (hour >= 5 && hour < 11) return ABOT_MORNING;
   if (hour >= 11 && hour < 16) return ABOT_DAY;
   if (hour >= 16 && hour < 19) return ABOT_AFTERNOON;
   return ABOT_NIGHT;
@@ -3057,38 +3380,32 @@ AbotPersonality abotPersonalityByHour(int hour) {
 
 EyeMood abotEyeFor(AbotPersonality p) {
   switch (p) {
-    case ABOT_MORNING:   return EYE_HAPPY;
-    case ABOT_DAY:       return EYE_TIRED;
+    case ABOT_MORNING: return EYE_HAPPY;
+    case ABOT_DAY: return EYE_TIRED;
     case ABOT_AFTERNOON: return EYE_TIRED;
-    case ABOT_NIGHT:     return EYE_TIRED;
-    default:             return EYE_DEFAULT;
+    case ABOT_NIGHT: return EYE_TIRED;
+    default: return EYE_DEFAULT;
   }
 }
 
 String abotPromptHint() {
   switch (currentAbotPersonality) {
-    case ABOT_MORNING:   return " Suasana pagi: nada kamu bersemangat dan ceria.";
-    case ABOT_DAY:       return " Suasana siang: nada kamu agak lelah tapi tetap hangat.";
+    case ABOT_MORNING: return " Suasana pagi: nada kamu bersemangat dan ceria.";
+    case ABOT_DAY: return " Suasana siang: nada kamu agak lelah tapi tetap hangat.";
     case ABOT_AFTERNOON: return " Suasana sore: nada kamu santai dan sedikit lemas tapi tetap ramah.";
-    case ABOT_NIGHT:     return " Suasana malam: nada kamu tenang dan sedikit mengantuk tapi tetap hangat.";
-    default:             return "";
+    case ABOT_NIGHT: return " Suasana malam: nada kamu tenang dan sedikit mengantuk tapi tetap hangat.";
+    default: return "";
   }
 }
 
 void updateAbotPersonality() {
   struct tm ti;
   AbotPersonality p = getLocalTimeSafe(&ti)
-                      ? abotPersonalityByHour(ti.tm_hour)
-                      : ABOT_NEUTRAL;
+                        ? abotPersonalityByHour(ti.tm_hour)
+                        : ABOT_NEUTRAL;
   currentAbotPersonality = p;
 
-  if (!introductionFinished || bootTransitionActive || sleepModeActive ||
-      listeningActive || voicePipelineActive ||
-      companionActive || companionGenerating || companionNextMenuActive ||
-      companionNextMenuPending || conversationActive || mapRequested ||
-      hudActive || arrivalActive || startupOnboardingActive || infoModeActive ||
-      destinationAskActive || tripIntroActive || systemState == STATE_THINKING ||
-      characterReactionActive || millis() < abotHoldUntil || otaActive) {
+  if (!introductionFinished || bootTransitionActive || sleepModeActive || listeningActive || voicePipelineActive || companionActive || companionGenerating || companionNextMenuActive || companionNextMenuPending || conversationActive || mapRequested || hudActive || arrivalActive || startupOnboardingActive || infoModeActive || destinationAskActive || tripIntroActive || systemState == STATE_THINKING || characterReactionActive || millis() < abotHoldUntil || otaActive) {
     return;
   }
 
@@ -3101,8 +3418,8 @@ void updateAbotPersonality() {
   if (currentEyeMood == desired) return;
   setEyeMood(desired);
   currentCharacterEmotion =
-    (desired == EYE_HAPPY) ? CHARACTER_HAPPY :
-    (desired == EYE_TIRED) ? CHARACTER_TIRED : CHARACTER_DEFAULT;
+    (desired == EYE_HAPPY) ? CHARACTER_HAPPY : (desired == EYE_TIRED) ? CHARACTER_TIRED
+                                                                      : CHARACTER_DEFAULT;
 }
 
 void setEyeMood(EyeMood mood) {
@@ -3110,25 +3427,31 @@ void setEyeMood(EyeMood mood) {
   currentEyeMood = mood;
   switch (mood) {
     case EYE_DEFAULT: roboEyes.setMood(DEFAULT); break;
-    case EYE_HAPPY:   roboEyes.setMood(HAPPY);   break;
-    case EYE_ANGRY:   roboEyes.setMood(ANGRY);   break;
-    case EYE_TIRED:   roboEyes.setMood(TIRED);   break;
+    case EYE_HAPPY: roboEyes.setMood(HAPPY); break;
+    case EYE_ANGRY: roboEyes.setMood(ANGRY); break;
+    case EYE_TIRED: roboEyes.setMood(TIRED); break;
   }
 }
 
 void setCharacterEmotion(CharacterEmotion emotion) {
-  currentCharacterEmotion  = emotion;
-  characterReactionActive  = false;
-  characterReactionUntil   = 0;
+  currentCharacterEmotion = emotion;
+  characterReactionActive = false;
+  characterReactionUntil = 0;
   switch (emotion) {
-    case CHARACTER_DEFAULT:   setEyeMood(EYE_DEFAULT); break;
-    case CHARACTER_LISTENING: setEyeMood(EYE_HAPPY);   break;
-    case CHARACTER_THINKING:  setEyeMood(EYE_DEFAULT); break;
-    case CHARACTER_HAPPY:     setEyeMood(EYE_HAPPY);   break;
-    case CHARACTER_LAUGH:     setEyeMood(EYE_HAPPY); roboEyes.anim_laugh();    break;
-    case CHARACTER_CONFUSED:  setEyeMood(EYE_DEFAULT); roboEyes.anim_confused(); break;
-    case CHARACTER_ANGRY:     setEyeMood(EYE_ANGRY);   break;
-    case CHARACTER_TIRED:     setEyeMood(EYE_TIRED);   break;
+    case CHARACTER_DEFAULT: setEyeMood(EYE_DEFAULT); break;
+    case CHARACTER_LISTENING: setEyeMood(EYE_HAPPY); break;
+    case CHARACTER_THINKING: setEyeMood(EYE_DEFAULT); break;
+    case CHARACTER_HAPPY: setEyeMood(EYE_HAPPY); break;
+    case CHARACTER_LAUGH:
+      setEyeMood(EYE_HAPPY);
+      roboEyes.anim_laugh();
+      break;
+    case CHARACTER_CONFUSED:
+      setEyeMood(EYE_DEFAULT);
+      roboEyes.anim_confused();
+      break;
+    case CHARACTER_ANGRY: setEyeMood(EYE_ANGRY); break;
+    case CHARACTER_TIRED: setEyeMood(EYE_TIRED); break;
   }
 }
 
@@ -3164,20 +3487,25 @@ void updateCharacterEmotion() {
   if (!characterReactionActive) return;
   if (millis() < characterReactionUntil) return;
   characterReactionActive = false;
-  characterReactionUntil  = 0;
-  if (listeningActive) { setCharacterEmotion(CHARACTER_LISTENING); return; }
-  if (companionGenerating || systemState == STATE_THINKING ||
-      voicePipelineActive) { setCharacterEmotion(CHARACTER_THINKING); return; }
+  characterReactionUntil = 0;
+  if (listeningActive) {
+    setCharacterEmotion(CHARACTER_LISTENING);
+    return;
+  }
+  if (companionGenerating || systemState == STATE_THINKING || voicePipelineActive) {
+    setCharacterEmotion(CHARACTER_THINKING);
+    return;
+  }
   setCharacterEmotion(CHARACTER_DEFAULT);
 }
 
 void resetNaturalEyeBehavior() {
   unsigned long now = millis();
-  naturalEyeGazeActive  = false;
-  naturalEyeReturnAt    = 0;
-  naturalEyeNextActionAt= now + NATURAL_EYE_FIRST_ACTION_MS;
-  naturalEyeNextWinkAt  = now + NATURAL_EYE_WINK_INTERVAL_MS;
-  naturalEyeSequence    = 0;
+  naturalEyeGazeActive = false;
+  naturalEyeReturnAt = 0;
+  naturalEyeNextActionAt = now + NATURAL_EYE_FIRST_ACTION_MS;
+  naturalEyeNextWinkAt = now + NATURAL_EYE_WINK_INTERVAL_MS;
+  naturalEyeSequence = 0;
   roboEyes.setPosition(DEFAULT);
 }
 
@@ -3189,13 +3517,7 @@ void triggerNaturalWink() {
 
 void updateNaturalEyeBehavior() {
   if (!naturalEyeBehaviorEnabled) return;
-  if (!introductionFinished || bootTransitionActive || sleepModeActive ||
-      listeningActive || voicePipelineActive ||
-      companionActive || companionGenerating || companionNextMenuActive ||
-      mapRequested || hudActive || arrivalActive || startupOnboardingActive ||
-      infoModeActive || destinationAskActive || tripIntroActive ||
-      conversationActive || systemState == STATE_THINKING ||
-      characterReactionActive || otaActive) return;
+  if (!introductionFinished || bootTransitionActive || sleepModeActive || listeningActive || voicePipelineActive || companionActive || companionGenerating || companionNextMenuActive || mapRequested || hudActive || arrivalActive || startupOnboardingActive || infoModeActive || destinationAskActive || tripIntroActive || conversationActive || systemState == STATE_THINKING || characterReactionActive || otaActive) return;
 
   if (naturalEyeGazeActive) {
     if (millis() >= naturalEyeReturnAt) {
@@ -3205,17 +3527,20 @@ void updateNaturalEyeBehavior() {
     }
     return;
   }
-  if (millis() >= naturalEyeNextWinkAt) { triggerNaturalWink(); return; }
+  if (millis() >= naturalEyeNextWinkAt) {
+    triggerNaturalWink();
+    return;
+  }
   if (millis() < naturalEyeNextActionAt) return;
 
   switch (naturalEyeSequence % 3) {
-    case 0:  roboEyes.setPosition(OJOL_POS_W); break;
-    case 1:  roboEyes.setPosition(OJOL_POS_E); break;
+    case 0: roboEyes.setPosition(OJOL_POS_W); break;
+    case 1: roboEyes.setPosition(OJOL_POS_E); break;
     default: roboEyes.setPosition(OJOL_POS_N); break;
   }
   naturalEyeSequence++;
   naturalEyeGazeActive = true;
-  naturalEyeReturnAt   = millis() + NATURAL_EYE_GAZE_DURATION_MS;
+  naturalEyeReturnAt = millis() + NATURAL_EYE_GAZE_DURATION_MS;
 }
 
 void updateThinkingGaze() {
@@ -3223,15 +3548,17 @@ void updateThinkingGaze() {
   unsigned long now = millis();
   if (now < thinkingGazeNextAt) return;
   switch (thinkingGazeStep % 3) {
-    case 0:  roboEyes.setPosition(OJOL_POS_NW); break;
-    case 1:  roboEyes.setPosition(OJOL_POS_NE); break;
-    default: roboEyes.setPosition(DEFAULT);     break;
+    case 0: roboEyes.setPosition(OJOL_POS_NW); break;
+    case 1: roboEyes.setPosition(OJOL_POS_NE); break;
+    default: roboEyes.setPosition(DEFAULT); break;
   }
   thinkingGazeStep++;
   thinkingGazeNextAt = now + 1200;
 }
 
-void renderEyes()  { roboEyes.update(); }
+void renderEyes() {
+  roboEyes.update();
+}
 
 // ===========================================================================
 //  SLEEP MODE
@@ -3250,14 +3577,17 @@ void enterSleepMode() {
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
   roboEyes.close();
-  naturalEyeGazeActive  = false;
-  naturalEyeNextActionAt= millis() + NATURAL_EYE_ACTION_INTERVAL_MS;
+  naturalEyeGazeActive = false;
+  naturalEyeNextActionAt = millis() + NATURAL_EYE_ACTION_INTERVAL_MS;
   Serial.println("[SLEEP] 20s idle -> SLEEP MODE");
 }
 
 void wakeFromSleep() {
-  if (!sleepModeActive) { lastUserActivityMs = millis(); return; }
-  sleepModeActive    = false;
+  if (!sleepModeActive) {
+    lastUserActivityMs = millis();
+    return;
+  }
+  sleepModeActive = false;
   lastUserActivityMs = millis();
   currentEyeMood = EYE_DEFAULT;
   roboEyes.setMood(DEFAULT);
@@ -3268,20 +3598,14 @@ void wakeFromSleep() {
   resetNaturalEyeBehavior();
   currentCharacterEmotion = CHARACTER_DEFAULT;
   characterReactionActive = false;
-  characterReactionUntil  = 0;
+  characterReactionUntil = 0;
   Serial.println("[SLEEP] WAKE UP");
 }
 
 void updateSleepMode() {
   if (!introductionFinished) return;
   bool safeForSleep =
-    !bootTransitionActive && !listeningActive && !voicePipelineActive &&
-    !startupOnboardingActive &&
-    !destinationAskActive && !infoModeActive && !tripIntroActive &&
-    !companionGenerating && !companionActive && !companionNextMenuActive &&
-    !companionNextMenuPending && !conversationActive &&
-    systemState != STATE_THINKING && !mapRequested && !hudActive &&
-    !arrivalActive && !characterReactionActive && !otaActive && !musicScreenWanted();
+    !bootTransitionActive && !listeningActive && !voicePipelineActive && !startupOnboardingActive && !destinationAskActive && !infoModeActive && !tripIntroActive && !companionGenerating && !companionActive && !companionNextMenuActive && !companionNextMenuPending && !conversationActive && systemState != STATE_THINKING && !mapRequested && !hudActive && !arrivalActive && !characterReactionActive && !otaActive && !musicScreenWanted();
   if (!safeForSleep) {
     lastUserActivityMs = millis();
     if (sleepModeActive) wakeFromSleep();
@@ -3292,12 +3616,16 @@ void updateSleepMode() {
   }
 }
 
-void renderSleep() { roboEyes.update(); }
+void renderSleep() {
+  roboEyes.update();
+}
 
 // ===========================================================================
 //  LISTENING / THINKING VISUALS
 // ===========================================================================
-void renderListening() { roboEyes.update(); }
+void renderListening() {
+  roboEyes.update();
+}
 
 void beginThinkingVisual() {
   if (thinkingVisualPrepared) return;
@@ -3305,7 +3633,7 @@ void beginThinkingVisual() {
   roboEyes.setIdleMode(ON, 2, 1);
   setCharacterEmotion(CHARACTER_THINKING);
   overlayListening = false;
-  overlayThinking  = true;
+  overlayThinking = true;
   thinkingGazeStep = 0;
   thinkingGazeNextAt = millis();
   roboEyes.setPosition(OJOL_POS_NW);
@@ -3316,20 +3644,20 @@ void endThinkingVisual() {
   if (!thinkingVisualPrepared) return;
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 1);
-  overlayThinking        = false;
+  overlayThinking = false;
   thinkingVisualPrepared = false;
-  thinkingGazeStep       = 0;
-  thinkingGazeNextAt     = 0;
+  thinkingGazeStep = 0;
+  thinkingGazeNextAt = 0;
   roboEyes.setPosition(DEFAULT);
   setCharacterEmotion(CHARACTER_DEFAULT);
   roboEyes.blink();
 }
 
 void cancelThinking() {
-  companionGenerating      = false;
+  companionGenerating = false;
   companionRequestCounter++;
   activeCompanionRequestId = companionRequestCounter;
-  thinkingDemoUntil        = 0;
+  thinkingDemoUntil = 0;
   if (systemState == STATE_THINKING) systemState = STATE_READY;
   endThinkingVisual();
 }
@@ -3351,35 +3679,37 @@ void startListening() {
     return;
   }
   if (voicePipelineActive) {
-    ttsStop = true;   // hentikan cerita panjang / pipeline
+    ttsStop = true;
     Serial.println("[VOICE] Pipeline sibuk — tunggu selesai");
     return;
   }
 
-  mapRequested            = false;
-  hudActive               = false;
-  companionActive         = false;
+  mapRequested = false;
+  hudActive = false;
+  companionActive = false;
   companionNextMenuActive = false;
-  companionNextMenuPending= false;
+  companionNextMenuPending = false;
   cancelThinking();
 
-  musicStopForVoice();   // musik berhenti selama pengguna bicara
+  musicStopForVoice();
   conversationActive = true;
-  listeningActive    = true;
-  listeningState     = LISTENING_ACTIVE;
-  overlayListening   = true;
+  listeningActive = true;
+  listeningState = LISTENING_ACTIVE;
+  overlayListening = true;
 
   setCharacterEmotion(CHARACTER_LISTENING);
+  sfxPlay(SFX_REC_START);
   audioStartRecording();
   Serial.println("[LISTENING] ACTIVE (mic merekam)");
 }
 
 void stopListening() {
   if (!listeningActive) return;
-  listeningActive  = false;
+  listeningActive = false;
   overlayListening = false;
-  listeningState   = LISTENING_IDLE;
+  listeningState = LISTENING_IDLE;
   conversationActive = false;
+  sfxPlay(SFX_REC_STOP);
   audioStopRecording();
   setCharacterEmotion(CHARACTER_DEFAULT);
   Serial.println("[LISTENING] STOP");
@@ -3389,8 +3719,8 @@ void stopListening() {
 //  DESTINATION STUBS
 // ===========================================================================
 void startGeocode(const String& placeName) {
-  destinationResolved     = false;
-  destinationStage        = DEST_FAILED;
+  destinationResolved = false;
+  destinationStage = DEST_FAILED;
   destinationStageStarted = millis();
   Serial.print("[GEOCODE] Preset lokal dinonaktifkan; tunggu tujuan dari HP: ");
   Serial.println(placeName);
@@ -3398,30 +3728,32 @@ void startGeocode(const String& placeName) {
 
 void startDestinationAsk() {
   destinationAskActive = false;
-  destinationResolved  = false;
+  destinationResolved = false;
   Serial.println("[ABOT] Menunggu rute dari aplikasi HP.");
 }
 
 void finishDestinationAsk() {
   destinationAskActive = false;
-  destinationStage     = DEST_ASK;
+  destinationStage = DEST_ASK;
 }
 
-void renderDestinationAsk() { destinationAskActive = false; }
+void renderDestinationAsk() {
+  destinationAskActive = false;
+}
 
 // ===========================================================================
 //  BUTTONS
 // ===========================================================================
 void startActionButtonFunction() {
   if (listeningActive || voicePipelineActive) return;
-  companionActive         = false;
+  companionActive = false;
   companionNextMenuActive = false;
-  companionNextMenuPending= false;
-  conversationActive      = false;
-  hudActive               = false;
+  companionNextMenuPending = false;
+  conversationActive = false;
+  hudActive = false;
   cancelThinking();
-  infoModeActive           = false;
-  mapRequested             = false;
+  infoModeActive = false;
+  mapRequested = false;
   musicRequestPost(MCMD_TOGGLE, "", "");
   Serial.println("[BUTTON ACTION] SHORT -> MUSIK");
 }
@@ -3440,7 +3772,7 @@ void updateButtons() {
 
   bool talkReading = digitalRead(BUTTON_TALK);
   if (talkReading != talkLastReading) {
-    talkLastChange  = now;
+    talkLastChange = now;
     talkLastReading = talkReading;
   }
 
@@ -3448,8 +3780,9 @@ void updateButtons() {
     talkStableState = talkReading;
     if (talkStableState == LOW) {
       markUserActivity();
-      talkPressedAt     = now;
+      talkPressedAt = now;
       talkLongTriggered = false;
+      sfxPlay(SFX_CLICK);
     } else {
       unsigned long held = now - talkPressedAt;
       if (talkLongTriggered && listeningActive) stopListening();
@@ -3459,8 +3792,7 @@ void updateButtons() {
     }
   }
 
-  if (talkStableState == LOW && !talkLongTriggered &&
-      now - talkPressedAt >= BUTTON_HOLD_MS) {
+  if (talkStableState == LOW && !talkLongTriggered && now - talkPressedAt >= BUTTON_HOLD_MS) {
     talkLongTriggered = true;
     startListening();
     Serial.println(listeningActive ? "[BUTTON TALK] HOLD CONFIRMED (rekam)"
@@ -3469,16 +3801,16 @@ void updateButtons() {
 
   bool actionReading = digitalRead(BUTTON_ACTION);
   if (actionReading != actionLastReading) {
-    actionLastChange  = now;
+    actionLastChange = now;
     actionLastReading = actionReading;
   }
 
-  if (now - actionLastChange >= BUTTON_DEBOUNCE_MS &&
-      actionReading != actionStableState) {
+  if (now - actionLastChange >= BUTTON_DEBOUNCE_MS && actionReading != actionStableState) {
     actionStableState = actionReading;
     if (actionStableState == LOW) {
       markUserActivity();
       actionPressedAt = now;
+      sfxPlay(SFX_CLICK);
     } else {
       unsigned long held = now - actionPressedAt;
       if (listeningActive) return;
@@ -3500,12 +3832,14 @@ void ensureWiFiConnected() {
       wifiConnected = true;
       configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
       abotLog("INFO", "WiFi tersambung");
+      sfxPlay(SFX_WIFI_UP);
     }
     return;
   }
   if (wifiConnected) {
     wifiConnected = false;
     abotLog("WARN", "WiFi koneksi terputus");
+    sfxPlay(SFX_WIFI_DOWN);
   }
   if (millis() - lastWiFiAttempt < WIFI_RETRY_INTERVAL_MS) return;
   lastWiFiAttempt = millis();
@@ -3515,6 +3849,7 @@ void ensureWiFiConnected() {
 }
 
 void checkHeapHealth() {
+  if (voicePipelineActive || ttsActive) return;
   if (millis() - lastHeapCheck < HEAP_CHECK_INTERVAL_MS) return;
   lastHeapCheck = millis();
   uint32_t freeHeap = ESP.getFreeHeap();
@@ -3537,10 +3872,11 @@ void renderWifiConnecting() {
 }
 
 void startBootTransition() {
-  bootTransitionActive    = true;
+  bootTransitionActive = true;
   bootTransitionStartedAt = millis();
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
+  sfxPlay(SFX_BOOT);
   Serial.println("[BOOT] Selesai -> sapaan Abot");
 }
 
@@ -3557,9 +3893,9 @@ void renderBootTransition() {
 }
 
 void startIntroduction() {
-  introductionFinished     = false;
-  wakeIntroStage           = WAKE_DARK;
-  wakeIntroStageStartedAt  = millis();
+  introductionFinished = false;
+  wakeIntroStage = WAKE_DARK;
+  wakeIntroStageStartedAt = millis();
   beginFrame();
   presentFrame();
   roboEyes.setAutoblinker(OFF, 0, 0);
@@ -3571,7 +3907,7 @@ void startIntroduction() {
 }
 
 void renderIntroduction() {
-  unsigned long now     = millis();
+  unsigned long now = millis();
   unsigned long elapsed = now - wakeIntroStageStartedAt;
   beginFrame();
   gfxFillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_WHITE);
@@ -3580,14 +3916,14 @@ void renderIntroduction() {
 
   if (wakeIntroStage == WAKE_DARK) {
     if (elapsed >= WAKE_DARK_MS) {
-      wakeIntroStage          = WAKE_ABOT_HELLO;
+      wakeIntroStage = WAKE_ABOT_HELLO;
       wakeIntroStageStartedAt = now;
     }
     return;
   }
   if (wakeIntroStage == WAKE_ABOT_HELLO) {
     if (elapsed >= WAKE_ABOT_HELLO_MS) {
-      wakeIntroStage          = WAKE_ABOT_PERSONALITY;
+      wakeIntroStage = WAKE_ABOT_PERSONALITY;
       wakeIntroStageStartedAt = now;
     }
     return;
@@ -3595,7 +3931,7 @@ void renderIntroduction() {
   if (wakeIntroStage == WAKE_ABOT_PERSONALITY) {
     updateAbotPersonality();
     if (elapsed >= WAKE_ABOT_PERSONALITY_MS) {
-      wakeIntroStage       = WAKE_FINISHED;
+      wakeIntroStage = WAKE_FINISHED;
       introductionFinished = true;
       roboEyes.setAutoblinker(ON, 3, 2);
       roboEyes.setIdleMode(ON, 2, 1);
@@ -3614,8 +3950,8 @@ void renderIntroduction() {
 }
 
 void startTripIntroduction() {
-  tripIntroActive     = true;
-  tripIntroStartedAt  = millis();
+  tripIntroActive = true;
+  tripIntroStartedAt = millis();
   updateAbotPersonality();
   setCharacterEmotion(CHARACTER_DEFAULT);
   resetNaturalEyeBehavior();
@@ -3695,22 +4031,21 @@ void renderClockScreen(const String& header) {
 }
 
 String weatherCodeToText(int code) {
-  if (code == 0)                        return "CERAH";
-  if (code == 1 || code == 2)           return "CERAH BERAWAN";
-  if (code == 3)                        return "BERAWAN";
-  if (code == 45 || code == 48)         return "BERKABUT";
-  if (code >= 51 && code <= 57)         return "GERIMIS";
-  if (code >= 61 && code <= 67)         return "HUJAN";
-  if (code >= 71 && code <= 77)         return "SALJU";
-  if (code >= 80 && code <= 82)         return "HUJAN";
-  if (code >= 85 && code <= 86)         return "SALJU";
-  if (code >= 95 && code <= 99)         return "BADAI";
+  if (code == 0) return "CERAH";
+  if (code == 1 || code == 2) return "CERAH BERAWAN";
+  if (code == 3) return "BERAWAN";
+  if (code == 45 || code == 48) return "BERKABUT";
+  if (code >= 51 && code <= 57) return "GERIMIS";
+  if (code >= 61 && code <= 67) return "HUJAN";
+  if (code >= 71 && code <= 77) return "SALJU";
+  if (code >= 80 && code <= 82) return "HUJAN";
+  if (code >= 85 && code <= 86) return "SALJU";
+  if (code >= 95 && code <= 99) return "BADAI";
   return "TIDAK DIKETAHUI";
 }
 
 void ensureWeatherData() {
-  if (!introductionFinished || networkIsBusy() || weatherFetching ||
-      !wifiConnected) return;
+  if (!introductionFinished || networkIsBusy() || weatherFetching || !wifiConnected) return;
   unsigned long interval = weatherData.valid ? WEATHER_REFRESH_MS
                                              : WEATHER_RETRY_MS;
   if (lastWeatherAttempt == 0 || millis() - lastWeatherAttempt >= interval) {
@@ -3737,7 +4072,7 @@ void renderWeatherScreen(const String& header) {
     presentFrame();
     return;
   }
-  String temp  = String(w.temperature, 1) + " C";
+  String temp = String(w.temperature, 1) + " C";
   String range = "H:" + String(w.tempMax, 0) + "  L:" + String(w.tempMin, 0);
   drawCenteredText(temp, 18, 2);
   drawCenteredText(w.condition, 42, 1);
@@ -3747,15 +4082,15 @@ void renderWeatherScreen(const String& header) {
 
 void startInfoMode() {
   if (destinationAskActive) return;
-  mapRequested             = false;
-  hudActive                = false;
-  companionActive          = false;
-  companionNextMenuActive  = false;
+  mapRequested = false;
+  hudActive = false;
+  companionActive = false;
+  companionNextMenuActive = false;
   companionNextMenuPending = false;
-  conversationActive       = false;
+  conversationActive = false;
   weatherViewCustom = false;
-  infoModeActive  = true;
-  infoPage        = 0;
+  infoModeActive = true;
+  infoPage = 0;
   infoModeStarted = millis();
   if (!weatherData.valid) lastWeatherAttempt = 0;
 }
@@ -3766,14 +4101,14 @@ void renderInfoMode() {
   if (infoPage == 0) {
     renderClockScreen("JAM");
     if (elapsed >= INFO_CLOCK_DURATION) {
-      infoPage        = 1;
+      infoPage = 1;
       infoModeStarted = millis();
     }
   } else {
     renderWeatherScreen("CUACA");
     if (elapsed >= INFO_WEATHER_DURATION) {
       infoModeActive = false;
-      infoPage       = 0;
+      infoPage = 0;
       weatherViewCustom = false;
     }
   }
@@ -3784,26 +4119,28 @@ void renderInfoMode() {
 // ===========================================================================
 void startStartupOnboarding() {
   startupOnboardingActive = true;
-  startupStage            = STARTUP_USAGE;
-  startupStageStarted     = millis();
-  infoModeActive          = false;
-  mapRequested       = false;
-  hudActive          = false;
-  companionActive    = false;
+  startupStage = STARTUP_USAGE;
+  startupStageStarted = millis();
+  infoModeActive = false;
+  mapRequested = false;
+  hudActive = false;
+  companionActive = false;
   conversationActive = false;
   cancelThinking();
 }
 
 void finishStartupOnboarding() {
   startupOnboardingCompleted = true;
-  startupOnboardingActive    = false;
-  startupStage               = STARTUP_NORMAL;
-  introductionFinished       = true;
-  infoModeActive             = false;
+  startupOnboardingActive = false;
+  startupStage = STARTUP_NORMAL;
+  introductionFinished = true;
+  infoModeActive = false;
   resetNaturalEyeBehavior();
   if (!startupOnboardingManual) {
-    if (hpConnected) { }
-    else { startDestinationAsk(); }
+    if (hpConnected) {
+    } else {
+      startDestinationAsk();
+    }
   }
   startupOnboardingManual = false;
 }
@@ -3825,8 +4162,11 @@ void renderStartupOnboarding() {
     unsigned long usageMs = fastLink ? STARTUP_USAGE_LINK_MS
                                      : STARTUP_USAGE_DURATION;
     if (elapsed >= usageMs) {
-      if (fastLink) { finishStartupOnboarding(); return; }
-      startupStage        = STARTUP_CLOCK;
+      if (fastLink) {
+        finishStartupOnboarding();
+        return;
+      }
+      startupStage = STARTUP_CLOCK;
       startupStageStarted = millis();
     }
     return;
@@ -3834,7 +4174,7 @@ void renderStartupOnboarding() {
   if (startupStage == STARTUP_CLOCK) {
     renderClockScreen("JAM");
     if (elapsed >= STARTUP_CLOCK_DURATION) {
-      startupStage        = STARTUP_WEATHER;
+      startupStage = STARTUP_WEATHER;
       startupStageStarted = millis();
     }
     return;
@@ -3849,13 +4189,15 @@ void renderStartupOnboarding() {
 //  MAP & HUD
 // ===========================================================================
 void startMapDisplay() {
-  mapRequested  = true;
-  mapStartTime  = millis();
+  mapRequested = true;
+  mapStartTime = millis();
   mapForNewRoute = false;
   if (routeReady) hudActive = false;
 }
 
-bool isImportantStep(const NavigationStep& step) { return step.important; }
+bool isImportantStep(const NavigationStep& step) {
+  return step.important;
+}
 
 int nextImportantStep() {
   for (int i = 0; i < navStepCount; i++) {
@@ -3916,8 +4258,8 @@ void drawMapFooter() {
     if (distanceToTurn < 0) distanceToTurn = 0;
     drawMiniTurnIcon(step.instruction, 7, 59);
     String label = (distanceToTurn >= 1000.0f)
-                   ? String(distanceToTurn / 1000.0f, 1) + "k "
-                   : String((int)distanceToTurn) + "m ";
+                     ? String(distanceToTurn / 1000.0f, 1) + "k "
+                     : String((int)distanceToTurn) + "m ";
     String instruction = step.instruction;
     if (instruction.length() > 11) instruction = instruction.substring(0, 11);
     gfxText(16, 55, label + instruction);
@@ -3934,41 +4276,41 @@ void renderMap() {
     presentFrame();
     return;
   }
-  const int   centerX = 64;
-  const int   centerY = 42;
+  const int centerX = 64;
+  const int centerY = 42;
   const float pixelsPerMeter = 0.13f;
-  const float behindMeters   = 90.0f;
-  const float aheadMeters    = 280.0f;
+  const float behindMeters = 90.0f;
+  const float aheadMeters = 280.0f;
 
   int seg = 0;
-  while (seg < routePointCount - 2 &&
-         routeCumulativeDistance[seg + 1] < simulatedRouteDistance) seg++;
+  while (seg < routePointCount - 2 && routeCumulativeDistance[seg + 1] < simulatedRouteDistance) seg++;
   float segStart = routeCumulativeDistance[seg];
-  float segEnd   = routeCumulativeDistance[seg + 1];
+  float segEnd = routeCumulativeDistance[seg + 1];
   float t = (segEnd > segStart)
-            ? (simulatedRouteDistance - segStart) / (segEnd - segStart)
-            : 0.0f;
+              ? (simulatedRouteDistance - segStart) / (segEnd - segStart)
+              : 0.0f;
   if (t < 0.0f) t = 0.0f;
   if (t > 1.0f) t = 1.0f;
 
-  double vehicleLat = routePoints[seg].lat +
-                      (routePoints[seg + 1].lat - routePoints[seg].lat) * t;
-  double vehicleLon = routePoints[seg].lon +
-                      (routePoints[seg + 1].lon - routePoints[seg].lon) * t;
+  double vehicleLat = routePoints[seg].lat + (routePoints[seg + 1].lat - routePoints[seg].lat) * t;
+  double vehicleLon = routePoints[seg].lon + (routePoints[seg + 1].lon - routePoints[seg].lon) * t;
   double cosLat = cos(vehicleLat * DEG_TO_RAD);
 
   double hdx = (routePoints[seg + 1].lon - routePoints[seg].lon) * 111320.0 * cosLat;
   double hdy = (routePoints[seg + 1].lat - routePoints[seg].lat) * 110540.0;
   double hlen = sqrt(hdx * hdx + hdy * hdy);
   double sinB = 0.0, cosB = 1.0;
-  if (hlen > 0.5) { sinB = hdx / hlen; cosB = hdy / hlen; }
+  if (hlen > 0.5) {
+    sinB = hdx / hlen;
+    cosB = hdy / hlen;
+  }
 
   auto toScreen = [&](double lat, double lon, int& sx, int& sy) {
     double e = (lon - vehicleLon) * 111320.0 * cosLat;
     double n = (lat - vehicleLat) * 110540.0;
     double forward = e * sinB + n * cosB;
-    double right   = e * cosB - n * sinB;
-    sx = centerX + (int)lround(right   * pixelsPerMeter);
+    double right = e * cosB - n * sinB;
+    sx = centerX + (int)lround(right * pixelsPerMeter);
     sy = centerY - (int)lround(forward * pixelsPerMeter);
   };
 
@@ -3976,10 +4318,10 @@ void renderMap() {
     float d1 = routeCumulativeDistance[i - 1];
     float d2 = routeCumulativeDistance[i];
     if (d2 < simulatedRouteDistance - behindMeters) continue;
-    if (d1 > simulatedRouteDistance + aheadMeters)  break;
+    if (d1 > simulatedRouteDistance + aheadMeters) break;
     int x1, y1, x2, y2;
     toScreen(routePoints[i - 1].lat, routePoints[i - 1].lon, x1, y1);
-    toScreen(routePoints[i].lat,     routePoints[i].lon,     x2, y2);
+    toScreen(routePoints[i].lat, routePoints[i].lon, x2, y2);
     gfxLine(x1, y1, x2, y2);
   }
 
@@ -4024,15 +4366,15 @@ void drawTurnArrow(const String& instruction) {
 void renderHUD() {
   beginFrame();
   int displayStep = (hudLockedStep >= 0 && hudLockedStep < navStepCount)
-                    ? hudLockedStep
-                    : nextImportantStep();
+                      ? hudLockedStep
+                      : nextImportantStep();
   if (displayStep >= 0 && displayStep < navStepCount) {
     NavigationStep& step = navSteps[displayStep];
     float distanceToTurn = step.routeDistance - simulatedRouteDistance;
     if (distanceToTurn < 0) distanceToTurn = 0;
     String distanceText = (distanceToTurn >= 1000.0f)
-                          ? String(distanceToTurn / 1000.0f, 1) + "k"
-                          : String((int)distanceToTurn) + "m";
+                            ? String(distanceToTurn / 1000.0f, 1) + "k"
+                            : String((int)distanceToTurn) + "m";
     gfxText(0, 0, distanceText, 2);
     drawTurnArrow(step.instruction);
     String instruction = step.instruction;
@@ -4055,25 +4397,26 @@ void renderHUD() {
 void handleArrival() {
   if (arrivalActive) return;
   if (sleepModeActive) wakeFromSleep();
-  arrivalActive     = true;
-  tripArrived       = true;
-  tripActive        = false;
-  arrivalStartedAt  = millis();
-  mapRequested             = false;
-  hudActive                = false;
-  hudLockedStep            = -1;
-  hudCompletedStep         = navStepCount > 0 ? navStepCount - 1 : -1;
-  companionActive          = false;
-  companionNextMenuActive  = false;
+  arrivalActive = true;
+  tripArrived = true;
+  tripActive = false;
+  arrivalStartedAt = millis();
+  mapRequested = false;
+  hudActive = false;
+  hudLockedStep = -1;
+  hudCompletedStep = navStepCount > 0 ? navStepCount - 1 : -1;
+  companionActive = false;
+  companionNextMenuActive = false;
   companionNextMenuPending = false;
-  conversationActive       = false;
-  infoModeActive           = false;
-  startupOnboardingActive  = false;
+  conversationActive = false;
+  infoModeActive = false;
+  startupOnboardingActive = false;
   cancelThinking();
   setCharacterEmotion(CHARACTER_HAPPY);
   lastUserActivityMs = millis();
   linkSend("{\"t\":\"arrived\"}");
   abotLog("INFO", "TUJUAN TERCAPAI");
+  sfxPlay(SFX_ARRIVE);
 }
 
 void renderArrival() {
@@ -4087,9 +4430,9 @@ void renderArrival() {
   drawCenteredText("Terima kasih!", 56, 1);
   presentFrame();
   if (millis() - arrivalStartedAt >= ARRIVAL_DISPLAY_DURATION) {
-    arrivalActive  = false;
-    tripArrived    = true;
-    tripActive     = false;
+    arrivalActive = false;
+    tripArrived = true;
+    tripActive = false;
     setCharacterEmotion(CHARACTER_DEFAULT);
     resetNaturalEyeBehavior();
     lastUserActivityMs = millis();
@@ -4099,46 +4442,46 @@ void renderArrival() {
 void startNewTrip() {
   if (networkIsBusy()) return;
   markUserActivity();
-  tripActive    = true;
-  tripArrived   = false;
+  tripActive = true;
+  tripArrived = false;
   arrivalActive = false;
-  tripMapPending= false;
-  routeReady       = false;
-  routeRequested   = false;
-  routeFromLink    = false;
-  lastLinkGpsAt    = 0;
-  lastOsrmAttempt  = 0;
-  routePointCount  = 0;
-  navStepCount     = 0;
+  tripMapPending = false;
+  routeReady = false;
+  routeRequested = false;
+  routeFromLink = false;
+  lastLinkGpsAt = 0;
+  lastOsrmAttempt = 0;
+  routePointCount = 0;
+  navStepCount = 0;
   simulatedRouteDistance = 0;
-  simulatedRouteIndex    = 0;
-  gpsLastMs              = 0;
-  activeStep             = 0;
-  hudLockedStep          = -1;
-  hudCompletedStep       = -1;
-  hudActive              = false;
-  hudShownAt             = 0;
-  mapRequested           = false;
-  navigationAIStarted    = false;
-  pendingNavigationAI    = false;
-  systemState            = STATE_READY;
-  activeOsrmUrl         = "";
-  osrmFailCount         = 0;
-  osrmGaveUpAt          = 0;
-  destinationResolved   = false;
-  tripIntroTriggerAsk   = true;
-  linkRouteReceived     = false;
+  simulatedRouteIndex = 0;
+  gpsLastMs = 0;
+  activeStep = 0;
+  hudLockedStep = -1;
+  hudCompletedStep = -1;
+  hudActive = false;
+  hudShownAt = 0;
+  mapRequested = false;
+  navigationAIStarted = false;
+  pendingNavigationAI = false;
+  systemState = STATE_READY;
+  activeOsrmUrl = "";
+  osrmFailCount = 0;
+  osrmGaveUpAt = 0;
+  destinationResolved = false;
+  tripIntroTriggerAsk = true;
+  linkRouteReceived = false;
   startTripIntroduction();
 }
 
 // ===========================================================================
-//  COMPANION (Groq GPT-OSS)
+//  COMPANION
 // ===========================================================================
 String personalityInstruction() {
   switch (personalityMode) {
     case PERSONALITY_PLAYFUL: return "Gunakan gaya santai, playful, dan ramah.";
     case PERSONALITY_EXCITED: return "Gunakan gaya antusias dan energik.";
-    default:                  return "Gunakan gaya natural, hangat, dan ramah.";
+    default: return "Gunakan gaya natural, hangat, dan ramah.";
   }
 }
 
@@ -4209,18 +4552,18 @@ String fallbackCompanion(CompanionType type) {
 
 String cleanCompanionText(String text) {
   text = stripNonAscii(text);
-  text.replace("\r",   "");
-  text.replace("```",  "");
-  text.replace("---",  "");
-  text.replace("**",   "");
-  text.replace("*",    "");
+  text.replace("\r", "");
+  text.replace("```", "");
+  text.replace("---", "");
+  text.replace("**", "");
+  text.replace("*", "");
   text.trim();
   return text;
 }
 
 void buildCompanionPages(const String& rawText) {
-  companionPageCount  = 0;
-  companionPage       = 0;
+  companionPageCount = 0;
+  companionPage = 0;
   companionTypedChars = 0;
   for (int p = 0; p < MAX_COMPANION_PAGES; p++) {
     for (int l = 0; l < MAX_COMPANION_LINES; l++) companionPages[p][l] = "";
@@ -4235,7 +4578,10 @@ void buildCompanionPages(const String& rawText) {
     if (pg >= MAX_COMPANION_PAGES) return false;
     companionPages[pg][ln] = s;
     ln++;
-    if (ln >= MAX_COMPANION_LINES) { ln = 0; pg++; }
+    if (ln >= MAX_COMPANION_LINES) {
+      ln = 0;
+      pg++;
+    }
     return true;
   };
 
@@ -4245,16 +4591,27 @@ void buildCompanionPages(const String& rawText) {
   while (pos < (int)text.length() && !full) {
     int sp = text.indexOf(' ', pos);
     String word;
-    if (sp == -1) { word = text.substring(pos); pos = text.length(); }
-    else          { word = text.substring(pos, sp); pos = sp + 1; }
+    if (sp == -1) {
+      word = text.substring(pos);
+      pos = text.length();
+    } else {
+      word = text.substring(pos, sp);
+      pos = sp + 1;
+    }
     word.trim();
     if (word.length() == 0) continue;
     while ((int)word.length() > MAX_LINE_CHARS) {
       if (cur.length() > 0) {
-        if (!pushLine(cur)) { full = true; break; }
+        if (!pushLine(cur)) {
+          full = true;
+          break;
+        }
         cur = "";
       }
-      if (!pushLine(word.substring(0, MAX_LINE_CHARS))) { full = true; break; }
+      if (!pushLine(word.substring(0, MAX_LINE_CHARS))) {
+        full = true;
+        break;
+      }
       word = word.substring(MAX_LINE_CHARS);
     }
     if (full) break;
@@ -4264,7 +4621,10 @@ void buildCompanionPages(const String& rawText) {
       cur += " ";
       cur += word;
     } else {
-      if (!pushLine(cur)) { full = true; break; }
+      if (!pushLine(cur)) {
+        full = true;
+        break;
+      }
       cur = word;
     }
   }
@@ -4283,21 +4643,18 @@ int companionPageTotalChars() {
   return total;
 }
 
-// ===========================================================================
-//  NETWORK JOB STARTERS
-// ===========================================================================
 bool startNetworkJob(NetworkJob job, const char* taskName,
                      const String& prompt, uint32_t requestId) {
   if (networkIsBusy()) return false;
-  networkJob          = job;
-  networkRequestId    = requestId;
-  networkPrompt       = prompt;
-  networkDone         = false;
-  networkSuccess      = false;
-  networkHttpCode     = -1;
-  networkBusy         = true;
+  networkJob = job;
+  networkRequestId = requestId;
+  networkPrompt = prompt;
+  networkDone = false;
+  networkSuccess = false;
+  networkHttpCode = -1;
+  networkBusy = true;
   networkJobStartedAt = millis();
-  networkJobWasBusy   = true;
+  networkJobWasBusy = true;
 
   BaseType_t result = xTaskCreatePinnedToCore(
     networkTask, taskName, 20000, NULL, 1, NULL, 0);
@@ -4329,8 +4686,8 @@ void startOSRM() {
     systemState = STATE_ERROR;
     return;
   }
-  systemState   = STATE_GETTING_ROUTE;
-  routeRequested= true;
+  systemState = STATE_GETTING_ROUTE;
+  routeRequested = true;
 }
 
 String createNavigationPrompt() {
@@ -4339,7 +4696,9 @@ String createNavigationPrompt() {
   prompt += abotPromptHint();
   prompt += " Jangan pakai markdown/emoji. Buat customer merasa ditemani.\n\n";
   if (destName.length() > 0) {
-    prompt += "Tujuan: "; prompt += destName; prompt += "\n";
+    prompt += "Tujuan: ";
+    prompt += destName;
+    prompt += "\n";
   }
   prompt += "Jarak total: ";
   prompt += String(osrmTotalDistance / 1000.0, 2);
@@ -4360,9 +4719,9 @@ void startNavigationAI() {
   if (networkIsBusy()) return;
   if (llmCooldownActive()) return;
   if (navigationAIStarted) return;
-  navigationAIStarted  = true;
-  pendingNavigationAI  = false;
-  lastLlmRequest       = millis();
+  navigationAIStarted = true;
+  pendingNavigationAI = false;
+  lastLlmRequest = millis();
   if (!startNetworkJob(NET_NAVIGATION_AI, "navAiTask",
                        createNavigationPrompt(), millis())) {
     navigationAIStarted = false;
@@ -4370,20 +4729,17 @@ void startNavigationAI() {
   }
 }
 
-// ===========================================================================
-//  COMPANION FLOW
-// ===========================================================================
 void startCompanion(CompanionType type) {
-  companionNextMenuActive  = false;
+  companionNextMenuActive = false;
   companionNextMenuPending = false;
   companionNextMenuDelayMs = 350;
-  mapRequested      = false;
-  hudActive         = false;
-  hudSuppressUntil  = millis() + HUD_SUPPRESS_DURATION;
-  currentCompanion  = type;
-  companionActive   = false;
+  mapRequested = false;
+  hudActive = false;
+  hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
+  currentCompanion = type;
+  companionActive = false;
   companionGenerating = true;
-  systemState       = STATE_THINKING;
+  systemState = STATE_THINKING;
 
   setEyeMood(EYE_DEFAULT);
   beginThinkingVisual();
@@ -4409,60 +4765,65 @@ void finishCompanionGeneration(const String& rawText, CompanionType type) {
 
   if (type == COMPANION_QUIZ) {
     int answerPos = text.indexOf("Jawaban:");
-    if (answerPos >= 0) { text = text.substring(0, answerPos); text.trim(); }
+    if (answerPos >= 0) {
+      text = text.substring(0, answerPos);
+      text.trim();
+    }
     int answerPos2 = text.indexOf("jawabannya");
-    if (answerPos2 >= 0) { text = text.substring(0, answerPos2); text.trim(); }
+    if (answerPos2 >= 0) {
+      text = text.substring(0, answerPos2);
+      text.trim();
+    }
     currentQuizQuestion = text;
-    quizWaitingAnswer   = true;
+    quizWaitingAnswer = true;
   }
 
   previousCompanionText = text;
   buildCompanionPages(text);
-  companionPage       = 0;
+  companionPage = 0;
   companionTypedChars = 0;
-  companionLastType   = millis();
+  companionLastType = millis();
   companionStateStart = millis();
-  companionPlayback   = COMPANION_TYPING;
-  companionActive     = true;
+  companionPlayback = COMPANION_TYPING;
+  companionActive = true;
   companionGenerating = false;
   endThinkingVisual();
   systemState = STATE_READY;
 
-  if (type == COMPANION_HUMOR || type == COMPANION_QUIZ ||
-      type == COMPANION_TRIVIA) setEyeMood(EYE_HAPPY);
-  else                        setEyeMood(EYE_DEFAULT);
+  if (type == COMPANION_HUMOR || type == COMPANION_QUIZ || type == COMPANION_TRIVIA) setEyeMood(EYE_HAPPY);
+  else setEyeMood(EYE_DEFAULT);
 }
 
 void finishCompanion() {
   const bool wasCard = (currentCompanion == COMPANION_CARD);
-  companionActive     = false;
+  companionActive = false;
   companionGenerating = false;
-  companionPlayback   = COMPANION_IDLE;
-  currentCompanion    = COMPANION_NONE;
+  companionPlayback = COMPANION_IDLE;
+  currentCompanion = COMPANION_NONE;
   setEyeMood(EYE_DEFAULT);
-  hudActive        = false;
+  hudActive = false;
   hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
   roboEyes.blink();
-  if (wasCard) lastUserActivityMs = millis();      // kartu bebas: tanpa menu "MAU LANJUT?"
-  else         openCompanionNextMenu(companionNextMenuDelayMs);
+  if (wasCard) lastUserActivityMs = millis();
+  else openCompanionNextMenu(companionNextMenuDelayMs);
 }
 
 void openCompanionNextMenu(unsigned long delayMs) {
-  companionNextMenuPending  = true;
-  companionNextMenuActive   = false;
-  companionNextMenuAt       = millis() + delayMs;
-  companionNextMenuPageAt   = 0;
-  companionNextMenuPage     = 0;
-  hudActive        = false;
+  companionNextMenuPending = true;
+  companionNextMenuActive = false;
+  companionNextMenuAt = millis() + delayMs;
+  companionNextMenuPageAt = 0;
+  companionNextMenuPage = 0;
+  hudActive = false;
   hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
 }
 
 void closeCompanionNextMenu() {
-  companionNextMenuActive  = false;
+  companionNextMenuActive = false;
   companionNextMenuPending = false;
-  companionNextMenuPage    = 0;
+  companionNextMenuPage = 0;
   setEyeMood(EYE_DEFAULT);
-  hudSuppressUntil   = millis() + HUD_SUPPRESS_DURATION;
+  hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
   lastUserActivityMs = millis();
 }
 
@@ -4470,9 +4831,9 @@ void updateCompanionNextMenu() {
   if (!companionNextMenuPending) return;
   if (!companionNextMenuActive) {
     if (millis() < companionNextMenuAt) return;
-    companionNextMenuActive   = true;
-    companionNextMenuPage     = 0;
-    companionNextMenuPageAt   = millis();
+    companionNextMenuActive = true;
+    companionNextMenuPage = 0;
+    companionNextMenuPageAt = millis();
     companionNextMenuOpenedAt = millis();
     return;
   }
@@ -4481,7 +4842,7 @@ void updateCompanionNextMenu() {
     return;
   }
   if (millis() - companionNextMenuPageAt >= COMPANION_NEXT_MENU_PAGE_MS) {
-    companionNextMenuPage   = (companionNextMenuPage + 1) % 2;
+    companionNextMenuPage = (companionNextMenuPage + 1) % 2;
     companionNextMenuPageAt = millis();
   }
 }
@@ -4508,8 +4869,7 @@ void renderCompanion() {
       visible = "";
     }
     gfxText(0, 12 + (l * 7), visible);
-    if (visible.length() > 0 && remaining == 0 &&
-        companionPlayback == COMPANION_TYPING) {
+    if (visible.length() > 0 && remaining == 0 && companionPlayback == COMPANION_TYPING) {
       int cursorX = visible.length() * 6;
       if (cursorX < 126) gfxLine(cursorX, 12 + (l * 7), cursorX, 17 + (l * 7));
     }
@@ -4543,7 +4903,7 @@ void updateCompanion() {
       if (companionTypedChars < companionPageTotalChars()) {
         companionTypedChars++;
       } else {
-        companionPlayback   = COMPANION_HOLD;
+        companionPlayback = COMPANION_HOLD;
         companionStateStart = millis();
       }
     }
@@ -4552,11 +4912,11 @@ void updateCompanion() {
     if (companionPage == companionPageCount - 1) holdTime = COMPANION_FINAL_HOLD;
     if (millis() - companionStateStart >= holdTime) {
       if (companionPage < companionPageCount - 1) {
-        companionPage       = companionPage + 1;
+        companionPage = companionPage + 1;
         companionTypedChars = 0;
-        companionLastType   = millis();
+        companionLastType = millis();
         companionStateStart = millis();
-        companionPlayback   = COMPANION_TYPING;
+        companionPlayback = COMPANION_TYPING;
       } else {
         finishCompanion();
       }
@@ -4572,30 +4932,30 @@ void handleQuizAnswer(char cmd) {
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_LAUGH);
       companionNextMenuDelayMs = CHARACTER_REACTION_LAUGH_MS + 350;
+      sfxPlay(SFX_QUIZ_OK);
       break;
     case 'K':
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_ANGRY);
       companionNextMenuDelayMs = CHARACTER_REACTION_ANGRY_MS + 350;
+      sfxPlay(SFX_QUIZ_BAD);
       break;
     case 'L':
       quizWaitingAnswer = false;
       triggerCharacterReaction(CHARACTER_CONFUSED);
       companionNextMenuDelayMs = CHARACTER_REACTION_CONFUSED_MS + 350;
+      sfxPlay(SFX_ERROR);
       break;
   }
 }
 
-// ===========================================================================
-//  NETWORK WORKER
-// ===========================================================================
 void networkTask(void* parameter) {
   {
-    NetworkJob job    = networkJob;
-    String     prompt = networkPrompt;
-    String     response = "";
-    int        httpCode = -1;
-    bool       success  = false;
+    NetworkJob job = networkJob;
+    String prompt = networkPrompt;
+    String response = "";
+    int httpCode = -1;
+    bool success = false;
 
     if (job == NET_OSRM) {
       for (int attempt = 1; attempt <= 3; attempt++) {
@@ -4606,8 +4966,11 @@ void networkTask(void* parameter) {
         httpCode = http.GET();
         if (httpCode == 200) {
           response = http.getString();
-          success  = response.length() > 0;
-          if (success) { http.end(); break; }
+          success = response.length() > 0;
+          if (success) {
+            http.end();
+            break;
+          }
         }
         http.end();
         delay(500);
@@ -4621,7 +4984,7 @@ void networkTask(void* parameter) {
         httpCode = http.GET();
         if (httpCode == 200) {
           response = http.getString();
-          success  = response.length() > 0;
+          success = response.length() > 0;
         }
         http.end();
       }
@@ -4640,20 +5003,20 @@ void networkTask(void* parameter) {
 
         JsonDocument requestDoc;
         const bool gptOss = activeChatModel.startsWith("openai/gpt-oss");
-        requestDoc["model"]      = activeChatModel;
-        requestDoc["temperature"]= (job == NET_COMPANION) ? 0.8 : 0.3;
+        requestDoc["model"] = activeChatModel;
+        requestDoc["temperature"] = (job == NET_COMPANION) ? 0.8 : 0.3;
         requestDoc["max_tokens"] = ((job == NET_COMPANION) ? 160 : 100) * (gptOss ? 5 : 1);
         if (gptOss) requestDoc["reasoning_effort"] = "low";
 
         JsonArray messages = requestDoc["messages"].to<JsonArray>();
         JsonObject systemMessage = messages.add<JsonObject>();
-        systemMessage["role"]    = "system";
+        systemMessage["role"] = "system";
         systemMessage["content"] =
           (job == NET_COMPANION)
             ? "Kamu Abot, AI Travel Companion. Jangan pakai emoji."
             : "Kamu Abot, AI navigasi. Jangan pakai emoji.";
         JsonObject userMessage = messages.add<JsonObject>();
-        userMessage["role"]    = "user";
+        userMessage["role"] = "user";
         userMessage["content"] = prompt;
 
         String payload;
@@ -4670,7 +5033,7 @@ void networkTask(void* parameter) {
             JsonVariant content = responseDoc["choices"][0]["message"]["content"];
             if (!content.isNull()) {
               response = content.as<String>();
-              success  = response.length() > 0;
+              success = response.length() > 0;
             }
           }
         }
@@ -4678,25 +5041,22 @@ void networkTask(void* parameter) {
       }
     }
 
-    networkResponse  = response;
-    networkHttpCode  = httpCode;
-    networkSuccess   = success;
-    networkDone      = true;
-    networkBusy      = false;
+    networkResponse = response;
+    networkHttpCode = httpCode;
+    networkSuccess = success;
+    networkDone = true;
+    networkBusy = false;
   }
   vTaskDelete(NULL);
 }
 
-// ===========================================================================
-//  NETWORK RESULT PROCESSING
-// ===========================================================================
 void processNetworkDone() {
   if (!networkDone) return;
   NetworkJob completedJob = networkJob;
-  bool       success      = networkSuccess;
-  String     response     = networkResponse;
-  int        httpCode     = networkHttpCode;
-  uint32_t   requestId    = networkRequestId;
+  bool success = networkSuccess;
+  String response = networkResponse;
+  int httpCode = networkHttpCode;
+  uint32_t requestId = networkRequestId;
   networkDone = false;
 
   if (completedJob == NET_WEATHER) {
@@ -4705,15 +5065,15 @@ void processNetworkDone() {
     JsonDocument doc;
     if (deserializeJson(doc, response)) return;
     JsonObject current = doc["current"];
-    JsonObject daily   = doc["daily"];
+    JsonObject daily = doc["daily"];
     if (current.isNull()) return;
     weatherData.temperature = current["temperature_2m"] | 0.0f;
-    weatherData.weatherCode = current["weather_code"]   | -1;
-    weatherData.condition   = weatherCodeToText(weatherData.weatherCode);
-    weatherData.tempMax     = daily["temperature_2m_max"][0] | weatherData.temperature;
-    weatherData.tempMin     = daily["temperature_2m_min"][0] | weatherData.temperature;
-    weatherData.valid       = true;
-    weatherData.updatedAt   = millis();
+    weatherData.weatherCode = current["weather_code"] | -1;
+    weatherData.condition = weatherCodeToText(weatherData.weatherCode);
+    weatherData.tempMax = daily["temperature_2m_max"][0] | weatherData.temperature;
+    weatherData.tempMin = daily["temperature_2m_min"][0] | weatherData.temperature;
+    weatherData.valid = true;
+    weatherData.updatedAt = millis();
     return;
   }
 
@@ -4726,10 +5086,16 @@ void processNetworkDone() {
       return;
     }
     JsonDocument doc;
-    if (deserializeJson(doc, response)) { osrmFailCount++; return; }
+    if (deserializeJson(doc, response)) {
+      osrmFailCount++;
+      return;
+    }
     response = "";
     JsonObject route = doc["routes"][0];
-    if (route.isNull()) { osrmFailCount++; return; }
+    if (route.isNull()) {
+      osrmFailCount++;
+      return;
+    }
     osrmTotalDistance = route["distance"].as<float>();
     osrmTotalDuration = route["duration"].as<float>();
     const char* polylineStr = route["geometry"];
@@ -4760,19 +5126,18 @@ void processNetworkDone() {
         if (navStepCount >= MAX_NAV_STEPS) break;
         NavigationStep& nav = navSteps[navStepCount];
         nav.distance = step["distance"].as<float>();
-        nav.type     = step["maneuver"]["type"].as<String>();
+        nav.type = step["maneuver"]["type"].as<String>();
         nav.modifier = step["maneuver"]["modifier"].as<String>();
-        nav.road     = step["name"].as<String>();
+        nav.road = step["name"].as<String>();
         String type = nav.type, modifier = nav.modifier;
         type.toLowerCase();
         modifier.toLowerCase();
         nav.instruction = "LANJUT";
-        if (type.indexOf("roundabout") >= 0)        nav.instruction = "PUTARAN";
-        else if (modifier.indexOf("uturn") >= 0)    nav.instruction = "PUTAR BALIK";
-        else if (modifier.indexOf("left")  >= 0)    nav.instruction = "BELOK KIRI";
-        else if (modifier.indexOf("right") >= 0)    nav.instruction = "BELOK KANAN";
-        nav.important = (type == "turn" || type == "merge" || type == "fork" ||
-                         type == "roundabout" || type == "on ramp" || type == "off ramp");
+        if (type.indexOf("roundabout") >= 0) nav.instruction = "PUTARAN";
+        else if (modifier.indexOf("uturn") >= 0) nav.instruction = "PUTAR BALIK";
+        else if (modifier.indexOf("left") >= 0) nav.instruction = "BELOK KIRI";
+        else if (modifier.indexOf("right") >= 0) nav.instruction = "BELOK KANAN";
+        nav.important = (type == "turn" || type == "merge" || type == "fork" || type == "roundabout" || type == "on ramp" || type == "off ramp");
         double maneuverLon = step["maneuver"]["location"][0].as<double>();
         double maneuverLat = step["maneuver"]["location"][1].as<double>();
         float bestDistance = 999999.0;
@@ -4781,10 +5146,13 @@ void processNetworkDone() {
           for (int i = 0; i < routePointCount; i++) {
             double dx = (routePoints[i].lon - maneuverLon) * 111320.0;
             double dy = (routePoints[i].lat - maneuverLat) * 110540.0;
-            float  d  = sqrt(dx * dx + dy * dy);
-            if (d < bestDistance) { bestDistance = d; bestIndex = i; }
+            float d = sqrt(dx * dx + dy * dy);
+            if (d < bestDistance) {
+              bestDistance = d;
+              bestIndex = i;
+            }
           }
-          nav.routeIndex    = bestIndex;
+          nav.routeIndex = bestIndex;
           nav.routeDistance = routeCumulativeDistance[bestIndex];
         }
         navStepCount++;
@@ -4792,21 +5160,20 @@ void processNetworkDone() {
     }
     simulatedRouteDistance = 0;
     simulatedRouteIndex = 0;
-    gpsLastMs           = 0;
-    activeStep          = 0;
-    hudLockedStep       = -1;
-    hudCompletedStep    = -1;
-    hudActive           = false;
-    hudShownAt          = 0;
-    routeReady    = true;
-    tripActive    = true;
-    tripArrived   = false;
+    gpsLastMs = 0;
+    activeStep = 0;
+    hudLockedStep = -1;
+    hudCompletedStep = -1;
+    hudActive = false;
+    hudShownAt = 0;
+    routeReady = true;
+    tripActive = true;
+    tripArrived = false;
     arrivalActive = false;
-    systemState   = STATE_READY;
+    systemState = STATE_READY;
     osrmFailCount = 0;
-    osrmGaveUpAt  = 0;
-    if (!initialMapShown && startupOnboardingCompleted &&
-        !startupOnboardingActive) {
+    osrmGaveUpAt = 0;
+    if (!initialMapShown && startupOnboardingCompleted && !startupOnboardingActive) {
       initialMapShown = true;
       startMapDisplay();
       pendingNavigationAI = NAV_AI_ON_ROUTE;
@@ -4838,19 +5205,21 @@ void processNetworkDone() {
   }
 }
 
-// ===========================================================================
-//  GPS SIMULATION
-// ===========================================================================
 void updateGPSSimulation() {
   if (!routeReady || routePointCount < 2) return;
   if (routeFromLink) {
-    bool gpsFresh = (lastLinkGpsAt != 0) &&
-                    (millis() - lastLinkGpsAt <= LINK_GPS_FRESH_MS);
-    if (gpsFresh) { deadReckonStep(); return; }
+    bool gpsFresh = (lastLinkGpsAt != 0) && (millis() - lastLinkGpsAt <= LINK_GPS_FRESH_MS);
+    if (gpsFresh) {
+      deadReckonStep();
+      return;
+    }
     if (!SIM_WHEN_NO_GPS) return;
   }
   unsigned long now = millis();
-  if (gpsLastMs == 0) { gpsLastMs = now; return; }
+  if (gpsLastMs == 0) {
+    gpsLastMs = now;
+    return;
+  }
   float deltaSeconds = (now - gpsLastMs) / 1000.0;
   gpsLastMs = now;
   if (deltaSeconds > 1.0) deltaSeconds = 1.0;
@@ -4866,9 +5235,6 @@ void updateGPSSimulation() {
   syncRouteProgress();
 }
 
-// ===========================================================================
-//  HUD LATCH
-// ===========================================================================
 float hudTriggerDistance() {
   float d = speedMps * HUD_LEAD_SECONDS;
   if (d < HUD_MIN_TRIGGER_M) d = HUD_MIN_TRIGGER_M;
@@ -4877,21 +5243,23 @@ float hudTriggerDistance() {
 }
 
 void updateHUDLatch() {
-  if (conversationActive || companionActive || companionGenerating ||
-      companionNextMenuActive || companionNextMenuPending ||
-      tripIntroActive || infoModeActive || destinationAskActive ||
-      voicePipelineActive || ttsActive) {
+  if (conversationActive || companionActive || companionGenerating || companionNextMenuActive || companionNextMenuPending || tripIntroActive || infoModeActive || destinationAskActive || voicePipelineActive || ttsActive) {
     hudActive = false;
     return;
   }
-  if (millis() < hudSuppressUntil) { hudActive = false; return; }
-  if (navStepCount == 0)           { hudActive = false; return; }
+  if (millis() < hudSuppressUntil) {
+    hudActive = false;
+    return;
+  }
+  if (navStepCount == 0) {
+    hudActive = false;
+    return;
+  }
 
   if (hudLockedStep >= 0) {
     float turnDist = navSteps[hudLockedStep].routeDistance - simulatedRouteDistance;
-    bool passed  = (turnDist <= -HUD_PASSED_MARGIN_M);
-    bool tooLong = (millis() - hudShownAt > HUD_MAX_SHOW_MS) &&
-                   (turnDist > 25.0f) && (speedMps > 8.0f);
+    bool passed = (turnDist <= -HUD_PASSED_MARGIN_M);
+    bool tooLong = (millis() - hudShownAt > HUD_MAX_SHOW_MS) && (turnDist > 25.0f) && (speedMps > 8.0f);
     if (passed || tooLong) {
       if (passed) {
         char buf[48];
@@ -4902,8 +5270,8 @@ void updateHUDLatch() {
         hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
       }
       hudLockedStep = -1;
-      hudActive     = false;
-      hudShownAt    = 0;
+      hudActive = false;
+      hudShownAt = 0;
       if (!passed) return;
     } else {
       hudActive = true;
@@ -4911,23 +5279,30 @@ void updateHUDLatch() {
     }
   }
 
-  float trigger       = hudTriggerDistance();
-  int   nextImportant = -1;
-  float nextDist      = 0;
+  float trigger = hudTriggerDistance();
+  int nextImportant = -1;
+  float nextDist = 0;
   for (int i = 0; i < navStepCount; i++) {
     if (i <= hudCompletedStep) continue;
     if (!isImportantStep(navSteps[i])) continue;
     float d = navSteps[i].routeDistance - simulatedRouteDistance;
-    if (d <= -HUD_PASSED_MARGIN_M) { hudCompletedStep = i; continue; }
+    if (d <= -HUD_PASSED_MARGIN_M) {
+      hudCompletedStep = i;
+      continue;
+    }
     if (mapRequested && d > HUD_PREEMPT_MAP_M) break;
-    if (d <= trigger) { nextImportant = i; nextDist = d; }
+    if (d <= trigger) {
+      nextImportant = i;
+      nextDist = d;
+    }
     break;
   }
 
   if (nextImportant >= 0) {
     hudLockedStep = nextImportant;
-    hudShownAt    = millis();
-    hudActive     = true;
+    hudShownAt = millis();
+    hudActive = true;
+    sfxPlay(SFX_TURN);
     char buf[64];
     snprintf(buf, sizeof(buf), "{\"t\":\"hud\",\"i\":%d,\"m\":%.0f}",
              nextImportant, nextDist);
@@ -4937,10 +5312,6 @@ void updateHUDLatch() {
   }
 }
 
-// ===========================================================================
-//  DISPLAY PRIORITY
-// ===========================================================================
-// Teks kalimat yang sedang diucapkan TTS (kalimat <= 100 karakter -> maks 5 baris)
 void renderVoiceText() {
   beginFrame();
   drawCenteredText("ABOT", 0, 1);
@@ -4970,36 +5341,79 @@ void renderVoiceText() {
 
 void updateDisplay() {
   if (otaActive) return;
-  if (listeningActive)                        { renderListening(); return; }
-  if (companionActive)                        { renderCompanion(); return; }
-  if (companionNextMenuActive)                { renderCompanionNextMenu(); return; }
-  if (destinationAskActive)                   { renderDestinationAsk(); return; }
-  if (startupOnboardingActive)                { renderStartupOnboarding(); return; }
-  if (tripIntroActive)                        { renderTripIntroduction(); return; }
-  if (infoModeActive)                         { renderInfoMode(); return; }
-  if (bootTransitionActive)                   { renderBootTransition(); return; }
-  if (!introductionFinished)                  { renderIntroduction(); return; }
-  
-  // TAMPILKAN TEKS JAWABAN SAAT TTS BERBUNYI
+  if (listeningActive) {
+    renderListening();
+    return;
+  }
+  if (companionActive) {
+    renderCompanion();
+    return;
+  }
+  if (companionNextMenuActive) {
+    renderCompanionNextMenu();
+    return;
+  }
+  if (destinationAskActive) {
+    renderDestinationAsk();
+    return;
+  }
+  if (startupOnboardingActive) {
+    renderStartupOnboarding();
+    return;
+  }
+  if (tripIntroActive) {
+    renderTripIntroduction();
+    return;
+  }
+  if (infoModeActive) {
+    renderInfoMode();
+    return;
+  }
+  if (bootTransitionActive) {
+    renderBootTransition();
+    return;
+  }
+  if (!introductionFinished) {
+    renderIntroduction();
+    return;
+  }
+
   if (ttsActive && voiceTextActive && currentTtsPart.length() > 0) {
     renderVoiceText();
     return;
   }
 
-  if (companionGenerating || systemState == STATE_THINKING ||
-      thinkingVisualPrepared)                 { renderThinking(); return; }
-  if (conversationActive)                     { renderEyes(); return; }
-  if (arrivalActive)                          { renderArrival(); return; }
-  if (hudActive)                              { renderHUD(); return; }
-  if (mapRequested)                           { renderMap(); return; }
-  if (musicScreenWanted())                    { renderMusic(); return; }
-  if (sleepModeActive)                        { renderSleep(); return; }
+  if (companionGenerating || systemState == STATE_THINKING || thinkingVisualPrepared) {
+    renderThinking();
+    return;
+  }
+  if (conversationActive) {
+    renderEyes();
+    return;
+  }
+  if (arrivalActive) {
+    renderArrival();
+    return;
+  }
+  if (hudActive) {
+    renderHUD();
+    return;
+  }
+  if (mapRequested) {
+    renderMap();
+    return;
+  }
+  if (musicScreenWanted()) {
+    renderMusic();
+    return;
+  }
+  if (sleepModeActive) {
+    renderSleep();
+    return;
+  }
   renderEyes();
 }
 
-// ===========================================================================
-//  DISPLAY TASK
-// ===========================================================================
 void displayRenderTask(void* pvParameters) {
   const TickType_t period = pdMS_TO_TICKS(16);
   for (;;) {
@@ -5013,25 +5427,20 @@ void displayRenderTask(void* pvParameters) {
   }
 }
 
-// ===========================================================================
-//  SERIAL COMMANDS
-// ===========================================================================
 void printHelp() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("COMMANDS:");
-  Serial.println("TOMBOL TALK   : tahan=bicara (STT+LLM+TTS), tekan=jam/cuaca");
-  Serial.println("TOMBOL ACTION : tekan=play/pause musik, tahan=lagu berikut / companion acak");
+  Serial.println("TOMBOL TALK   : tahan=bicara, tekan=jam/cuaca");
+  Serial.println("TOMBOL ACTION : tekan=musik, tahan=lagu berikut / companion");
   Serial.println("M = MAP | U = CARA MENGGUNAKAN | G = TRIP BARU");
   Serial.println("C = CONVERSATION ON / X = OFF");
   Serial.println("Q = QUIZ | T = TRIVIA | H = HUMOR | S = STORY");
-  Serial.println("D = MUSIK | > = LAGU BERIKUT | F = STOP MUSIK | J/K/L = quiz answer");
-  Serial.println("A = NAVIGATION AI | B = THINKING DEMO");
+  Serial.println("D = MUSIK | > = LAGU BERIKUT | F = STOP MUSIK");
+  Serial.println("A = NAVIGATION AI | B = THINKING DEMO | $ = TES BUZZER");
   Serial.println("1-6 = preset mata | W = WINK | P/N/E = personality");
   Serial.println("R = RESET GPS | V = REKAM SUARA");
   Serial.println("+ / - = VOLUME | Z = MUTE");
-  Serial.println("SUARA : tanya apa saja. Minta tampilkan peta/jam/cuaca (kota apa saja),");
-  Serial.println("        kuis, trivia, humor, cerita, musik, intro, atau tulisan bebas");
   Serial.println("========================================");
 }
 
@@ -5040,36 +5449,50 @@ void handleCommand(char cmd) {
   if (companionNextMenuActive) {
     if (cmd == 'Q' || cmd == 'T' || cmd == 'S' || cmd == 'D' || cmd == 'H') {
       closeCompanionNextMenu();
-      if (cmd == 'Q')      startCompanion(COMPANION_QUIZ);
+      if (cmd == 'Q') startCompanion(COMPANION_QUIZ);
       else if (cmd == 'T') startCompanion(COMPANION_TRIVIA);
       else if (cmd == 'S') startCompanion(COMPANION_STORY);
       else if (cmd == 'D') musicRequestPost(MCMD_PLAY, "", "");
       else if (cmd == 'H') startCompanion(COMPANION_HUMOR);
       return;
     }
-    if (cmd == 'X') { closeCompanionNextMenu(); return; }
+    if (cmd == 'X') {
+      closeCompanionNextMenu();
+      return;
+    }
   }
-  if (cmd == 'J' || cmd == 'K' || cmd == 'L') { handleQuizAnswer(cmd); return; }
-  if (cmd == 'G') { startNewTrip(); return; }
-  if (cmd == 'U') { markUserActivity(); startupOnboardingManual = true; startStartupOnboarding(); return; }
+  if (cmd == 'J' || cmd == 'K' || cmd == 'L') {
+    handleQuizAnswer(cmd);
+    return;
+  }
+  if (cmd == 'G') {
+    startNewTrip();
+    return;
+  }
+  if (cmd == 'U') {
+    markUserActivity();
+    startupOnboardingManual = true;
+    startStartupOnboarding();
+    return;
+  }
   if (cmd == 'M') {
     if (destinationAskActive) return;
-    companionActive          = false;
-    companionNextMenuActive  = false;
+    companionActive = false;
+    companionNextMenuActive = false;
     companionNextMenuPending = false;
-    hudActive                = false;
+    hudActive = false;
     cancelThinking();
     startMapDisplay();
     return;
   }
   if (cmd == 'C') {
     if (destinationAskActive) return;
-    conversationActive       = true;
-    mapRequested             = false;
-    companionActive          = false;
-    companionNextMenuActive  = false;
+    conversationActive = true;
+    mapRequested = false;
+    companionActive = false;
+    companionNextMenuActive = false;
     companionNextMenuPending = false;
-    hudActive                = false;
+    hudActive = false;
     cancelThinking();
     hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
     setEyeMood(EYE_HAPPY);
@@ -5077,25 +5500,55 @@ void handleCommand(char cmd) {
   }
   if (cmd == 'X') {
     conversationActive = false;
-    hudSuppressUntil   = millis() + HUD_SUPPRESS_DURATION;
+    hudSuppressUntil = millis() + HUD_SUPPRESS_DURATION;
     setEyeMood(EYE_DEFAULT);
     return;
   }
-  if (cmd == 'Q') { startCompanion(COMPANION_QUIZ);      return; }
-  if (cmd == 'T') { startCompanion(COMPANION_TRIVIA);    return; }
-  if (cmd == 'H') { startCompanion(COMPANION_HUMOR);     return; }
-  if (cmd == 'S') { startCompanion(COMPANION_STORY);     return; }
-  if (cmd == 'D') { musicRequestPost(MCMD_TOGGLE, "", ""); return; }
-  if (cmd == '>') { musicRequestPost(MCMD_NEXT,   "", ""); return; }
-  if (cmd == 'F') { musicRequestPost(MCMD_STOP,   "", ""); return; }
+  if (cmd == 'Q') {
+    startCompanion(COMPANION_QUIZ);
+    return;
+  }
+  if (cmd == 'T') {
+    startCompanion(COMPANION_TRIVIA);
+    return;
+  }
+  if (cmd == 'H') {
+    startCompanion(COMPANION_HUMOR);
+    return;
+  }
+  if (cmd == 'S') {
+    startCompanion(COMPANION_STORY);
+    return;
+  }
+  if (cmd == 'D') {
+    musicRequestPost(MCMD_TOGGLE, "", "");
+    return;
+  }
+  if (cmd == '>') {
+    musicRequestPost(MCMD_NEXT, "", "");
+    return;
+  }
+  if (cmd == 'F') {
+    musicRequestPost(MCMD_STOP, "", "");
+    return;
+  }
+  if (cmd == '$') {
+    sfxSelfTest();
+    return;
+  }
   if (cmd >= '1' && cmd <= '6') {
     abotHoldUntil = millis() + 8000;
-    if      (cmd == '1') setEyeMood(EYE_DEFAULT);
+    if (cmd == '1') setEyeMood(EYE_DEFAULT);
     else if (cmd == '2') setEyeMood(EYE_HAPPY);
     else if (cmd == '3') setEyeMood(EYE_ANGRY);
     else if (cmd == '4') setEyeMood(EYE_TIRED);
-    else if (cmd == '5') { setEyeMood(EYE_HAPPY);   roboEyes.anim_laugh();    }
-    else if (cmd == '6') { setEyeMood(EYE_DEFAULT); roboEyes.anim_confused(); }
+    else if (cmd == '5') {
+      setEyeMood(EYE_HAPPY);
+      roboEyes.anim_laugh();
+    } else if (cmd == '6') {
+      setEyeMood(EYE_DEFAULT);
+      roboEyes.anim_confused();
+    }
     return;
   }
   if (cmd == 'W') {
@@ -5105,47 +5558,72 @@ void handleCommand(char cmd) {
     triggerNaturalWink();
     return;
   }
-  if (cmd == 'P') { personalityMode = PERSONALITY_PLAYFUL; return; }
-  if (cmd == 'N') { personalityMode = PERSONALITY_NORMAL;  return; }
-  if (cmd == 'E') { personalityMode = PERSONALITY_EXCITED; return; }
+  if (cmd == 'P') {
+    personalityMode = PERSONALITY_PLAYFUL;
+    return;
+  }
+  if (cmd == 'N') {
+    personalityMode = PERSONALITY_NORMAL;
+    return;
+  }
+  if (cmd == 'E') {
+    personalityMode = PERSONALITY_EXCITED;
+    return;
+  }
   if (cmd == 'B') {
     thinkingDemoUntil = millis() + 3000;
-    systemState       = STATE_THINKING;
+    systemState = STATE_THINKING;
     setEyeMood(EYE_DEFAULT);
     beginThinkingVisual();
     return;
   }
-  if (cmd == 'A') { navigationAIStarted = false; startNavigationAI(); return; }
+  if (cmd == 'A') {
+    navigationAIStarted = false;
+    startNavigationAI();
+    return;
+  }
   if (cmd == 'R') {
     arrivalActive = false;
-    tripArrived   = false;
-    tripActive    = true;
+    tripArrived = false;
+    tripActive = true;
     simulatedRouteDistance = 0;
-    simulatedRouteIndex    = 0;
-    gpsLastMs              = 0;
-    activeStep             = 0;
-    hudLockedStep          = -1;
-    hudCompletedStep       = -1;
-    hudActive              = false;
-    hudShownAt             = 0;
-    speedLastAt            = 0;
-    drLastMs               = 0;
+    simulatedRouteIndex = 0;
+    gpsLastMs = 0;
+    activeStep = 0;
+    hudLockedStep = -1;
+    hudCompletedStep = -1;
+    hudActive = false;
+    hudShownAt = 0;
+    speedLastAt = 0;
+    drLastMs = 0;
     return;
   }
-  if (cmd == '+') { audioVolumeStep(+1); return; }
-  if (cmd == '-') { audioVolumeStep(-1); return; }
-  if (cmd == 'Z') { audioToggleMute();   return; }
+  if (cmd == '+') {
+    audioVolumeStep(+1);
+    return;
+  }
+  if (cmd == '-') {
+    audioVolumeStep(-1);
+    return;
+  }
+  if (cmd == 'Z') {
+    audioToggleMute();
+    return;
+  }
   if (cmd == 'V') {
     if (listeningActive) stopListening();
-    else                 startListening();
+    else startListening();
     return;
   }
-  if (cmd == '?') { printHelp(); return; }
+  if (cmd == '?') {
+    printHelp();
+    return;
+  }
 }
 
 void oledProbeAddress() {
   Wire.begin(OLED_SDA, OLED_SCL);
-  const uint8_t candidates[2] = {0x3C, 0x3D};
+  const uint8_t candidates[2] = { 0x3C, 0x3D };
   for (int i = 0; i < 2; i++) {
     Wire.beginTransmission(candidates[i]);
     if (Wire.endTransmission() == 0) {
@@ -5159,11 +5637,10 @@ void oledProbeAddress() {
   Wire.end();
 }
 
-// ===========================================================================
-//  SETUP
-// ===========================================================================
 void setup() {
   stateMutex = xSemaphoreCreateRecursiveMutex();
+  mqttMutex = xSemaphoreCreateMutex();
+
   Serial.begin(115200);
   randomSeed((unsigned long)micros());
   {
@@ -5178,8 +5655,10 @@ void setup() {
   Serial.println("  VOICE AI: STT Groq + LLM Groq + TTS Google");
   Serial.println("========================================");
 
-  pinMode(BUTTON_TALK,   INPUT_PULLUP);
+  pinMode(BUTTON_TALK, INPUT_PULLUP);
   pinMode(BUTTON_ACTION, INPUT_PULLUP);
+
+  sfxBegin();
 
   oledProbeAddress();
   u8g2.setBusClock(OLED_I2C_CLOCK_HZ);
@@ -5229,12 +5708,12 @@ void setup() {
   }
 
   BaseType_t r = xTaskCreatePinnedToCore(voiceTask, "VoiceTask", 16384,
-                                          NULL, 3, &voiceTaskHandle, 0);
+                                         NULL, 3, &voiceTaskHandle, 0);
   if (r != pdPASS) {
     Serial.println("[VOICE] FAIL: voiceTask spawn");
     voiceTaskHandle = NULL;
   } else {
-    Serial.println("[VOICE] voiceTask started (STT+LLM+TTS)");
+    Serial.println("[VOICE] voiceTask started");
   }
 
   systemState = STATE_READY;
@@ -5242,15 +5721,15 @@ void setup() {
   startBootTransition();
 
   lastUserActivityMs = millis();
-  sleepModeActive    = false;
+  sleepModeActive = false;
 
   Serial.println("[STATE] READY");
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms     = 15000,
+    .timeout_ms = 15000,
     .idle_core_mask = 0,
-    .trigger_panic  = true,
+    .trigger_panic = true,
   };
   if (esp_task_wdt_reconfigure(&wdt_config) != ESP_OK) esp_task_wdt_init(&wdt_config);
 #else
@@ -5262,17 +5741,28 @@ void setup() {
   xTaskCreatePinnedToCore(displayRenderTask, "DisplayTask", 8192, NULL, 2,
                           &displayTaskHandle, 1);
   Serial.println("[DISPLAY] Display task started on core 1 (~60 FPS)");
+
+  // --- CEK APAKAH INI BOOT PERTAMA SETELAH OTA ---
+  bootTimeMs = millis();
+  otaPrefs.begin("ota", true);
+  pendingOtaVerification = otaPrefs.getBool("pending", false);
+  otaTargetVersion = otaPrefs.getString("target", "");
+  otaPrefs.end();
+
+  if (pendingOtaVerification) {
+    Serial.printf("[OTA] Menunggu verifikasi untuk versi %s...\n", otaTargetVersion.c_str());
+  }
+
 }
 
-// ===========================================================================
-//  LOOP
-// ===========================================================================
 void loop() {
   esp_task_wdt_reset();
   linkUpdate();
   mqttUpdate();
   ensureWiFiConnected();
   checkHeapHealth();
+
+  sfxUpdate();
 
   {
     StateLock lock;
@@ -5281,8 +5771,7 @@ void loop() {
     updateNaturalEyeBehavior();
     updateButtons();
 
-    if (hpConnected && lastLinkMessageAt > 0 &&
-        millis() - lastLinkMessageAt > LINK_TIMEOUT_MS) {
+    if (hpConnected && lastLinkMessageAt > 0 && millis() - lastLinkMessageAt > LINK_TIMEOUT_MS) {
       hpConnected = false;
       abotLog("WARN", "HP terputus (timeout)");
     }
@@ -5294,11 +5783,7 @@ void loop() {
       setEyeMood(EYE_DEFAULT);
     }
 
-    if (activeOsrmUrl.length() > 0 && !routeReady && !routeRequested &&
-        !networkIsBusy() && wifiConnected &&
-        !hpConnected && !linkRouteReceived &&
-        osrmFailCount < OSRM_MAX_RETRIES &&
-        (lastOsrmAttempt == 0 || millis() - lastOsrmAttempt >= OSRM_RETRY_MS)) {
+    if (activeOsrmUrl.length() > 0 && !routeReady && !routeRequested && !networkIsBusy() && wifiConnected && !hpConnected && !linkRouteReceived && osrmFailCount < OSRM_MAX_RETRIES && (lastOsrmAttempt == 0 || millis() - lastOsrmAttempt >= OSRM_RETRY_MS)) {
       startOSRM();
     }
 
@@ -5308,8 +5793,8 @@ void loop() {
       networkJobWasBusy = false;
     } else if (networkJobWasBusy && millis() - networkJobStartedAt > 45000UL) {
       abotLog("ERR", "Network job hang >45s, force-release");
-      networkBusy       = false;
-      networkDone       = false;
+      networkBusy = false;
+      networkDone = false;
       networkJobWasBusy = false;
       if (systemState == STATE_THINKING) systemState = STATE_READY;
       endThinkingVisual();
@@ -5328,8 +5813,7 @@ void loop() {
       mapRequested = false;
     }
 
-    if (pendingNavigationAI && !navigationAIStarted && routeReady &&
-        !mapRequested && !networkIsBusy()) {
+    if (pendingNavigationAI && !navigationAIStarted && routeReady && !mapRequested && !networkIsBusy()) {
       startNavigationAI();
     }
 
@@ -5340,4 +5824,28 @@ void loop() {
 
   linkReportStatus();
   delay(1);
+
+    // --- VERIFIKASI OTA SETELAH 30 DETIK BERJALAN NORMAL ---
+  if (pendingOtaVerification && (millis() - bootTimeMs > 30000)) {
+    pendingOtaVerification = false;
+    
+    // Tandai firmware baru ini VALID (Batalkan rollback otomatis)
+    esp_ota_mark_app_valid_cancel_rollback();
+    
+    // Cek apakah versi yang dilaporkan cocok dengan target
+    if (String(FW_VERSION) == otaTargetVersion) {
+      linkSend(String("{\"t\":\"ota_result\",\"ok\":true,\"ver\":\"") + FW_VERSION + "\"}");
+      abotLog("INFO", "OTA Sukses terverifikasi (v%s)", FW_VERSION);
+    } else {
+      linkSend(String("{\"t\":\"ota_result\",\"ok\":false,\"ver\":\"") + FW_VERSION + "\",\"rolled_back\":true}");
+      abotLog("ERR", "OTA Gagal! Versi sekarang %s, target %s", FW_VERSION, otaTargetVersion.c_str());
+    }
+
+    // Hapus status pending di NVS
+    otaPrefs.begin("ota", false);
+    otaPrefs.putBool("pending", false);
+    otaPrefs.end();
+  }
+
+
 }
