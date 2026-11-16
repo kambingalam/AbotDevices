@@ -1,19 +1,18 @@
 /*
   ============================================================================
-   ABOT MUSIC PLAYER (Audius + Jamendo)  -  dipakai oleh ABOT V3.50
+   ABOT MUSIC PLAYER (Audius + Jamendo)  -  dipakai oleh ABOT V3.51
   ============================================================================
    - Sumber lagu : Audius (utama, tanpa API key) -> Jamendo (cadangan)
    - Streaming   : ESP32-audioI2S (objek audioI2S yang sama dengan TTS)
-   - Layar OLED  : judul berjalan, animasi (procedural / frame bitmap),
-                   waktu, ikon play/pause, progress bar ala Apple Watch
+   - OLED        : judul berjalan, animasi robot + equalizer, waktu,
+                   ikon play/pause, progress bar
    - Semua logika audio berjalan di voiceTask (satu-satunya pemilik audioI2S),
      task lain hanya mengirim permintaan lewat musicRequestPost().
 
-   Opsional di secrets.h : #define JAMENDO_CLIENT_ID_STR "xxxxxxxx"  (cadangan)
+   Opsional di secrets.h : #define JAMENDO_CLIENT_ID_STR "xxxxxxxx"
    Opsional              : #define AUDIUS_APP_NAME "ABOT"
    Opsional              : music_frames.h (dibuat oleh make_frames.py)
-   Opsional              : #define MUSIC_USE_VU 0  (kalau getVUlevel() tidak ada di
-                           versi ESP32-audioI2S kamu)
+   Opsional              : #define MUSIC_USE_VU 1  (jika getVUlevel() ada)
   ============================================================================
 */
 #pragma once
@@ -27,7 +26,7 @@
 #define AUDIUS_API "https://api.audius.co"
 
 #ifndef MUSIC_USE_VU
-#define MUSIC_USE_VU 1
+#define MUSIC_USE_VU 0
 #endif
 #ifndef MUSIC_VU_GAIN
 #define MUSIC_VU_GAIN 1.8f
@@ -46,10 +45,9 @@ constexpr uint8_t MCMD_NONE = 0, MCMD_PLAY = 1, MCMD_TOGGLE = 2, MCMD_PAUSE = 3,
                   MCMD_RESUME = 4, MCMD_NEXT = 5, MCMD_STOP = 6;
 
 constexpr int           MUSIC_MAX_TRACKS        = 10;
-constexpr unsigned long MUSIC_LOAD_TIMEOUT_MS   = 15000UL;
-constexpr unsigned long MUSIC_SOFT_PAUSE_MAX_MS = 90000UL;   // jeda lebih lama -> stream dilepas
+constexpr unsigned long MUSIC_LOAD_TIMEOUT_MS   = 20000UL;
+constexpr unsigned long MUSIC_SOFT_PAUSE_MAX_MS = 90000UL;
 
-// Area animasi di OLED
 constexpr int MUSIC_AREA_X = 2, MUSIC_AREA_Y = 12, MUSIC_AREA_W = 56, MUSIC_AREA_H = 40;
 
 // ---------------------------------------------------------------------------
@@ -62,19 +60,20 @@ struct MusicTrack {
   int    duration = 0;
 };
 
-static MusicTrack musicList[MUSIC_MAX_TRACKS];     // hanya diakses voiceTask
+static MusicTrack musicList[MUSIC_MAX_TRACKS];
 static int        musicCount = 0;
 static int        musicIndex = -1;
 
 static volatile uint8_t musicState     = MUS_STOPPED;
-static volatile bool    musicStopReq   = false;    // minta voiceTask melepas stream
-static volatile bool    musicAbortFlag = false;    // TALK ditekan saat proses memuat
+static volatile bool    musicStopReq   = false;
+static volatile bool    musicAbortFlag = false;
+static volatile bool    musicEof       = false;   // diset audio_eof_stream()
 
-static volatile uint8_t musicReqCmd = MCMD_NONE;   // dijaga StateLock
+static volatile uint8_t musicReqCmd = MCMD_NONE;
 static String           musicReqQuery = "";
 static String           musicReqGenre = "";
 
-static char musicTitleBuf[48]  = "";               // dibaca renderer (StateLock)
+static char musicTitleBuf[48]  = "";
 static char musicArtistBuf[32] = "";
 static int  musicDurationSec   = 0;
 
@@ -84,9 +83,17 @@ static unsigned long musicPauseStartMs   = 0;
 static unsigned long musicPausedAccumMs  = 0;
 static bool          musicHasStarted     = false;
 static int           musicFailStreak     = 0;
+static unsigned long musicLastRunningMs  = 0; // <--- FIX: Untuk mendeteksi buffering
 
 static inline bool musicScreenWanted() { return musicState != MUS_STOPPED; }
 static inline bool musicHasSession()   { return musicState != MUS_STOPPED; }
+
+// Callback ESP32-audioI2S (dipanggil di dalam audioI2S.loop()).
+// Aman didefinisikan walau versi library tidak memanggilnya.
+void audio_eof_stream(const char* info) {
+  Serial.printf("[MUSIC] EOF stream: %s\n", info ? info : "");
+  musicEof = true;
+}
 
 // ---------------------------------------------------------------------------
 //  Helper
@@ -134,24 +141,21 @@ static String musicUrlEnc(const String& s) {
   return o;
 }
 
-// Ucapkan pesan singkat lewat TTS (dipanggil dari voiceTask)
 static void musicSay(const String& msg) {
   { StateLock lock; voiceTextActive = true; }
   speakText(msg);
 }
 
-// ---------------------------------------------------------------------------
-//  Resolusi redirect
-// ---------------------------------------------------------------------------
-// Ikuti redirect (maks 3 lompatan) supaya audioI2S langsung dapat URL akhir.
+// Ikuti redirect manual (Audius mengarahkan /stream ke node penyimpanan).
 static String musicResolveUrl(const String& url) {
   String cur = url;
   for (int hop = 0; hop < 3; hop++) {
+    if (musicAbortFlag) break;
     WiFiClientSecure sclient;
     sclient.setInsecure();
     WiFiClient pclient;
     HTTPClient http;
-    http.setTimeout(8000);
+    http.setTimeout(5000); // FIX: Diturunkan dari 8000ms agar tidak terlalu lama menunggu
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     const char* keys[] = {"Location"};
     http.collectHeaders(keys, 1);
@@ -169,9 +173,8 @@ static String musicResolveUrl(const String& url) {
 }
 
 // ---------------------------------------------------------------------------
-//  Sumber 1 (cadangan): Jamendo
+//  Sumber cadangan: Jamendo
 // ---------------------------------------------------------------------------
-// return: jumlah lagu, 0 = kosong, -1 = gagal jaringan, -2 = kunci belum diisi
 static int musicFetchJamendo(const String& query, const String& genre) {
   if (strlen(JAMENDO_CLIENT_ID_STR) == 0) return -2;
 
@@ -183,31 +186,22 @@ static int musicFetchJamendo(const String& query, const String& genre) {
     url += "&order=popularity_week&tags=" + musicUrlEnc(genre) +
            "&offset=" + String((int)random(0, 25));
   } else {
-    // Tanpa query dan genre: ambil lagu populer secara acak
     url += "&order=popularity_week&offset=" + String((int)random(0, 100));
   }
 
-  Serial.printf("[MUSIC] Jamendo URL: %s\n", url.c_str());
+  Serial.printf("[MUSIC] Jamendo query='%s' genre='%s'\n", query.c_str(), genre.c_str());
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(15000);
-
   if (!http.begin(client, url)) return -1;
   const int code = http.GET();
   Serial.printf("[MUSIC] Jamendo HTTP %d\n", code);
+  if (code != 200) { http.end(); return -1; }
 
-  if (code != 200) {
-    http.end();
-    return -1;
-  }
-
-  // Baca seluruh body ke String dulu, baru parsing
-  String payload = http.getString();
+  const String payload = http.getString();
   http.end();
-
-  Serial.printf("[MUSIC] Jamendo JSON: %d bytes\n", payload.length());
 
   JsonDocument filter;
   filter["results"][0]["name"]        = true;
@@ -216,8 +210,8 @@ static int musicFetchJamendo(const String& query, const String& genre) {
   filter["results"][0]["audio"]       = true;
 
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
-
+  const DeserializationError err =
+      deserializeJson(doc, payload, DeserializationOption::Filter(filter));
   if (err) {
     Serial.printf("[MUSIC] Jamendo JSON error: %s\n", err.c_str());
     return -1;
@@ -232,17 +226,15 @@ static int musicFetchJamendo(const String& query, const String& genre) {
     m.artist   = String((const char*)(t["artist_name"] | ""));
     m.url      = String(audio);
     m.duration = t["duration"] | 0;
-    musicCount++;
-    if (musicCount >= MUSIC_MAX_TRACKS) break;
+    if (++musicCount >= MUSIC_MAX_TRACKS) break;
   }
-  Serial.printf("[MUSIC] Jamendo: %d lagu didapat\n", musicCount);
+  Serial.printf("[MUSIC] Jamendo: %d lagu\n", musicCount);
   return musicCount;
 }
 
 // ---------------------------------------------------------------------------
-//  Sumber 2 (utama): Audius  (tanpa API key, hanya app_name)
+//  Sumber utama: Audius
 // ---------------------------------------------------------------------------
-// Tag gaya Jamendo (huruf kecil) -> nama genre Audius. "" = tanpa filter genre.
 static String musicAudiusGenre(const String& tag) {
   if (tag == "pop")        return "Pop";
   if (tag == "rock")       return "Rock";
@@ -261,7 +253,6 @@ static String musicAudiusGenre(const String& tag) {
   return "";
 }
 
-// return: jumlah lagu, 0 = kosong, -1 = gagal jaringan / parsing
 static int musicFetchAudius(const String& query, const String& genre) {
   String url;
   if (query.length() > 0) {
@@ -271,7 +262,7 @@ static int musicFetchAudius(const String& query, const String& genre) {
     url = String(AUDIUS_API "/v1/tracks/trending?limit=10&time=week&app_name=" AUDIUS_APP_NAME);
     const String g = musicAudiusGenre(genre);
     if (g.length() > 0) url += "&genre=" + musicUrlEnc(g);
-    url += "&offset=" + String((int)random(0, 20));   // variasi tiap permintaan
+    url += "&offset=" + String((int)random(0, 20));
   }
   Serial.printf("[MUSIC] Audius URL: %s\n", url.c_str());
 
@@ -312,26 +303,23 @@ static int musicFetchAudius(const String& query, const String& genre) {
     m.artist   = String((const char*)(t["user"]["name"] | ""));
     m.url      = String(AUDIUS_API "/v1/tracks/") + id + "/stream?app_name=" AUDIUS_APP_NAME;
     m.duration = t["duration"] | 0;
-    musicCount++;
-    if (musicCount >= MUSIC_MAX_TRACKS) break;
+    if (++musicCount >= MUSIC_MAX_TRACKS) break;
   }
-  Serial.printf("[MUSIC] Audius: %d lagu didapat\n", musicCount);
+  Serial.printf("[MUSIC] Audius: %d lagu\n", musicCount);
   return musicCount;
 }
 
-// Pintu masuk: Audius dulu, kalau kosong/gagal baru Jamendo.
-// return: jumlah lagu, 0 = kosong, -1 = gagal jaringan
 static int musicFetchPlaylist(const String& query, const String& genre) {
   const int n = musicFetchAudius(query, genre);
   if (n > 0) return n;
-
-  if (strlen(JAMENDO_CLIENT_ID_STR) == 0) return n;   // Jamendo tidak dikonfigurasi
+  if (musicAbortFlag) return n;
+  if (strlen(JAMENDO_CLIENT_ID_STR) == 0) return n;
   Serial.println("[MUSIC] Audius kosong/gagal, coba Jamendo");
   return musicFetchJamendo(query, genre);
 }
 
 // ---------------------------------------------------------------------------
-//  Kontrol pemutaran (hanya dipanggil dari voiceTask)
+//  Kontrol pemutaran
 // ---------------------------------------------------------------------------
 static void musicOnTrackFail();
 
@@ -339,6 +327,7 @@ static bool musicStartTrack(int i) {
   if (i < 0 || i >= musicCount) return false;
   musicIndex = i;
   audioI2S.stopSong();
+  musicEof = false;
   musicSetDisplay(musicList[i].title, musicList[i].artist, musicList[i].duration);
   {
     StateLock lock;
@@ -346,18 +335,22 @@ static bool musicStartTrack(int i) {
     musicHasStarted  = false;
     musicLoadStartMs = millis();
   }
+  delay(100);   // beri waktu audioI2S melepas stream lama
+
   const String url = musicResolveUrl(musicList[i].url);
-  if (musicAbortFlag) {                       // pengguna menekan TALK saat proses memuat
+  if (musicAbortFlag) {
     StateLock lock;
     musicState = MUS_STOPPED;
     return true;
   }
   Serial.printf("[MUSIC] Putar #%d: %s\n", i, musicList[i].title.c_str());
+
   if (!audioI2S.connecttohost(url.c_str())) {
     Serial.println("[MUSIC] connecttohost gagal");
     return false;
   }
   musicLoadStartMs = millis();
+  sfxPlay(SFX_MUSIC);
   return true;
 }
 
@@ -377,6 +370,7 @@ static void musicOnTrackFail() {
       musicHasStarted = false;
     }
     musicFailStreak = 0;
+    sfxPlay(SFX_ERROR);
     musicSay("Maaf, lagunya gagal diputar. Coba lagi nanti ya.");
     return;
   }
@@ -392,7 +386,8 @@ static void musicDropStream() {
   musicHasStarted = false;
 }
 
-// Dipanggil dari startListening() (task loop): hentikan musik saat TALK ditahan.
+// Dipanggil dari task lain (mis. saat TALK ditahan). stopSong() sebenarnya
+// dijalankan voiceTask lewat musicStopReq.
 static void musicStopForVoice() {
   musicAbortFlag = true;
   if (musicState != MUS_STOPPED) {
@@ -402,7 +397,6 @@ static void musicStopForVoice() {
   }
 }
 
-// Dipanggil terus-menerus oleh voiceTask
 static void musicTick() {
   if (musicStopReq) {
     audioI2S.stopSong();
@@ -416,6 +410,12 @@ static void musicTick() {
   const uint8_t st = musicState;
   if (st == MUS_LOADING || st == MUS_PLAYING) {
     audioI2S.loop();
+    
+    // Catat kapan terakhir kali audio benar-benar berjalan
+    if (audioI2S.isRunning()) {
+      musicLastRunningMs = millis();
+    }
+
     if (st == MUS_LOADING) {
       if (audioI2S.isRunning()) {
         StateLock lock;
@@ -424,17 +424,31 @@ static void musicTick() {
         musicPlayStartMs   = millis();
         musicPausedAccumMs = 0;
         musicFailStreak    = 0;
+        musicEof           = false;
       } else if (millis() - musicLoadStartMs > MUSIC_LOAD_TIMEOUT_MS) {
         Serial.println("[MUSIC] timeout memuat lagu");
         musicOnTrackFail();
       }
     } else {
       const uint32_t el = musicElapsedSec();
+      
+      // FIX: Beri waktu toleransi 15 detik jika lagu buffering sebelum dianggap selesai/gagal
+      bool stuckTooLong = false;
+      if (!audioI2S.isRunning() && musicLastRunningMs > 0) {
+        if (millis() - musicLastRunningMs > 15000UL) { // 15 detik
+          stuckTooLong = true;
+        }
+      }
+
       const bool ended =
-        (!audioI2S.isRunning() && millis() - musicPlayStartMs > 4000UL) ||
+        musicEof ||
+        stuckTooLong ||
         (musicDurationSec > 0 && el > (uint32_t)musicDurationSec + 5);
+        
       if (ended) {
-        Serial.println("[MUSIC] lagu selesai -> berikutnya");
+        Serial.println("[MUSIC] lagu selesai atau terputus -> berikutnya");
+        musicEof = false;
+        musicLastRunningMs = 0; // Reset
         musicAdvance(+1);
       }
     }
@@ -449,9 +463,6 @@ static void musicTick() {
   }
 }
 
-// ---------------------------------------------------------------------------
-//  Permintaan dari task lain (tombol, suara, serial)
-// ---------------------------------------------------------------------------
 static void musicRequestPost(uint8_t cmd, const String& query, const String& genre) {
   {
     StateLock lock;
@@ -475,7 +486,6 @@ static void musicPostFromAct(const String& cmdStr, const String& query, const St
   musicRequestPost(cmd, q, musicCleanTag(genre));
 }
 
-// Dijalankan voiceTask setelah ada notifikasi 0x02
 static void musicServiceRequest() {
   uint8_t cmd;
   String  q, g;
@@ -484,7 +494,7 @@ static void musicServiceRequest() {
     cmd = musicReqCmd;
     q   = musicReqQuery;
     g   = musicReqGenre;
-    musicReqCmd = MCMD_NONE;
+    musicReqCmd   = MCMD_NONE;
     musicReqQuery = "";
     musicReqGenre = "";
   }
@@ -498,15 +508,16 @@ static void musicServiceRequest() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    sfxPlay(SFX_ERROR);
     musicSay("Koneksi internet lagi putus, musiknya belum bisa diputar.");
     return;
   }
 
   if (cmd == MCMD_TOGGLE) {
-    if      (musicState == MUS_PLAYING)                          cmd = MCMD_PAUSE;
-    else if (musicState == MUS_PAUSED)                           cmd = MCMD_RESUME;
-    else if (musicIndex >= 0 && musicIndex < musicCount)         cmd = MCMD_RESUME;
-    else                                                         cmd = MCMD_PLAY;
+    if      (musicState == MUS_PLAYING)                  cmd = MCMD_PAUSE;
+    else if (musicState == MUS_PAUSED)                   cmd = MCMD_RESUME;
+    else if (musicIndex >= 0 && musicIndex < musicCount) cmd = MCMD_RESUME;
+    else                                                 cmd = MCMD_PLAY;
   }
 
   if (cmd == MCMD_PAUSE) {
@@ -528,7 +539,7 @@ static void musicServiceRequest() {
       return;
     }
     if (musicState == MUS_PLAYING || musicState == MUS_LOADING) return;
-    if (musicIndex >= 0 && musicIndex < musicCount) {      // stream sudah dilepas: putar ulang dari awal
+    if (musicIndex >= 0 && musicIndex < musicCount) {
       if (!musicStartTrack(musicIndex)) musicOnTrackFail();
       return;
     }
@@ -543,9 +554,9 @@ static void musicServiceRequest() {
     cmd = MCMD_PLAY;
   }
 
-  // ---- MCMD_PLAY: cari playlist baru ----
+  // ---- MCMD_PLAY ----
   audioI2S.stopSong();
-  musicSetDisplay("Mencari lagu...", "Audius", 0);
+  musicSetDisplay("Mencari lagu...", "Audius/Jamendo", 0);
   {
     StateLock lock;
     musicState       = MUS_LOADING;
@@ -553,26 +564,43 @@ static void musicServiceRequest() {
     musicLoadStartMs = millis();
   }
 
-  bool notFound = false;
   int n = musicFetchPlaylist(q, g);
 
-  // Kosong (judul/genre tidak ada): cari lagu populer sebagai cadangan
-  if (n <= 0) {
-    notFound = true;
+  // --- FIX: JIKA LAGU SPESIFIK TIDAK DITEMUKAN, JANGAN ASAL PUTAR ---
+  if (n <= 0 && q.length() > 0) { 
+    musicDropStream();
+    sfxPlay(SFX_ERROR);
+    String msg = "Maaf, lagu \"" + q + "\" tidak ada di katalog. Coba minta genre lain ya.";
+    musicSay(msg);
+    return;
+  }
+
+  // Jika kosong dan tidak ada query (minta putar acak), baru cari populer
+  if (n <= 0 && q.length() == 0) {
     Serial.println("[MUSIC] Pencarian kosong, mencari lagu populer...");
     n = musicFetchPlaylist("", "");
   }
 
-  if (musicAbortFlag) { musicDropStream(); return; }
+  if (musicAbortFlag) {
+    musicDropStream();
+    return;
+  }
   if (n <= 0) {
     musicDropStream();
+    sfxPlay(SFX_ERROR);
     musicSay("Maaf, aku belum bisa mengambil lagu sekarang.");
     return;
   }
-  if (notFound && (q.length() > 0 || g.length() > 0)) {
-    musicSay("Lagu itu tidak ada di katalog, kuputarkan yang lain ya.");
+  
+  // Jika user minta genre (bukan judul spesifik), boleh putar acak
+  if (q.length() == 0 && g.length() > 0) {
+    musicSay("Oke, ini lagu dengan genre " + g + ".");
   }
-  if (musicAbortFlag) { musicDropStream(); return; }
+
+  if (musicAbortFlag) {
+    musicDropStream();
+    return;
+  }
 
   musicFailStreak = 0;
   if (!musicStartTrack(0)) musicOnTrackFail();
@@ -608,7 +636,7 @@ static void musicDrawArt(bool playing) {
       : 0.0f;
   lvl = lvl * 0.7f + target * 0.3f;
 
-  // --- kepala robot Abot yang goyang mengikuti musik ---
+  // kepala robot Abot yang goyang mengikuti musik
   const int cx  = MUSIC_AREA_X + MUSIC_AREA_W / 2;
   const int bob = playing ? (int)lroundf(sinf(t * 7.0f) * (1.0f + 1.5f * lvl)) : 0;
   const int hw = 36, hh = 20;
@@ -620,10 +648,10 @@ static void musicDrawArt(bool playing) {
 
   const int  ey     = hy + 5;
   const bool squint = playing && lvl > 0.55f && ((now / 180UL) % 2UL);
-  if (!playing) {                               // mata mengantuk saat jeda
+  if (!playing) {
     gfxLine(hx + 8,       ey + 4, hx + 14,      ey + 4);
     gfxLine(hx + hw - 15, ey + 4, hx + hw - 9,  ey + 4);
-  } else if (squint) {                          // mata ^ ^ saat beat kuat
+  } else if (squint) {
     gfxLine(hx + 8,  ey + 6, hx + 11, ey + 2);
     gfxLine(hx + 11, ey + 2, hx + 14, ey + 6);
     gfxLine(hx + hw - 15, ey + 6, hx + hw - 12, ey + 2);
@@ -633,7 +661,7 @@ static void musicDrawArt(bool playing) {
     gfxFillRoundRect(hx + hw - 14, ey, 6, 9, 2);
   }
 
-  // --- equalizer ---
+  // equalizer
   const int nBars = 8, barW = 5, gap = 2;
   const int totalW = nBars * barW + (nBars - 1) * gap;
   const int bx0 = MUSIC_AREA_X + (MUSIC_AREA_W - totalW) / 2;
@@ -648,9 +676,9 @@ static void musicDrawArt(bool playing) {
 }
 
 static void renderMusic() {
-  const uint8_t st       = musicState;
-  const bool    playing  = (st == MUS_PLAYING);
-  const bool    loading  = (st == MUS_LOADING);
+  const uint8_t  st      = musicState;
+  const bool     playing = (st == MUS_PLAYING);
+  const bool     loading = (st == MUS_LOADING);
   const uint32_t now     = millis();
 
   beginFrame();
@@ -679,10 +707,10 @@ static void renderMusic() {
   const uint32_t el  = musicElapsedSec();
   const int      dur = musicDurationSec;
   char tb[24];
-  if (loading)       snprintf(tb, sizeof(tb), "MEMUAT...");
-  else if (dur > 0)  snprintf(tb, sizeof(tb), "%u:%02u/%d:%02d",
-                              (unsigned)(el / 60), (unsigned)(el % 60), dur / 60, dur % 60);
-  else               snprintf(tb, sizeof(tb), "%u:%02u", (unsigned)(el / 60), (unsigned)(el % 60));
+  if (loading)      snprintf(tb, sizeof(tb), "MEMUAT...");
+  else if (dur > 0) snprintf(tb, sizeof(tb), "%u:%02u/%d:%02d",
+                             (unsigned)(el / 60), (unsigned)(el % 60), dur / 60, dur % 60);
+  else              snprintf(tb, sizeof(tb), "%u:%02u", (unsigned)(el / 60), (unsigned)(el % 60));
   gfxText(rx, 25, tb);
 
   // ikon: prev | play/pause | next
@@ -699,7 +727,7 @@ static void renderMusic() {
     gfxFillTriangle(icx - 4, icy - 6, icx - 4, icy + 6, icx + 5, icy);
   }
 
-  // progress bar: jalur titik-titik + bagian terisi + penanda bulat
+  // progress bar
   const int barY = 59;
   float frac = (dur > 0) ? (float)el / (float)dur : 0.0f;
   if (frac > 1.0f) frac = 1.0f;
