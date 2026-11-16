@@ -1,6 +1,6 @@
 /*
   ============================================================================
-   OJOL ASSISTEN (ABOT) V3.51.0 — VOICE AI CHATBOT + LAYAR DINAMIS + MUSIK
+   OJOL ASSISTEN (ABOT) V3.51.4 — VOICE AI CHATBOT + LAYAR DINAMIS + MUSIK
   ============================================================================
    Fungsi    : Display navigasi + AI companion + voice chat + Music Player
    Target    : ESP32-S3 + OLED SSD1306 128x64 (I2C)
@@ -8,9 +8,29 @@
    Link      : JSON lines via Serial / MQTT (dari HP driver)
    Audio     : Mic INMP441 (i2s_std, port 0) + Speaker MAX98357A (audioI2S, port 1)
    Voice AI  : Groq Whisper (STT) + Groq GPT-OSS (LLM) + Google Translate TTS
-   Wajib     : secrets.h  ->  WIFI_SSID_STR, WIFI_PASS_STR, GROQ_API_KEY_STR, JAMENDO_CLIENT_ID_STR
+   Kredensial: disimpan di NVS, diisi lewat Serial 115200 (TIDAK ada di source/binary):
+               SET ssid=...  |  SET pass=...  |  SET groq=gsk_...  |  SET auth=...
+               CFG?  |  CFG CLEAR
    Library   : U8g2, FluxGarage RoboEyes, ArduinoJson (v7), PubSubClient,
                ESP32-audioI2S
+
+   V3.51.4 PERUBAHAN:
+     • Layar OLED menampilkan progress saat OTA (sebelumnya beku/kosong).
+     • Mata siang hari (jam 11-16) sekarang MARAH (EYE_ANGRY).
+     • Status OTA "pending" di NVS hanya dibersihkan kalau OTA gagal SEBELUM
+       Update.end(true) (flag `flashed`), supaya tidak false "rolled_back".
+     • Kredensial (Groq key, WiFi, auth token) di NVS; secrets.h tidak dipakai.
+     • AUTH_TOKEN tidak lagi hardcoded di source.
+     • ota_start dari MQTT (aplikasi HP) harus DIKONFIRMASI tombol di perangkat:
+       ACTION = ya, TALK = batal, kedaluwarsa 45 detik. Dari Serial (kabel)
+       langsung jalan. URL firmware dibatasi ke repo GitHub sendiri.
+     • ota_cancel dari aplikasi benar-benar membatalkan unduhan yang berjalan.
+     • Tombol dikunci selama OTA; cek heap tidak me-restart saat OTA;
+       stack OtaTask 16 KB (TLS).
+     • Topik MQTT bisa diganti lewat Serial: SET topic=<basis>. Default (publik
+       di GitHub) tetap dipakai kalau belum diatur. Ganti juga di aplikasi HP.
+     • startOTAUpdate menolak SHA256 yang bukan 64 karakter (lapis kedua).
+     • Progress OTA 1% pertama dikirim ke HP supaya tidak terlihat macet.
 
    V3.51.0 PERUBAHAN:
      • OTA BENERAN (bukan simulasi): download firmware dari URL, verify SHA256.
@@ -61,14 +81,16 @@ enum DestinationStage : unsigned char;
 #include <Preferences.h>
 #include <esp_ota_ops.h>
 
-#include "secrets.h"
+// CATATAN KEAMANAN: secrets.h TIDAK di-include lagi. Key Groq, WiFi, dan auth
+// token dibaca dari NVS (diisi lewat serial, lihat cfgHandleLine). Jangan
+// menaruh kredensial di source atau binary.
 #include <FluxGarage_RoboEyes.h>
 #include "bitmaps.h"
 
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.51.2"
+#define FW_VERSION "3.51.5"
 
 #define OTA_SIMULATION_MODE 0
 
@@ -99,6 +121,34 @@ struct VoiceAct {
 // ---------------------------------------------------------------------------
 void linkSend(const String& json);
 extern TaskHandle_t voiceTaskHandle;
+
+// ---------------------------------------------------------------------------
+// Kredensial runtime (dari NVS, namespace "cfg")
+// ---------------------------------------------------------------------------
+String cfgGroqKey = "";
+String cfgWifiSsid = "";
+String cfgWifiPass = "";
+String cfgAuthToken = "";
+String cfgTopic = "";  // basis topik MQTT, kosong = default
+volatile bool cfgWifiChanged = false;
+
+void cfgLoad() {
+  Preferences p;
+  p.begin("cfg", true);
+  cfgGroqKey   = p.getString("groq", "");
+  cfgWifiSsid  = p.getString("ssid", "");
+  cfgWifiPass  = p.getString("pass", "");
+  cfgAuthToken = p.getString("auth", "");
+  cfgTopic     = p.getString("topic", "");
+  p.end();
+}
+
+// Perintah serial (TIDAK diterima dari MQTT):
+//   SET groq=gsk_xxx | SET ssid=NamaWiFi | SET pass=PasswordWiFi | SET auth=token
+//   CFG?  -> tampilkan status (nilai rahasia disamarkan)
+//   CFG CLEAR -> hapus semua kredensial
+// Nilai rahasia sengaja tidak pernah dicetak ulang ke Serial/MQTT.
+void cfgHandleLine(String line);
 
 // ---------------------------------------------------------------------------
 // MultiPartStream
@@ -184,9 +234,6 @@ constexpr int MIC_GAIN = 8;
 constexpr int REC_SECONDS_PSRAM = 20;
 constexpr int REC_SECONDS_HEAP = 2;
 
-#ifndef GROQ_API_KEY_STR
-#error "GROQ_API_KEY_STR wajib ada di secrets.h (ambil gratis di console.groq.com/keys)"
-#endif
 const char* GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const char* GROQ_STT_MODEL = "whisper-large-v3-turbo";
 const char* GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -336,7 +383,7 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
   }
 
   String auth = "Bearer ";
-  auth += GROQ_API_KEY_STR;
+  auth += cfgGroqKey;
   http.addHeader("Authorization", auth);
   http.addHeader("Content-Type",
                  "multipart/form-data; boundary=" + boundary);
@@ -437,7 +484,7 @@ static bool speakChunk(const String& s) {
   }
   const unsigned long t0 = millis();
   bool started = false;
-  while (millis() - t0 < 25000) {
+  while (millis() - t0 < 35000) {
     audioI2S.loop();
     if (audioI2S.isRunning()) started = true;
     if (ttsEof) break;
@@ -480,6 +527,8 @@ static bool speakText(const String& text) {
     }
     if (speakChunk(parts[i])) ok = true;
   }
+
+  vTaskDelay(pdMS_TO_TICKS(500));
 
   {
     StateLock lock;
@@ -805,13 +854,6 @@ struct WeatherData {
 // ===========================================================================
 //  KONFIGURASI JARINGAN
 // ===========================================================================
-#ifndef WIFI_SSID_STR
-#define WIFI_SSID_STR "Imam"
-#define WIFI_PASS_STR "12345678"
-#endif
-const char* WIFI_SSID = WIFI_SSID_STR;
-const char* WIFI_PASSWORD = WIFI_PASS_STR;
-
 #define HOME_CITY "Medan"
 #define HOME_LAT "3.5952"
 #define HOME_LON "98.6722"
@@ -824,12 +866,12 @@ const char* WEATHER_URL =
 
 const char* MQTT_HOST = "broker.emqx.io";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC_COMMAND = "abot/wokwi/477375325542330369/v337/command";
-const char* MQTT_TOPIC_STATUS = "abot/wokwi/477375325542330369/v337/status";
+// Default ini ada di GitHub (publik). Ganti dengan: SET topic=<basis rahasia>
+const char* MQTT_TOPIC_BASE_DEFAULT = "abot/wokwi/477375325542330369/v337";
+char MQTT_TOPIC_COMMAND[112] = "abot/wokwi/477375325542330369/v337/command";
+char MQTT_TOPIC_STATUS[112] = "abot/wokwi/477375325542330369/v337/status";
 const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
 const size_t MQTT_PACKET_BUFFER_SIZE = 10000;
-
-const char* AUTH_TOKEN = "abot-secret-2025";
 
 // ===========================================================================
 //  KONFIGURASI TIMING
@@ -1088,6 +1130,9 @@ bool isAuthorized = false;
 bool linkEnabled = true;
 bool linkRouteReceived = false;
 bool hpConnected = false;
+// true saat linkDispatchLine dipanggil dari jalur MQTT (bukan Serial).
+// Dipakai untuk menolak ota_start dari MQTT (hanya boleh via Serial).
+bool dispatchFromMqtt = false;
 unsigned long lastLinkMessageAt = 0;
 unsigned long lastGpsMsgAt = 0;
 unsigned long lastRouteMsgAt = 0;
@@ -1104,6 +1149,30 @@ float speedLastDist = 0;
 unsigned long drLastMs = 0;
 
 bool otaActive = false;
+// Progress OTA untuk layar OLED (ditulis OtaTask, dibaca DisplayTask)
+volatile int otaProgress = 0;   // 0..100
+volatile int otaStageIdx = 0;   // 0=unduh 1=verifikasi 2=pasang 3=selesai 4=gagal
+
+// --- Konfirmasi OTA: perintah dari MQTT harus disetujui lewat tombol ---
+const unsigned long OTA_CONFIRM_TIMEOUT_MS = 45000UL;
+// Hanya URL firmware di repo milik sendiri yang diterima (huruf besar/kecil bebas).
+const char* const OTA_URL_PREFIXES[] = {
+  "https://github.com/kambingalam/AbotDevices/releases/download/",
+  "https://github.com/kambingalam/AbotDevices/releases/latest/download/",
+  "https://raw.githubusercontent.com/kambingalam/AbotDevices/"
+};
+bool otaConfirmActive = false;
+unsigned long otaConfirmUntil = 0;
+unsigned long otaConfirmStartedAt = 0;
+String otaPendUrl = "";
+String otaPendId = "";
+String otaPendVer = "";
+String otaPendSha = "";
+volatile bool otaLaunched = false;         // task OTA sudah dibuat (tutup race ota_start ganda)
+volatile bool otaCancelRequested = false;  // diset ota_cancel, dicek di loop unduh
+static inline bool otaUiLocked() {
+  return otaConfirmActive || otaActive || otaLaunched;
+}
 
 Preferences otaPrefs;
 bool pendingOtaVerification = false;
@@ -1454,10 +1523,9 @@ void flushLogRing() {
     logRingCount = 0;
     logRingHead = 0;
   }
-    for (int i = 0; i < count; i++) {
+  for (int i = 0; i < count; i++) {
     String out = "{\"t\":\"log\",\"l\":\"" + jsonEscape(String(lines[i])) + "\"}";
-    
-    // Tambahkan palang pintu di sini
+
     if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
       mqttClient.publish(MQTT_TOPIC_STATUS, out.c_str());
       xSemaphoreGive(mqttMutex);
@@ -1572,7 +1640,7 @@ static void groqEnsureModel(bool force = false) {
   http.setTimeout(8000);
   if (!http.begin(client, GROQ_MODELS_URL)) return;
   String auth = "Bearer ";
-  auth += GROQ_API_KEY_STR;
+  auth += cfgGroqKey;
   http.addHeader("Authorization", auth);
   int code = http.GET();
   Serial.printf("[MODELS] HTTP %d\n", code);
@@ -1714,9 +1782,10 @@ static String buildSystemPrompt(const String& extra) {
        "query: judul lagu atau nama artis kalau pengguna menyebutnya, selain itu kosongkan.\n"
        "genre: tag musik Jamendo huruf kecil bahasa Inggris (pop, rock, lofi, chillout, lounge, jazz, "
        "electronic, hiphop, classical, acoustic, ambient, relaxation, folk, reggae, blues, metal) "
-       "kalau pengguna minta suasana atau genre, selain itu kosongkan. Katalog Jamendo hanya berisi musik "
-       "bebas lisensi, bukan lagu populer. Kalau diminta lagu populer, tetap show=music dengan genre "
-       "terdekat dan jelaskan singkat di say.\n"
+       "kalau pengguna minta suasana atau genre, selain itu kosongkan. Katalog musik ini hanya berisi musik "
+       "bebas lisensi, bukan lagu artis populer seperti di Spotify. Jika pengguna meminta lagu artis populer, "
+       "KOSONGKAN field query, isi genre dengan genre terdekat, dan jelaskan di say bahwa lagu tersebut tidak ada "
+       "tapi kamu menawarkan lagu dengan genre serupa.\n"
        "more: true kalau kamu sedang menceritakan cerita panjang dan masih ada bagian berikutnya, selain itu false.\n"
        "Cerita: kalau pengguna tidak menyebut panjang, ceritakan utuh dalam satu balasan (more=false). "
        "Kalau pengguna minta cerita panjang atau menyebut durasi, ceritakan bertahap: tiap balasan satu "
@@ -1758,7 +1827,7 @@ static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, Strin
   }
 
   String auth = "Bearer ";
-  auth += GROQ_API_KEY_STR;
+  auth += cfgGroqKey;
   http.addHeader("Authorization", auth);
   http.addHeader("Content-Type", "application/json");
 
@@ -2266,7 +2335,13 @@ static void storyContinue(const String& request, const VoiceAct& first) {
     if (ttsStop || speakAborted) break;
     told += " ";
     told += nxt.say;
+
+    if (histCount > 0) {
+      histBot[histCount - 1] = (told.length() > 1500) ? told.substring(told.length() - 1500) : told;
+    }
+
     more = nxt.more;
+
     voiceEmotion(moodFromString(nxt.mood));
     voiceTextMode(true);
     speakText(nxt.say);
@@ -2464,8 +2539,7 @@ void mqttHeartbeat() {
            "{\"t\":\"hb\",\"ver\":\"%s\",\"up\":%lu,\"heap\":%u,\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
            otaReportedVersion.c_str(), millis() / 1000UL,
            (unsigned)ESP.getFreeHeap(), routeReady ? 1 : 0, tripActive ? 1 : 0);
-           
-  // Tambahkan palang pintu di sini
+
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     mqttClient.publish(MQTT_TOPIC_STATUS, buf);
     xSemaphoreGive(mqttMutex);
@@ -2474,23 +2548,24 @@ void mqttHeartbeat() {
 
 void mqttUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
-  
+
   if (mqttClient.connected()) {
     if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
       mqttClient.loop();
       xSemaphoreGive(mqttMutex);
     }
-    
+
     if (mqttPendingDispatch.length() > 0) {
       String msg = mqttPendingDispatch;
       mqttPendingDispatch = "";
+      // Tandai bahwa baris ini datang dari MQTT, supaya ota_start bisa ditolak.
+      dispatchFromMqtt = true;
       linkDispatchLine(msg);
+      dispatchFromMqtt = false;
     }
     mqttHeartbeat();
     return;
   }
-  
-  // ... (sisa kode mqttUpdate di bawahnya biarkan sama)
 
   unsigned long now = millis();
   if (now - mqttLastReconnectAttempt < mqttBackoffMs) return;
@@ -2533,7 +2608,7 @@ void linkBegin() {
 void linkSend(const String& json) {
   Serial.print("[HP] ");
   Serial.println(json);
-  
+
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     if (mqttClient.connected()) {
       bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
@@ -2564,7 +2639,10 @@ void linkUpdate() {
         continue;
       }
       buffer.trim();
-      if (buffer.length() > 0) linkDispatchLine(buffer);
+      if (buffer.length() > 0) {
+        dispatchFromMqtt = false;  // serial path
+        linkDispatchLine(buffer);
+      }
       buffer = "";
       continue;
     }
@@ -2577,7 +2655,211 @@ void linkUpdate() {
   }
 }
 
+// ===========================================================================
+//  OTA: validasi + konfirmasi tombol + peluncuran task
+// ===========================================================================
+static bool otaUrlAllowed(const String& url) {
+  if (url.length() < 20 || url.length() > 300) return false;
+  if (url.indexOf("..") >= 0 || url.indexOf('@') >= 0) return false;
+  String u = url;
+  u.toLowerCase();
+  for (const char* p : OTA_URL_PREFIXES) {
+    String pre = String(p);
+    pre.toLowerCase();
+    if (u.startsWith(pre)) return true;
+  }
+  return false;
+}
+
+static bool otaSha256Valid(const char* s) {
+  if (!s || strlen(s) != 64) return false;
+  for (int i = 0; i < 64; i++) {
+    if (!isxdigit((unsigned char)s[i])) return false;
+  }
+  return true;
+}
+
+static void otaSendErr(const String& id, const char* code, const char* msg) {
+  linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + jsonEscape(id) + "\",\"code\":\"" + code + "\",\"message\":\"" + jsonEscape(String(msg)) + "\"}");
+}
+
+// Membuat task OTA (stack 16 KB karena TLS). Dipanggil di bawah StateLock.
+static void otaLaunch(const String& url, const String& id, const String& ver, const String& sha) {
+  struct OtaParams {
+    String url;
+    String id;
+    String ver;
+    String sha;
+  };
+  OtaParams* params = new OtaParams{ url, id, ver, sha };
+  otaCancelRequested = false;
+  otaLaunched = true;
+  markUserActivity();
+
+  BaseType_t r = xTaskCreatePinnedToCore([](void* pv) {
+    OtaParams* p = (OtaParams*)pv;
+    startOTAUpdate(p->url, p->id, p->ver, p->sha);
+    delete p;
+    otaLaunched = false;  // hanya tercapai kalau OTA gagal (sukses = restart)
+    vTaskDelete(NULL);
+  },
+                                         "OtaTask", 16384, params, 1, NULL, 0);
+  if (r != pdPASS) {
+    delete params;
+    otaLaunched = false;
+    otaSendErr(id, "no_memory", "Gagal membuat task OTA");
+  }
+}
+
+static void otaConfirmCancel(const char* why) {
+  if (!otaConfirmActive) return;
+  otaConfirmActive = false;
+  otaSendErr(otaPendId, "cancelled", why);
+  abotLog("INFO", "OTA batal: %s", why);
+}
+
+static void otaConfirmAccept() {
+  if (!otaConfirmActive) return;
+  otaConfirmActive = false;
+  if (voicePipelineActive || listeningActive || musicState != MUS_STOPPED || otaActive || otaLaunched) {
+    otaSendErr(otaPendId, "busy", "Perangkat sedang sibuk");
+    return;
+  }
+  abotLog("INFO", "OTA dikonfirmasi lewat tombol");
+  otaLaunch(otaPendUrl, otaPendId, otaPendVer, otaPendSha);
+}
+
+static void updateOtaConfirm() {
+  if (otaConfirmActive && (long)(millis() - otaConfirmUntil) >= 0) {
+    otaConfirmCancel("Tidak dikonfirmasi di perangkat");
+  }
+}
+
+void cfgApplyTopic() {
+  const char* base = cfgTopic.length() ? cfgTopic.c_str() : MQTT_TOPIC_BASE_DEFAULT;
+  snprintf(MQTT_TOPIC_COMMAND, sizeof(MQTT_TOPIC_COMMAND), "%s/command", base);
+  snprintf(MQTT_TOPIC_STATUS, sizeof(MQTT_TOPIC_STATUS), "%s/status", base);
+}
+
+// Terapkan topik baru: putuskan MQTT, mqttUpdate() akan menyambung + subscribe ulang.
+static void mqttApplyTopicNow() {
+  cfgApplyTopic();
+  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (mqttClient.connected()) mqttClient.disconnect();
+    xSemaphoreGive(mqttMutex);
+  }
+  mqttLastReconnectAttempt = 0;
+  mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
+}
+
+void cfgHandleLine(String line) {
+  line.trim();
+
+  if (line == "CFG?") {
+    Serial.printf("[CFG] groq=%s (len %u) | ssid=%s | pass=%s | auth=%s | topic=%s\n",
+                  cfgGroqKey.length() ? "OK" : "KOSONG", (unsigned)cfgGroqKey.length(),
+                  cfgWifiSsid.length() ? cfgWifiSsid.c_str() : "KOSONG",
+                  cfgWifiPass.length() ? "OK" : "KOSONG",
+                  cfgAuthToken.length() ? "OK" : "KOSONG",
+                  cfgTopic.length() ? "CUSTOM" : "DEFAULT (publik di GitHub!)");
+    return;
+  }
+
+  if (line == "CFG CLEAR") {
+    Preferences p;
+    p.begin("cfg", false);
+    p.clear();
+    p.end();
+    cfgGroqKey = "";
+    cfgWifiSsid = "";
+    cfgWifiPass = "";
+    cfgAuthToken = "";
+    cfgTopic = "";
+    cfgWifiChanged = true;
+    modelChecked = false;
+    mqttApplyTopicNow();
+    Serial.println("[CFG] Semua kredensial dihapus");
+    return;
+  }
+
+  // SET <kunci>=<nilai>
+  int eq = line.indexOf('=');
+  if (!line.startsWith("SET ") || eq < 5) {
+    Serial.println("[CFG] Format: SET groq=... | SET ssid=... | SET pass=... | SET auth=... | SET topic=... | CFG? | CFG CLEAR");
+    return;
+  }
+  String k = line.substring(4, eq);
+  String v = line.substring(eq + 1);
+  k.trim();
+  k.toLowerCase();
+  v.trim();
+
+  if (v.length() == 0 || v.length() > 200) {
+    Serial.println("[CFG] Nilai kosong atau terlalu panjang");
+    return;
+  }
+
+  bool topicChanged = false;
+  Preferences p;
+  p.begin("cfg", false);
+  if (k == "groq") {
+    if (!v.startsWith("gsk_")) {
+      p.end();
+      Serial.println("[CFG] Key Groq harus diawali gsk_");
+      return;
+    }
+    p.putString("groq", v);
+    cfgGroqKey = v;
+    modelChecked = false;
+    Serial.println("[CFG] Key Groq tersimpan");
+  } else if (k == "ssid") {
+    p.putString("ssid", v);
+    cfgWifiSsid = v;
+    cfgWifiChanged = true;
+    Serial.println("[CFG] SSID tersimpan");
+  } else if (k == "pass") {
+    p.putString("pass", v);
+    cfgWifiPass = v;
+    cfgWifiChanged = true;
+    Serial.println("[CFG] Password WiFi tersimpan");
+  } else if (k == "auth") {
+    p.putString("auth", v);
+    cfgAuthToken = v;
+    Serial.println("[CFG] Auth token tersimpan");
+  } else if (k == "topic") {
+    bool okT = (v.length() >= 8 && v.length() <= 80 && v[0] != '/' && v[v.length() - 1] != '/');
+    for (size_t i = 0; okT && i < v.length(); i++) {
+      const char c = v[i];
+      okT = isalnum((unsigned char)c) || c == '/' || c == '_' || c == '-';
+    }
+    if (!okT) {
+      Serial.println("[CFG] Topik: 8-80 karakter (huruf, angka, _ - /), tanpa / di awal atau akhir");
+    } else {
+      p.putString("topic", v);
+      cfgTopic = v;
+      topicChanged = true;
+      Serial.println("[CFG] Topik MQTT tersimpan. Samakan dengan pengaturan di aplikasi HP.");
+    }
+  } else {
+    Serial.println("[CFG] Kunci tidak dikenal (groq / ssid / pass / auth / topic)");
+  }
+  p.end();
+  if (topicChanged) mqttApplyTopicNow();
+
+  // Terapkan WiFi baru: putuskan, ensureWiFiConnected() akan menyambung ulang
+  if (cfgWifiChanged && cfgWifiSsid.length() > 0) {
+    cfgWifiChanged = false;
+    lastWiFiAttempt = 0;
+    WiFi.disconnect();
+  }
+}
+
 void linkDispatchLine(const String& line) {
+  // Provisioning hanya lewat Serial; jalur MQTT selalu berupa JSON ('{').
+  if (line.startsWith("SET ") || line == "CFG?" || line == "CFG CLEAR") {
+    cfgHandleLine(line);
+    return;
+  }
   if (line[0] != '{') {
     if (line.length() == 1) {
       StateLock lock;
@@ -2603,7 +2885,13 @@ void linkDispatchLine(const String& line) {
 
   if (strcmp(t, "auth") == 0) {
     const char* token = doc["token"] | "";
-    if (strcmp(token, AUTH_TOKEN) == 0) {
+    if (cfgAuthToken.length() == 0) {
+      isAuthorized = false;
+      abotLog("WARN", "AUTH GAGAL. Token belum diatur di NVS. Gunakan SET auth=... via Serial.");
+      linkSend("{\"t\":\"auth_fail\",\"why\":\"no_token_configured\"}");
+      return;
+    }
+    if (strcmp(token, cfgAuthToken.c_str()) == 0) {
       isAuthorized = true;
       hpConnected = true;
       abotLog("INFO", "AUTH OK. HP terhubung & diotorisasi.");
@@ -2637,47 +2925,70 @@ void linkDispatchLine(const String& line) {
   else if (strcmp(t, "reset") == 0) onLinkReset();
   else if (strcmp(t, "ping") == 0) onLinkPing();
   else if (strcmp(t, "ota_start") == 0) {
-    const char* requestId = doc["id"] | "";
+    const String rid = String((const char*)(doc["id"] | ""));
     const char* targetVersion = doc["ver"] | "";
     const char* firmwareUrl = doc["url"] | "";
     const char* firmwareSha = doc["sha256"] | "";
 
-    // 1. Wajibkan SHA256 (Keamanan)
-    if (strlen(firmwareSha) != 64) {
-      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"bad_hash\",\"message\":\"sha256 wajib 64 karakter\"}");
+    if (!otaSha256Valid(firmwareSha)) {
+      otaSendErr(rid, "bad_hash", "sha256 wajib 64 karakter hex");
       return;
     }
-
-    // 2. Guard: Jangan OTA kalau sedang sibuk (Musik/Rekam)
-    if (voicePipelineActive || listeningActive || musicState != MUS_STOPPED) {
-      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"busy\",\"message\":\"Selesaikan aktivitas saat ini\"}");
+    if (strlen(targetVersion) > 16) {
+      otaSendErr(rid, "manifest_invalid", "versi terlalu panjang");
       return;
     }
-
     if (strlen(firmwareUrl) == 0) {
-      linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"manifest_invalid\",\"message\":\"URL kosong\"}");
-    } else {
-      // 3. Jalankan OTA di Task Terpisah agar layar & MQTT tidak freeze
-      struct OtaParams {
-        String url;
-        String id;
-        String ver;
-        String sha;
-      };
-      OtaParams* params = new OtaParams{ String(firmwareUrl), String(requestId), String(targetVersion), String(firmwareSha) };
-
-      xTaskCreatePinnedToCore([](void* pv) {
-        OtaParams* p = (OtaParams*)pv;
-        startOTAUpdate(p->url, p->id, p->ver, p->sha);
-        delete p;
-        vTaskDelete(NULL);
-      },
-                              "OtaTask", 8192, params, 1, NULL, 0);
+      otaSendErr(rid, "manifest_invalid", "URL kosong");
+      return;
     }
+    // Hanya firmware dari repo sendiri (cegah firmware dari sumber lain).
+    if (!otaUrlAllowed(String(firmwareUrl))) {
+      Serial.printf("[OTA] URL ditolak: %s\n", firmwareUrl);
+      abotLog("WARN", "OTA ditolak: URL tidak diizinkan");
+      otaSendErr(rid, "url_denied", "URL firmware bukan dari repo yang diizinkan");
+      return;
+    }
+    if (otaActive || otaLaunched || otaConfirmActive) {
+      otaSendErr(rid, "busy", "OTA sudah berjalan atau menunggu konfirmasi");
+      return;
+    }
+    if (voicePipelineActive || listeningActive || musicState != MUS_STOPPED) {
+      otaSendErr(rid, "busy", "Selesaikan aktivitas saat ini");
+      return;
+    }
+
+    if (dispatchFromMqtt) {
+      // Perintah dari jaringan (broker publik): minta persetujuan fisik.
+      otaPendUrl = String(firmwareUrl);
+      otaPendId = rid;
+      otaPendVer = String(targetVersion);
+      otaPendSha = String(firmwareSha);
+      otaConfirmStartedAt = millis();
+      otaConfirmUntil = otaConfirmStartedAt + OTA_CONFIRM_TIMEOUT_MS;
+      otaConfirmActive = true;
+      markUserActivity();
+      sfxPlay(SFX_REPLY);
+      abotLog("INFO", "OTA menunggu konfirmasi tombol");
+      // Jaga agar aplikasi tetap menampilkan "sedang proses" selama menunggu.
+      linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + jsonEscape(rid) + "\",\"stage\":\"manifest\",\"progress\":0,\"message\":\"Tekan ACTION di perangkat untuk konfirmasi\"}");
+      return;
+    }
+    // Dari Serial (kabel USB): langsung jalan.
+    otaLaunch(String(firmwareUrl), rid, String(targetVersion), String(firmwareSha));
   } else if (strcmp(t, "ota_cancel") == 0) {
-    const char* requestId = doc["id"] | "";
-    String cancelMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"cancelled\",\"message\":\"OTA dibatalkan\"}";
-    linkSend(cancelMsg);
+    const String rid = String((const char*)(doc["id"] | ""));
+    if (otaConfirmActive) {
+      otaConfirmCancel("Dibatalkan dari aplikasi");
+    } else if (otaActive || otaLaunched) {
+      if (otaActive && otaStageIdx >= 2) {
+        otaSendErr(rid, "too_late", "Sudah tahap pemasangan, tidak bisa dibatalkan");
+      } else {
+        otaCancelRequested = true;  // task OTA yang mengirim ota_error "cancelled"
+      }
+    } else {
+      otaSendErr(rid, "cancelled", "OTA dibatalkan");
+    }
   } else if (strcmp(t, "vol") == 0) {
     if (!doc["v"].isNull()) audioSetVolume(doc["v"].as<int>());
     char volBuf[64];
@@ -2714,7 +3025,10 @@ void startOTAUpdate(const String& url, const String& requestId,
     return;
   }
 
+  otaProgress = 0;
+  otaStageIdx = 0;
   otaActive = true;
+  markUserActivity();
   String effectiveTarget = targetVersion.length() ? targetVersion : otaReportedVersion;
   String accepted = String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId + "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}";
   linkSend(accepted);
@@ -2724,23 +3038,15 @@ void startOTAUpdate(const String& url, const String& requestId,
   const int stageProgress[] = { 100, 100, 25, 75, 100 };
 
   for (int i = 0; i < 5; i++) {
-    beginFrame();
-    drawCenteredText("SIMULASI OTA", 12, 1);
-    drawCenteredText(String(stageProgress[i]) + "%", 32, 2);
-    drawCenteredText(stages[i], 52, 1);
-    presentFrame();
-
-    String progressMsg = String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"" + stages[i] + "\",\"progress\":" + String(stageProgress[i]) + ",\"sim\":true}";
-    linkSend(progressMsg);
+    otaProgress = stageProgress[i];
+    otaStageIdx = (i >= 3) ? 2 : (i == 2 ? 1 : 0);
+    linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"" + stages[i] + "\",\"progress\":" + String(stageProgress[i]) + ",\"sim\":true}");
     delay(i < 2 ? 300 : 500);
   }
 
   otaReportedVersion = effectiveTarget;
-  beginFrame();
-  drawCenteredText("OTA SIMULASI", 18, 1);
-  drawCenteredText("SELESAI", 38, 2);
-  presentFrame();
-
+  otaProgress = 100;
+  otaStageIdx = 3;
   linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId + "\",\"to\":\"" + effectiveTarget + "\",\"sim\":true}");
   delay(900);
   linkSend(String("{\"t\":\"ota_result\",\"id\":\"") + requestId + "\",\"ok\":true,\"ver\":\"" + effectiveTarget + "\",\"sim\":true}");
@@ -2750,6 +3056,10 @@ void startOTAUpdate(const String& url, const String& requestId,
   return;
 #else
   // ---------- OTA BENERAN ----------
+  if (expectedSha256.length() != 64) {
+    linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + jsonEscape(requestId) + "\",\"code\":\"bad_hash\",\"message\":\"sha256 wajib 64 karakter\"}");
+    return;
+  }
   if (url.length() == 0) {
     linkSend(String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"manifest_invalid\",\"message\":\"URL kosong\"}");
     return;
@@ -2763,28 +3073,52 @@ void startOTAUpdate(const String& url, const String& requestId,
     return;
   }
 
+  // Layar OLED langsung beralih ke tampilan progress OTA
+  otaProgress = 0;
+  otaStageIdx = 0;
   otaActive = true;
+  {
+    StateLock lock;
+    markUserActivity();  // bangunkan dari sleep mode, state tidur bersih
+  }
   const String effectiveTarget =
     targetVersion.length() ? targetVersion : otaReportedVersion;
-  
+
   abotLog("INFO", "OTA mulai: %s -> %s", otaReportedVersion.c_str(),
           effectiveTarget.c_str());
-          
+
   // Simpan target versi ke NVS sebelum mulai
   otaPrefs.begin("ota", false);
   otaPrefs.putString("target", effectiveTarget);
   otaPrefs.putBool("pending", true);
   otaPrefs.end();
 
-  linkSend(String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId +
-           "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" +
-           effectiveTarget + "\"}");
+  linkSend(String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId + "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" + effectiveTarget + "\"}");
 
+  // flashed = true setelah Update.end(true) berhasil. Sebelum itu, kalau OTA
+  // gagal, aman untuk membersihkan pending (partisi belum di-swap, jadi tidak
+  // akan ada false "rolled_back" report).
+  bool flashed = false;
   auto sendError = [&](const char* code, const String& msg) {
     String errMsg = String("{\"t\":\"ota_error\",\"id\":\"") + requestId + "\",\"code\":\"" + code + "\"";
     if (msg.length() > 0) errMsg += ",\"message\":\"" + jsonEscape(msg) + "\"";
     errMsg += "}";
     linkSend(errMsg);
+
+    if (!flashed) {
+      // Belum sempat Update.end(true). Aman hapus pending supaya boot
+      // berikutnya tidak salah lapor "rollback".
+      otaPrefs.begin("ota", false);
+      otaPrefs.putBool("pending", false);
+      otaPrefs.end();
+    }
+    // Kalau sudah flashed, biarkan pending = true. Boot berikutnya akan
+    // verifikasi lewat loop() (30 detik).
+
+    Serial.printf("[OTA] sisa stack minimum: %u byte\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    // Tampilkan GAGAL di OLED sebentar sebelum layar kembali normal
+    otaStageIdx = 4;
+    delay(2500);
     otaActive = false;
   };
 
@@ -2837,7 +3171,15 @@ void startOTAUpdate(const String& url, const String& requestId,
   int lastProgress = -1;
 
   while (written < (size_t)contentLength) {
-    esp_task_wdt_reset();  // <--- TAMBAHKAN BARIS INI (Lapor WDT)
+    esp_task_wdt_reset();
+
+    if (otaCancelRequested) {
+      Update.abort();
+      mbedtls_sha256_free(&shaCtx);
+      http.end();
+      sendError("cancelled", "OTA dibatalkan dari aplikasi");
+      return;
+    }
 
     if (!http.connected()) break;
     size_t avail = stream->available();
@@ -2870,7 +3212,9 @@ void startOTAUpdate(const String& url, const String& requestId,
     written += readBytes;
 
     int progress = (int)((written * 100) / (size_t)contentLength);
-    if (progress / 5 != lastProgress / 5) {
+    otaProgress = progress;  // untuk layar OLED (halus, tiap iterasi)
+    // Kirim ke HP: progress 1% pertama + setiap kelipatan 5%.
+    if (progress == 1 || progress / 5 != lastProgress / 5) {
       lastProgress = progress;
       linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":" + String(progress) + "}");
     }
@@ -2888,9 +3232,11 @@ void startOTAUpdate(const String& url, const String& requestId,
     return;
   }
 
+  otaProgress = 100;
+  otaStageIdx = 1;  // VERIFIKASI
   linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"verify\",\"progress\":100}");
 
-  if (expectedSha256.length() > 0) {
+  {  // SHA256 selalu diverifikasi (panjangnya sudah dipastikan 64 di atas)
     String calcHex = "";
     char hexBuf[3];
     for (int i = 0; i < 32; i++) {
@@ -2907,24 +3253,35 @@ void startOTAUpdate(const String& url, const String& requestId,
     abotLog("INFO", "SHA256 cocok");
   }
 
+  if (otaCancelRequested) {
+    Update.abort();
+    sendError("cancelled", "OTA dibatalkan dari aplikasi");
+    return;
+  }
+
+  otaStageIdx = 2;  // MEMASANG
   linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"install\",\"progress\":100}");
 
   if (!Update.end(true)) {
     sendError("write_failed", Update.errorString());
     return;
   }
+  // Update.end(true) berhasil. Partisi sudah di-swap. Jangan clear pending.
+  flashed = true;
+
   if (!Update.isFinished()) {
     sendError("write_failed", "Update tidak selesai");
     return;
   }
 
+  otaStageIdx = 3;  // SELESAI
   abotLog("INFO", "OTA selesai, restart...");
-  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId +
-           "\",\"to\":\"" + effectiveTarget + "\"}");
+  Serial.printf("[OTA] sisa stack minimum: %u byte\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  linkSend(String("{\"t\":\"ota_done\",\"id\":\"") + requestId + "\",\"to\":\"" + effectiveTarget + "\"}");
   delay(1500);
-  
+
   // Matikan sementara watchdog sebelum restart agar tidak bentrok
-  esp_task_wdt_delete(NULL); 
+  esp_task_wdt_delete(NULL);
   ESP.restart();
 #endif
 }
@@ -3364,7 +3721,7 @@ String buildOsrmUrl(float fromLat, float fromLon, float toLat, float toLon) {
 const char* abotPersonalityName(AbotPersonality p) {
   switch (p) {
     case ABOT_MORNING: return "PAGI / SEMANGAT";
-    case ABOT_DAY: return "SIANG / LELAH";
+    case ABOT_DAY: return "SIANG / MARAH";
     case ABOT_AFTERNOON: return "SORE / LEMAS";
     case ABOT_NIGHT: return "MALAM / NGANTUK";
     default: return "NETRAL";
@@ -3381,7 +3738,7 @@ AbotPersonality abotPersonalityByHour(int hour) {
 EyeMood abotEyeFor(AbotPersonality p) {
   switch (p) {
     case ABOT_MORNING: return EYE_HAPPY;
-    case ABOT_DAY: return EYE_TIRED;
+    case ABOT_DAY: return EYE_ANGRY;  // siang: mata marah
     case ABOT_AFTERNOON: return EYE_TIRED;
     case ABOT_NIGHT: return EYE_TIRED;
     default: return EYE_DEFAULT;
@@ -3391,7 +3748,7 @@ EyeMood abotEyeFor(AbotPersonality p) {
 String abotPromptHint() {
   switch (currentAbotPersonality) {
     case ABOT_MORNING: return " Suasana pagi: nada kamu bersemangat dan ceria.";
-    case ABOT_DAY: return " Suasana siang: nada kamu agak lelah tapi tetap hangat.";
+    case ABOT_DAY: return " Suasana siang: nada kamu agak ketus dan pura-pura kesal karena panas, tapi tetap peduli dan hangat.";
     case ABOT_AFTERNOON: return " Suasana sore: nada kamu santai dan sedikit lemas tapi tetap ramah.";
     case ABOT_NIGHT: return " Suasana malam: nada kamu tenang dan sedikit mengantuk tapi tetap hangat.";
     default: return "";
@@ -3418,8 +3775,10 @@ void updateAbotPersonality() {
   if (currentEyeMood == desired) return;
   setEyeMood(desired);
   currentCharacterEmotion =
-    (desired == EYE_HAPPY) ? CHARACTER_HAPPY : (desired == EYE_TIRED) ? CHARACTER_TIRED
-                                                                      : CHARACTER_DEFAULT;
+    (desired == EYE_HAPPY)   ? CHARACTER_HAPPY
+    : (desired == EYE_ANGRY) ? CHARACTER_ANGRY
+    : (desired == EYE_TIRED) ? CHARACTER_TIRED
+                             : CHARACTER_DEFAULT;
 }
 
 void setEyeMood(EyeMood mood) {
@@ -3605,7 +3964,7 @@ void wakeFromSleep() {
 void updateSleepMode() {
   if (!introductionFinished) return;
   bool safeForSleep =
-    !bootTransitionActive && !listeningActive && !voicePipelineActive && !startupOnboardingActive && !destinationAskActive && !infoModeActive && !tripIntroActive && !companionGenerating && !companionActive && !companionNextMenuActive && !companionNextMenuPending && !conversationActive && systemState != STATE_THINKING && !mapRequested && !hudActive && !arrivalActive && !characterReactionActive && !otaActive && !musicScreenWanted();
+    !bootTransitionActive && !listeningActive && !voicePipelineActive && !startupOnboardingActive && !destinationAskActive && !infoModeActive && !tripIntroActive && !companionGenerating && !companionActive && !companionNextMenuActive && !companionNextMenuPending && !conversationActive && systemState != STATE_THINKING && !mapRequested && !hudActive && !arrivalActive && !characterReactionActive && !otaActive && !otaConfirmActive && !musicScreenWanted();
   if (!safeForSleep) {
     lastUserActivityMs = millis();
     if (sleepModeActive) wakeFromSleep();
@@ -3785,6 +4144,11 @@ void updateButtons() {
       sfxPlay(SFX_CLICK);
     } else {
       unsigned long held = now - talkPressedAt;
+      if (otaConfirmActive) {
+        otaConfirmCancel("Dibatalkan di perangkat");
+        return;
+      }
+      if (otaActive || otaLaunched) return;
       if (talkLongTriggered && listeningActive) stopListening();
       else if (!talkLongTriggered && held < BUTTON_HOLD_MS) {
         startInfoMode();
@@ -3792,7 +4156,7 @@ void updateButtons() {
     }
   }
 
-  if (talkStableState == LOW && !talkLongTriggered && now - talkPressedAt >= BUTTON_HOLD_MS) {
+  if (talkStableState == LOW && !talkLongTriggered && !otaUiLocked() && now - talkPressedAt >= BUTTON_HOLD_MS) {
     talkLongTriggered = true;
     startListening();
     Serial.println(listeningActive ? "[BUTTON TALK] HOLD CONFIRMED (rekam)"
@@ -3813,6 +4177,12 @@ void updateButtons() {
       sfxPlay(SFX_CLICK);
     } else {
       unsigned long held = now - actionPressedAt;
+      if (otaConfirmActive) {
+        // Hanya tekanan yang dimulai SETELAH layar konfirmasi muncul yang dihitung.
+        if (actionPressedAt >= otaConfirmStartedAt) otaConfirmAccept();
+        return;
+      }
+      if (otaActive || otaLaunched) return;
       if (listeningActive) return;
       if (held < BUTTON_HOLD_MS) startActionButtonFunction();
       else if (musicHasSession()) musicRequestPost(MCMD_NEXT, "", "");
@@ -3843,13 +4213,14 @@ void ensureWiFiConnected() {
   }
   if (millis() - lastWiFiAttempt < WIFI_RETRY_INTERVAL_MS) return;
   lastWiFiAttempt = millis();
+  if (cfgWifiSsid.length() == 0) return;  // belum diprovisioning
   Serial.println("[WIFI] Mencoba reconnect...");
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
 }
 
 void checkHeapHealth() {
-  if (voicePipelineActive || ttsActive) return;
+  if (voicePipelineActive || ttsActive || otaActive) return;
   if (millis() - lastHeapCheck < HEAP_CHECK_INTERVAL_MS) return;
   lastHeapCheck = millis();
   uint32_t freeHeap = ESP.getFreeHeap();
@@ -4998,7 +5369,7 @@ void networkTask(void* parameter) {
         http.addHeader("Content-Type", "application/json");
         http.addHeader("Accept", "application/json");
         String authorization = "Bearer ";
-        authorization += GROQ_API_KEY_STR;
+        authorization += cfgGroqKey;
         http.addHeader("Authorization", authorization);
 
         JsonDocument requestDoc;
@@ -5318,29 +5689,87 @@ void renderVoiceText() {
   gfxLine(12, 10, 115, 10);
 
   String text = stripNonAscii(currentTtsPart);
+  if (text.length() == 0) {
+    presentFrame();
+    return;
+  }
+
   const int maxChars = 21;
   const int len = text.length();
   int pos = 0, lines = 0, y = 13;
+
   while (pos < len && lines < 5) {
     int end = pos + maxChars;
-    if (end >= len) end = len;
-    else {
+    if (end >= len) {
+      end = len;
+    } else {
       int sp = text.lastIndexOf(' ', end);
       if (sp > pos) end = sp;
     }
+
     String line = text.substring(pos, end);
     line.trim();
-    gfxText(0, y, line);
-    y += 10;
-    lines++;
+
+    if (line.length() > 0) {
+      gfxText(0, y, line);
+      y += 10;
+      lines++;
+    }
+
     pos = end;
     while (pos < len && text[pos] == ' ') pos++;
   }
+
+  presentFrame();
+}
+
+// ===========================================================================
+//  LAYAR PROGRESS OTA
+// ===========================================================================
+void renderOta() {
+  static const char* STAGE_TEXT[] = { "MENGUNDUH", "VERIFIKASI", "MEMASANG",
+                                      "SELESAI - RESTART", "GAGAL" };
+  int st = otaStageIdx;
+  if (st < 0 || st > 4) st = 0;
+  int pct = otaProgress;
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+
+  beginFrame();
+  drawCenteredText("UPDATE FIRMWARE", 0, 1);
+  gfxLine(8, 10, 119, 10);
+  drawCenteredText(String(pct) + "%", 15, 2);
+  gfxFrame(8, 40, 112, 9);
+  gfxFillRect(10, 42, (108 * pct) / 100, 5);
+  drawCenteredText(STAGE_TEXT[st], 53, 1);
+  presentFrame();
+}
+
+void renderOtaConfirm() {
+  long leftMs = (long)(otaConfirmUntil - millis());
+  int left = (leftMs > 0) ? (int)(leftMs / 1000) : 0;
+  String v = stripNonAscii(otaPendVer);
+  if (v.length() > 9) v = v.substring(0, 9);
+  v = v.length() ? ("v" + v) : String("BARU");
+
+  beginFrame();
+  drawCenteredText("UPDATE FIRMWARE?", 0, 1);
+  gfxLine(8, 10, 119, 10);
+  drawCenteredText(v, 15, 2);
+  drawCenteredText("ACTION = YA", 40, 1);
+  drawCenteredText("TALK = BATAL (" + String(left) + "s)", 52, 1);
   presentFrame();
 }
 
 void updateDisplay() {
-  if (otaActive) return;
+  if (otaActive) {
+    renderOta();
+    return;
+  }
+  if (otaConfirmActive) {
+    renderOtaConfirm();
+    return;
+  }
   if (listeningActive) {
     renderListening();
     return;
@@ -5441,6 +5870,10 @@ void printHelp() {
   Serial.println("1-6 = preset mata | W = WINK | P/N/E = personality");
   Serial.println("R = RESET GPS | V = REKAM SUARA");
   Serial.println("+ / - = VOLUME | Z = MUTE");
+  Serial.println("PROVISIONING (Serial only, bukan MQTT):");
+  Serial.println("  SET ssid=NamaWiFi | SET pass=PasswordWiFi");
+  Serial.println("  SET groq=gsk_xxx | SET auth=tokenRahasia | SET topic=abot/acak123456");
+  Serial.println("  CFG?  |  CFG CLEAR");
   Serial.println("========================================");
 }
 
@@ -5658,6 +6091,29 @@ void setup() {
   pinMode(BUTTON_TALK, INPUT_PULLUP);
   pinMode(BUTTON_ACTION, INPUT_PULLUP);
 
+  cfgLoad();
+  cfgApplyTopic();
+  Serial.printf("[CFG] groq=%s ssid=%s pass=%s auth=%s\n",
+                cfgGroqKey.length() ? "OK" : "KOSONG",
+                cfgWifiSsid.length() ? "OK" : "KOSONG",
+                cfgWifiPass.length() ? "OK" : "KOSONG",
+                cfgAuthToken.length() ? "OK" : "KOSONG");
+  if (cfgGroqKey.length() == 0) {
+    Serial.println("[CFG] Key Groq belum diatur. Kirim lewat Serial: SET groq=gsk_...");
+  }
+  if (cfgWifiSsid.length() == 0) {
+    Serial.println("[CFG] SSID WiFi belum diatur. Kirim lewat Serial: SET ssid=...");
+  }
+  if (cfgAuthToken.length() == 0) {
+    Serial.println("[CFG] Auth token belum diatur. Kirim lewat Serial: SET auth=...");
+    Serial.println("[CFG] Tanpa auth token, HP tidak bisa connect ke perangkat.");
+  }
+  if (cfgTopic.length() == 0) {
+    Serial.println("[CFG] PERINGATAN: topik MQTT masih default (publik di GitHub).");
+    Serial.println("[CFG] Siapa pun bisa membaca status/transkrip dan melihat token auth.");
+    Serial.println("[CFG] Ganti: SET topic=abot/<acak-panjang>, lalu samakan di aplikasi HP.");
+  }
+
   sfxBegin();
 
   oledProbeAddress();
@@ -5684,11 +6140,15 @@ void setup() {
 
   systemState = STATE_WIFI_CONNECTING;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("[WIFI] Connecting...");
+  if (cfgWifiSsid.length() > 0) {
+    WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
+    Serial.println("[WIFI] Connecting...");
+  } else {
+    Serial.println("[CFG] WiFi belum diatur. Kirim lewat Serial: SET ssid=... lalu SET pass=...");
+  }
 
   unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED) {
+  while (cfgWifiSsid.length() > 0 && WiFi.status() != WL_CONNECTED) {
     renderWifiConnecting();
     delay(250);
     if (millis() - wifiStart > 20000) break;
@@ -5752,7 +6212,6 @@ void setup() {
   if (pendingOtaVerification) {
     Serial.printf("[OTA] Menunggu verifikasi untuk versi %s...\n", otaTargetVersion.c_str());
   }
-
 }
 
 void loop() {
@@ -5770,6 +6229,7 @@ void loop() {
     updateAbotPersonality();
     updateNaturalEyeBehavior();
     updateButtons();
+    updateOtaConfirm();
 
     if (hpConnected && lastLinkMessageAt > 0 && millis() - lastLinkMessageAt > LINK_TIMEOUT_MS) {
       hpConnected = false;
@@ -5825,13 +6285,13 @@ void loop() {
   linkReportStatus();
   delay(1);
 
-    // --- VERIFIKASI OTA SETELAH 30 DETIK BERJALAN NORMAL ---
+  // --- VERIFIKASI OTA SETELAH 30 DETIK BERJALAN NORMAL ---
   if (pendingOtaVerification && (millis() - bootTimeMs > 30000)) {
     pendingOtaVerification = false;
-    
+
     // Tandai firmware baru ini VALID (Batalkan rollback otomatis)
     esp_ota_mark_app_valid_cancel_rollback();
-    
+
     // Cek apakah versi yang dilaporkan cocok dengan target
     if (String(FW_VERSION) == otaTargetVersion) {
       linkSend(String("{\"t\":\"ota_result\",\"ok\":true,\"ver\":\"") + FW_VERSION + "\"}");
@@ -5846,6 +6306,4 @@ void loop() {
     otaPrefs.putBool("pending", false);
     otaPrefs.end();
   }
-
-
 }
