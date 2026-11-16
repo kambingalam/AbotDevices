@@ -86,6 +86,7 @@ enum DestinationStage : unsigned char;
 // menaruh kredensial di source atau binary.
 #include <FluxGarage_RoboEyes.h>
 #include "bitmaps.h"
+#include "certs.h"
 
 // ---------------------------------------------------------------------------
 // Build flags
@@ -369,7 +370,7 @@ static String groqSttRequest(const uint8_t* wav, size_t wavLen,
   MultiPartStream stream(head, wav, wavLen, tail);
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(ROOT_CA_BUNDLE);
   client.setTimeout(STT_TIMEOUT_MS / 1000);
 
   HTTPClient http;
@@ -865,7 +866,7 @@ const char* WEATHER_URL =
   "&timezone=Asia%2FJakarta";
 
 const char* MQTT_HOST = "broker.emqx.io";
-const uint16_t MQTT_PORT = 1883;
+const uint16_t MQTT_PORT = 8883;
 // Default ini ada di GitHub (publik). Ganti dengan: SET topic=<basis rahasia>
 const char* MQTT_TOPIC_BASE_DEFAULT = "abot/wokwi/477375325542330369/v337";
 char MQTT_TOPIC_COMMAND[112] = "abot/wokwi/477375325542330369/v337/command";
@@ -1120,7 +1121,7 @@ bool weatherViewCustom = false;
 bool weatherFetching = false;
 unsigned long lastWeatherAttempt = 0;
 
-WiFiClient mqttNetworkClient;
+WiFiClientSecure mqttNetworkClient;
 PubSubClient mqttClient(mqttNetworkClient);
 String mqttPendingDispatch = "";
 unsigned long mqttLastReconnectAttempt = 0;
@@ -1635,7 +1636,7 @@ static void groqEnsureModel(bool force = false) {
   lastTry = millis();
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(ROOT_CA_BUNDLE);
   HTTPClient http;
   http.setTimeout(8000);
   if (!http.begin(client, GROQ_MODELS_URL)) return;
@@ -1818,7 +1819,7 @@ static int groqPost(const String& model, bool jsonMode, JsonDocument& doc, Strin
   serializeJson(doc, payload);
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(ROOT_CA_BUNDLE);
   HTTPClient http;
   http.setTimeout(CHAT_TIMEOUT_MS);
   if (!http.begin(client, GROQ_CHAT_URL)) {
@@ -1997,7 +1998,7 @@ static bool fetchCityWeather(const String& city, String& outName, String& outSum
   double lat = 0, lon = 0;
   {
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setCACert(ROOT_CA_BUNDLE);
     HTTPClient http;
     http.setTimeout(8000);
     String url = String("https://geocoding-api.open-meteo.com/v1/search?count=1&language=id&format=json&name=")
@@ -2021,7 +2022,7 @@ static bool fetchCityWeather(const String& city, String& outName, String& outSum
   WeatherData w;
   {
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setCACert(ROOT_CA_BUNDLE);
     HTTPClient http;
     http.setTimeout(8000);
     String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + "&longitude=" + String(lon, 4) + "&current=temperature_2m,weather_code"
@@ -2507,6 +2508,7 @@ static void voiceTask(void* pv) {
 //  MQTT
 // ===========================================================================
 void mqttBegin() {
+  mqttNetworkClient.setCACert(ROOT_CA_BUNDLE);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setSocketTimeout(1);
@@ -3125,7 +3127,7 @@ void startOTAUpdate(const String& url, const String& requestId,
   linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":0}");
 
   WiFiClientSecure secureClient;
-  secureClient.setInsecure();
+  secureClient.setCACert(ROOT_CA_BUNDLE);
   WiFiClient plainClient;
 
   HTTPClient http;
@@ -5348,7 +5350,7 @@ void networkTask(void* parameter) {
       }
     } else if (job == NET_WEATHER) {
       WiFiClientSecure client;
-      client.setInsecure();
+      client.setCACert(ROOT_CA_BUNDLE);
       HTTPClient http;
       http.setTimeout(8000);
       if (http.begin(client, WEATHER_URL)) {
@@ -5361,7 +5363,7 @@ void networkTask(void* parameter) {
       }
     } else if (job == NET_NAVIGATION_AI || job == NET_COMPANION) {
       WiFiClientSecure client;
-      client.setInsecure();
+      client.setCACert(ROOT_CA_BUNDLE);
       HTTPClient http;
       http.setTimeout(CHAT_TIMEOUT_MS);
 
@@ -6287,23 +6289,23 @@ void loop() {
 
   // --- VERIFIKASI OTA SETELAH 30 DETIK BERJALAN NORMAL ---
   if (pendingOtaVerification && (millis() - bootTimeMs > 30000)) {
+    // Jangan tandai valid sebelum versi benar-benar cocok. Kalau tidak cocok,
+    // batalkan slot baru dan reboot ke firmware lama.
+    otaPrefs.begin("ota", false);
+    otaPrefs.putBool("pending", false);
+    otaPrefs.putString("target", "");
+    otaPrefs.end();
     pendingOtaVerification = false;
 
-    // Tandai firmware baru ini VALID (Batalkan rollback otomatis)
-    esp_ota_mark_app_valid_cancel_rollback();
-
-    // Cek apakah versi yang dilaporkan cocok dengan target
     if (String(FW_VERSION) == otaTargetVersion) {
+      esp_ota_mark_app_valid_cancel_rollback();
       linkSend(String("{\"t\":\"ota_result\",\"ok\":true,\"ver\":\"") + FW_VERSION + "\"}");
       abotLog("INFO", "OTA Sukses terverifikasi (v%s)", FW_VERSION);
     } else {
       linkSend(String("{\"t\":\"ota_result\",\"ok\":false,\"ver\":\"") + FW_VERSION + "\",\"rolled_back\":true}");
       abotLog("ERR", "OTA Gagal! Versi sekarang %s, target %s", FW_VERSION, otaTargetVersion.c_str());
+      delay(200);
+      esp_ota_mark_app_invalid_rollback_and_reboot();
     }
-
-    // Hapus status pending di NVS
-    otaPrefs.begin("ota", false);
-    otaPrefs.putBool("pending", false);
-    otaPrefs.end();
   }
 }
