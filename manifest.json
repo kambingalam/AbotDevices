@@ -3,7 +3,7 @@
   "device": "abot-esp32s3",
   "version": "3.51.5",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/v3.51.3/abot_3_51_3.ino.bin",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3.51.5/abot_3_51_4.ino.bin",
   "size": 2187184,
   "sha256": "acc5980340b3084056ac38e9a442b610df195ed37fdeac58e9480e25af104267",
   "min_battery": 30,
