@@ -152,7 +152,7 @@ static String musicResolveUrl(const String& url) {
   for (int hop = 0; hop < 3; hop++) {
     if (musicAbortFlag) break;
     WiFiClientSecure sclient;
-    sclient.setInsecure();
+    sclient.setCACert(ROOT_CA_BUNDLE);
     WiFiClient pclient;
     HTTPClient http;
     http.setTimeout(5000); // FIX: Diturunkan dari 8000ms agar tidak terlalu lama menunggu
@@ -192,7 +192,7 @@ static int musicFetchJamendo(const String& query, const String& genre) {
   Serial.printf("[MUSIC] Jamendo query='%s' genre='%s'\n", query.c_str(), genre.c_str());
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(ROOT_CA_BUNDLE);
   HTTPClient http;
   http.setTimeout(15000);
   if (!http.begin(client, url)) return -1;
@@ -267,7 +267,7 @@ static int musicFetchAudius(const String& query, const String& genre) {
   Serial.printf("[MUSIC] Audius URL: %s\n", url.c_str());
 
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(ROOT_CA_BUNDLE);
   HTTPClient http;
   http.setTimeout(15000);
   if (!http.begin(client, url)) return -1;

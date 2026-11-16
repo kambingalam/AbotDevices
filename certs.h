@@ -1,5 +1,5 @@
 #pragma once
-// Root CA bundle: GlobalSign R1 (Groq/GTS), USERTrust ECC (GitHub/Sectigo),
+// Root CA bundle: GlobalSign R1 (Groq/GTS, Jamendo/Audius), USERTrust ECC (GitHub/Sectigo),
 // DigiCert Global Root G2 (EMQX), ISRG Root X1 (GitHub raw/Open-Meteo).
 static const char ROOT_CA_BUNDLE[] PROGMEM = R"PEM(
 -----BEGIN CERTIFICATE-----
