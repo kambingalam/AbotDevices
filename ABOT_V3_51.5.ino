@@ -91,7 +91,7 @@ enum DestinationStage : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.51.5"
+#define FW_VERSION "3.51.6"
 
 #define OTA_SIMULATION_MODE 0
 
