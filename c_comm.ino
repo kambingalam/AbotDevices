@@ -353,7 +353,7 @@ void cfgHandleLine(String line) {
 }
 
 void linkDispatchLine(const String& line) {
-  // Provisioning hanya lewat Serial; jalur MQTT selalu berupa JSON ('{').
+  // Provisioning lewat Serial atau BLE (SET/CFG? dirutekan ke cfgHandleLine).
   if (line.startsWith("SET ") || line == "CFG?" || line == "CFG CLEAR") {
     cfgHandleLine(line);
     return;

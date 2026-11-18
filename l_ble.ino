@@ -42,8 +42,17 @@ class BleRxCallbacks : public BLECharacteristicCallbacks {
           bleRxBuffer = "";
           line.trim();
           if (line.length() > 0) {
-            dispatchFromMqtt = false;  // BLE bukan MQTT: ota_start boleh
-            linkDispatchLine(line);
+            // BLE bukan jalur tepercaya: SET/CFG hanya boleh kalau token belum
+            // diatur (provisioning pertama) atau HP sudah AUTH.
+            // shortcut: jendela provisioning pertama terbuka bagi siapa pun
+            // dalam jangkauan; tambah konfirmasi tombol kalau perlu.
+            const bool isCfg = line.startsWith("SET ") || line == "CFG?" || line == "CFG CLEAR";
+            if (isCfg && cfgAuthToken.length() > 0 && !isAuthorized) {
+              linkSend("{\"t\":\"nack\",\"why\":\"unauthorized\"}");
+            } else {
+              dispatchFromMqtt = false;  // BLE bukan MQTT: ota_start boleh
+              linkDispatchLine(line);
+            }
           }
         }
         continue;
