@@ -1,12 +1,14 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.51.6",
+  "version": "3.51.7",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3.51.6/ABOT_V3_51_6.ino.bin",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_51_7/ABOT_V3_51_7.ino.bin",
   "size": 2192672,
-  "sha256": "df7e6085a7d05521803d741d9b3ee1041131c378528814e6e9d11623ed4235fc",
+  "sha256": "816ba1cdd4a174ca05f6c653c62d96ae4ea2f12d30b3b565a96fa20d850b94e3",
   "min_battery": 30,
-  "released": "2026-11-13",
-  "notes": ["bug TTS,MUSIC,API KEY BARU GROQ,OTA NOSSCRETS.H"]
+  "released": "2026-11-18",
+  "notes": [
+    "refactor modular .ino + include Arduino.h per file"
+  ]
 }
