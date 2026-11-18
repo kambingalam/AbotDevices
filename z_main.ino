@@ -65,6 +65,7 @@ void setup() {
   audioBegin();
   linkBegin();
   mqttBegin();
+  bleBegin();
 
   systemState = STATE_WIFI_CONNECTING;
   WiFi.mode(WIFI_STA);

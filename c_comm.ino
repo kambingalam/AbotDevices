@@ -105,6 +105,7 @@ void linkBegin() {
 void linkSend(const String& json) {
   Serial.print("[HP] ");
   Serial.println(json);
+  bleSend(json);
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     if (mqttClient.connected()) {
