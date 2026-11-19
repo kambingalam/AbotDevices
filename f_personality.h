@@ -221,6 +221,7 @@ void enterSleepMode() {
   roboEyes.setAutoblinker(OFF, 0, 0);
   roboEyes.setIdleMode(OFF, 0, 0);
   roboEyes.close();
+  overlaySleep = true;
   naturalEyeGazeActive = false;
   naturalEyeNextActionAt = millis() + NATURAL_EYE_ACTION_INTERVAL_MS;
   Serial.println("[SLEEP] 20s idle -> SLEEP MODE");
@@ -236,6 +237,7 @@ void wakeFromSleep() {
   currentEyeMood = EYE_DEFAULT;
   roboEyes.setMood(DEFAULT);
   roboEyes.setPosition(DEFAULT);
+  overlaySleep = false;
   roboEyes.open();
   roboEyes.setAutoblinker(ON, 3, 2);
   roboEyes.setIdleMode(ON, 2, 1);
