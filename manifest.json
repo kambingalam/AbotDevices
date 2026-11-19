@@ -1,16 +1,16 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.52.0",
+  "version": "3.52.1",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52.0/ABOT_V3_52_0.ino.bin",
-  "size": 2432768,
-  "sha256": "08721a8cf6be0195a3cd8e15479febb07ffa344a3675f938e3c5be16b8bd300b",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_1/ABOT_V3_52_1.ino.bin",
+  "size": 2436192,
+  "sha256": "40ccda3a0a3bdbd88476248b695f5802e17b1903312dee0578eb4126d4a96b3b",
   "min_battery": 30,
   "released": "2026-11-19",
   "notes": [
-    "Musik dari link: play url, device unduh audio sendiri lewat WiFi",
-    "music_stop untuk hentikan pemutaran",
-    "OTA tetap lewat MQTT/TLS"
+    "OTA: redirect diikuti manual (max 4 hop), log hop/code/err/heap, fallback TLS tanpa CA (sha256 tetap dicek)",
+    "Animasi tidur z/zz/zzz naik + gelembung pecah",
+    "Musik dari link (play url) + music_stop"
   ]
 }
