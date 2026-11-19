@@ -1,16 +1,16 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.51.9",
+  "version": "3.52.0",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_51_9/ABOT_V3_51_9.ino.bin",
-  "size": 2431488,
-  "sha256": "da467b300caf3bd8e554379cb6ac9bdb4ebd816a5471c4e36f22f4f560196757",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52.0/ABOT_V3_52_0.ino.bin",
+  "size": 2432768,
+  "sha256": "08721a8cf6be0195a3cd8e15479febb07ffa344a3675f938e3c5be16b8bd300b",
   "min_battery": 30,
   "released": "2026-11-19",
   "notes": [
-    "BLE dilepas saat WiFi hidup: heap balik ~60 KB, MQTT/TLS normal",
-    "ping & status read-only tanpa AUTH",
-    "ota_start via BLE menunda unduhan sampai BLE lepas"
+    "Musik dari link: play url, device unduh audio sendiri lewat WiFi",
+    "music_stop untuk hentikan pemutaran",
+    "OTA tetap lewat MQTT/TLS"
   ]
 }
