@@ -1,14 +1,16 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.51.7",
+  "version": "3.51.8",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_51_7/ABOT_V3_51_7.ino.bin",
-  "size": 2192672,
-  "sha256": "816ba1cdd4a174ca05f6c653c62d96ae4ea2f12d30b3b565a96fa20d850b94e3",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_51_8/ABOT_V3_51_8.ino.bin",
+  "size": 2426816,
+  "sha256": "873306810b268d011da07aa47dacb82535f8a58341a268faf82306fee8dd028a",
   "min_battery": 30,
-  "released": "2026-11-18",
+  "released": "2026-11-19",
   "notes": [
-    "refactor modular .ino + include Arduino.h per file"
+    "satu .ino utama + modul .h (tanpa tab .ino)",
+    "BLE UART Nordic (ABOT-01) untuk config/debug offline",
+    "SET/CFG via BLE butuh auth bila token sudah diatur"
   ]
 }
