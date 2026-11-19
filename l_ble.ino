@@ -1,3 +1,4 @@
+// Tab .ino tidak boleh diawali preprocessor directive (bug ##line Arduino IDE).
 #include <Arduino.h>
 // ===========================================================================
 //  BLE UART (Nordic UART Service) — link cadangan tanpa WiFi
