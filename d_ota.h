@@ -123,7 +123,7 @@ void startOTAUpdate(const String& url, const String& requestId,
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   String target = url;
   int httpCode = -1;
-  int tlsErr = 0;
+  char tlsMsg[64] = {0};
   bool insecureTls = false;
 
   for (int attempt = 0; attempt < 2 && httpCode != 200; attempt++) {
@@ -153,9 +153,10 @@ void startOTAUpdate(const String& url, const String& requestId,
       }
 
       httpCode = http.GET();
-      tlsErr = secureClient ? secureClient->lastError() : 0;
-      abotLog("INFO", "OTA hop=%d code=%d err=%d heap=%u", hop, httpCode, tlsErr,
-              (unsigned)ESP.getFreeHeap());
+      tlsMsg[0] = 0;
+      if (secureClient) secureClient->lastError(tlsMsg, sizeof(tlsMsg));
+      abotLog("INFO", "OTA hop=%d code=%d err=%s heap=%u", hop, httpCode,
+              tlsMsg[0] ? tlsMsg : "-", (unsigned)ESP.getFreeHeap());
 
       if (httpCode != 301 && httpCode != 302 && httpCode != 303 &&
           httpCode != 307 && httpCode != 308) {
@@ -174,8 +175,9 @@ void startOTAUpdate(const String& url, const String& requestId,
   }
 
   if (httpCode != 200) {
-    sendError("download_failed", "HTTP " + String(httpCode) + " err " + String(tlsErr) +
-                                   " heap " + String(ESP.getFreeHeap()));
+    sendError("download_failed", "HTTP " + String(httpCode) + " err " +
+                                   String(tlsMsg[0] ? tlsMsg : "-") + " heap " +
+                                   String(ESP.getFreeHeap()));
     http.end();
     return;
   }
