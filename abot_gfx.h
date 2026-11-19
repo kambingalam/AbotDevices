@@ -213,35 +213,11 @@ private:
   }
 
   static void drawSleepOverlay() {
-    // z -> zz -> zzz naik, lalu gelembung pecah. 4 tahap, loop.
-    const unsigned long STAGE_MS = 1050;
-    const unsigned long t = millis() % (STAGE_MS * 4);
-    const int stage = (int)(t / STAGE_MS);
-    const int st = (int)(t % STAGE_MS);
-
-    const int x = 86 - stage * 6;
-    const int y = 44 - stage * 7 - (st * 5 / (int)STAGE_MS);
-
-    // kotak hitam biar z tidak tabrakan dengan mata
-    gfxFillRect(x - 5, y - 3, 34, 20, COLOR_BLACK);
-
-    if (stage < 3) {
-      const char* txt = (stage == 0) ? "z" : (stage == 1 ? "zz" : "zzz");
-      gfxRoundFrame(x - 5, y - 2, 12 + stage * 6, 13, 6, COLOR_WHITE);
-      gfxText(x, y, txt, 1, COLOR_WHITE);
-      gfxText(x + 17, y + 11, "z", 1, COLOR_WHITE);
-    } else {
-      const int grow = st * 6 / (int)STAGE_MS;
-      const int cx = x - 1;
-      const int cy = y + 4;
-      gfxRoundFrame(cx - 6 - grow, cy - 4 - grow, 12 + grow * 2, 9 + grow * 2,
-                    4, COLOR_WHITE);
-      gfxFillCircle(cx, cy, 1, COLOR_WHITE);
-      gfxPixel(cx - 9 - grow, cy - 6 - grow, COLOR_WHITE);
-      gfxPixel(cx + 9 + grow, cy - 6 - grow, COLOR_WHITE);
-      gfxPixel(cx - 9 - grow, cy + 6 + grow, COLOR_WHITE);
-      gfxPixel(cx + 9 + grow, cy + 6 + grow, COLOR_WHITE);
-    }
+    // z -> zz -> zzz, posisi tetap di pojok kanan atas. Mata ditutup roboEyes.close().
+    constexpr unsigned long STEP_MS = 1200;
+    const unsigned long t = millis() % (STEP_MS * 4);
+    const char* txt = t < STEP_MS ? "z" : (t < STEP_MS * 2 ? "zz" : "zzz");
+    gfxText(SCREEN_WIDTH - 21, 1, txt, 1, COLOR_WHITE);
   }
 
   static void drawThinkingOverlay() {
