@@ -403,7 +403,12 @@ String otaPendUrl = "";
 String otaPendId = "";
 String otaPendVer = "";
 String otaPendSha = "";
-volatile bool otaLaunched = false;         // task OTA sudah dibuat (tutup race ota_start ganda)
+volatile bool otaLaunched = false;
+// BLE harus dilepas sementara supaya TLS (MQTT/OTA) dapat RAM.
+volatile bool bleShutdownRequested = false;
+// ota_start dari BLE/Serial ditunda sampai BLE lepas (RAM untuk TLS).
+bool otaDeferPending = false;
+unsigned long otaDeferAt = 0;         // task OTA sudah dibuat (tutup race ota_start ganda)
 volatile bool otaCancelRequested = false;  // diset ota_cancel, dicek di loop unduh
 static inline bool otaUiLocked() {
   return otaConfirmActive || otaActive || otaLaunched;

@@ -148,6 +148,8 @@ void linkBegin();
 void linkUpdate();
 void bleBegin();
 void bleSend(const String& json);
+void bleUpdate();
+void bleShutdown();
 void linkDispatchLine(const String& line);
 void linkReportStatus();
 void mqttBegin();

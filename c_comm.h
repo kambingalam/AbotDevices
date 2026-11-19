@@ -234,6 +234,15 @@ static void updateOtaConfirm() {
   }
 }
 
+// ota_start dari BLE ditunda sampai BLE benar-benar lepas dan heap naik.
+static void updateOtaDeferred() {
+  if (!otaDeferPending) return;
+  if ((long)(millis() - otaDeferAt) < 0) return;
+  otaDeferPending = false;
+  abotLog("INFO", "OTA mulai, heap=%u", (unsigned)ESP.getFreeHeap());
+  otaLaunch(otaPendUrl, otaPendId, otaPendVer, otaPendSha);
+}
+
 void cfgApplyTopic() {
   const char* base = cfgTopic.length() ? cfgTopic.c_str() : MQTT_TOPIC_BASE_DEFAULT;
   snprintf(MQTT_TOPIC_COMMAND, sizeof(MQTT_TOPIC_COMMAND), "%s/command", base);
@@ -403,7 +412,9 @@ void linkDispatchLine(const String& line) {
     return;
   }
 
-  if (!isAuthorized) {
+  // ping/status read-only: dibutuhkan halaman BLE Diagnostic sebelum AUTH.
+  const bool isPublic = (strcmp(t, "ping") == 0) || (strcmp(t, "status") == 0);
+  if (!isAuthorized && !isPublic) {
     abotLog("WARN", "Perintah ditolak. Belum AUTH.");
     linkSend("{\"t\":\"nack\",\"why\":\"unauthorized\"}");
     return;
@@ -473,8 +484,15 @@ void linkDispatchLine(const String& line) {
       linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + jsonEscape(rid) + "\",\"stage\":\"manifest\",\"progress\":0,\"message\":\"Tekan ACTION di perangkat untuk konfirmasi\"}");
       return;
     }
-    // Dari Serial (kabel USB): langsung jalan.
-    otaLaunch(String(firmwareUrl), rid, String(targetVersion), String(firmwareSha));
+    // Dari Serial/BLE: langsung jalan, tapi BLE dilepas dulu (TLS butuh RAM).
+    otaPendUrl = String(firmwareUrl);
+    otaPendId = rid;
+    otaPendVer = String(targetVersion);
+    otaPendSha = String(firmwareSha);
+    otaDeferAt = millis() + 800;
+    otaDeferPending = true;
+    bleShutdownRequested = true;
+    linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + jsonEscape(rid) + "\",\"stage\":\"manifest\",\"progress\":0,\"message\":\"Melepas BLE, menyiapkan unduhan\"}");
   } else if (strcmp(t, "ota_cancel") == 0) {
     const String rid = String((const char*)(doc["id"] | ""));
     if (otaConfirmActive) {

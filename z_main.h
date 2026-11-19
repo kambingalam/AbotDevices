@@ -64,8 +64,7 @@ void setup() {
 
   audioBegin();
   linkBegin();
-  mqttBegin();
-  bleBegin();
+  mqttBegin();  // BLE start otomatis saat WiFi mati (bleUpdate)
 
   systemState = STATE_WIFI_CONNECTING;
   WiFi.mode(WIFI_STA);
@@ -148,6 +147,7 @@ void loop() {
   linkUpdate();
   mqttUpdate();
   ensureWiFiConnected();
+  bleUpdate();
   checkHeapHealth();
 
   sfxUpdate();
@@ -159,6 +159,7 @@ void loop() {
     updateNaturalEyeBehavior();
     updateButtons();
     updateOtaConfirm();
+    updateOtaDeferred();
 
     if (hpConnected && lastLinkMessageAt > 0 && millis() - lastLinkMessageAt > LINK_TIMEOUT_MS) {
       hpConnected = false;

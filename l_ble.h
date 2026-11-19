@@ -26,8 +26,9 @@ class BleServerCallbacks : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer* server) override {
     bleClientConnected = false;
-    Serial.println("[BLE] HP terputus, advertising lagi");
-    server->startAdvertising();
+    Serial.println("[BLE] HP terputus");
+    // Bisa terpanggil saat bleShutdown() menghancurkan server: jangan sentuh.
+    if (bleServer != nullptr && bleServer == server) server->startAdvertising();
   }
 };
 
@@ -85,7 +86,7 @@ void bleSend(const String& json) {
 }
 
 void bleBegin() {
-  bleMutex = xSemaphoreCreateMutex();
+  if (bleMutex == nullptr) bleMutex = xSemaphoreCreateMutex();
   bleRxBuffer.reserve(512);
 
   BLEDevice::init("ABOT-01");
@@ -112,4 +113,30 @@ void bleBegin() {
   BLEDevice::startAdvertising();
 
   Serial.printf("[BLE] ready, heap=%u\n", (unsigned)ESP.getFreeHeap());
+}
+
+// Lepas stack BLE (Bluedroid makan ~50-60 KB RAM internal, cukup bikin TLS gagal).
+// Panggil hanya dari loop(), jangan dari callback BLE.
+void bleShutdown() {
+  if (bleServer == nullptr) return;
+  bleClientConnected = false;
+  bleTxChar = nullptr;
+  bleServer = nullptr;
+  BLEDevice::deinit(true);
+  Serial.printf("[BLE] off, heap=%u\n", (unsigned)ESP.getFreeHeap());
+}
+
+// BLE = link cadangan saat WiFi mati. Begitu WiFi hidup, BLE dilepas supaya
+// MQTT/OTA punya RAM untuk TLS. Sesi yang sedang terhubung tidak dicabut.
+void bleUpdate() {
+  if (bleShutdownRequested) {
+    bleShutdownRequested = false;
+    bleShutdown();
+  }
+  if (bleClientConnected) return;
+  if (!wifiConnected && bleServer == nullptr) {
+    bleBegin();
+  } else if (wifiConnected && bleServer != nullptr) {
+    bleShutdown();
+  }
 }
