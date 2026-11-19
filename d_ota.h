@@ -114,8 +114,9 @@ void startOTAUpdate(const String& url, const String& requestId,
   abotLog("INFO", "OTA heap awal %u", (unsigned)ESP.getFreeHeap());
 
   // Redirect diikuti manual: satu client baru per hop, tiap langkah dicatat.
-  // Percobaan kedua memakai TLS tanpa verifikasi CA (integritas tetap dijaga
-  // sha256 dari manifest), supaya OTA tidak gagal hanya karena CA kedaluwarsa.
+  // TLS tanpa CA: integritas dijaga sha256 dari manifest yang dikirim lewat MQTT
+  // terverifikasi. Verifikasi CA butuh merantai sertifikat + 32 KB buffer TLS,
+  // dan bersamaan dengan MQTT heap tidak cukup (SSL - Memory allocation failed).
   std::unique_ptr<WiFiClientSecure> secureClient;
   std::unique_ptr<WiFiClient> plainClient;
   HTTPClient http;
@@ -124,54 +125,46 @@ void startOTAUpdate(const String& url, const String& requestId,
   String target = url;
   int httpCode = -1;
   char tlsMsg[64] = {0};
-  bool insecureTls = false;
 
-  for (int attempt = 0; attempt < 2 && httpCode != 200; attempt++) {
-    insecureTls = (attempt == 1);
-    if (insecureTls) abotLog("WARN", "OTA TLS tanpa verifikasi CA; sha256 tetap dicek");
-    target = url;
+  for (int hop = 0; hop < 4; hop++) {
+    http.end();
+    secureClient.reset();
+    plainClient.reset();
 
-    for (int hop = 0; hop < 4; hop++) {
-      http.end();
-      secureClient.reset();
-      plainClient.reset();
-
-      bool begun = false;
-      if (target.startsWith("https")) {
-        secureClient.reset(new WiFiClientSecure());
-        if (insecureTls) secureClient->setInsecure();
-        else secureClient->setCACert(ROOT_CA_BUNDLE);
-        secureClient->setHandshakeTimeout(30);
-        begun = http.begin(*secureClient, target);
-      } else {
-        plainClient.reset(new WiFiClient());
-        begun = http.begin(*plainClient, target);
-      }
-      if (!begun) {
-        httpCode = -1;
-        break;
-      }
-
-      httpCode = http.GET();
-      tlsMsg[0] = 0;
-      if (secureClient) secureClient->lastError(tlsMsg, sizeof(tlsMsg));
-      abotLog("INFO", "OTA hop=%d code=%d err=%s heap=%u", hop, httpCode,
-              tlsMsg[0] ? tlsMsg : "-", (unsigned)ESP.getFreeHeap());
-
-      if (httpCode != 301 && httpCode != 302 && httpCode != 303 &&
-          httpCode != 307 && httpCode != 308) {
-        break;
-      }
-
-      String loc = http.header("Location");
-      if (loc.length() == 0) break;
-      if (loc.startsWith("/")) {
-        int proto = target.indexOf("://");
-        int slash = proto < 0 ? -1 : target.indexOf('/', proto + 3);
-        loc = (slash < 0 ? target : target.substring(0, slash)) + loc;
-      }
-      target = loc;
+    bool begun = false;
+    if (target.startsWith("https")) {
+      secureClient.reset(new WiFiClientSecure());
+      secureClient->setInsecure();
+      secureClient->setHandshakeTimeout(30);
+      begun = http.begin(*secureClient, target);
+    } else {
+      plainClient.reset(new WiFiClient());
+      begun = http.begin(*plainClient, target);
     }
+    if (!begun) {
+      httpCode = -1;
+      break;
+    }
+
+    httpCode = http.GET();
+    tlsMsg[0] = 0;
+    if (secureClient) secureClient->lastError(tlsMsg, sizeof(tlsMsg));
+    abotLog("INFO", "OTA hop=%d code=%d err=%s heap=%u", hop, httpCode,
+            tlsMsg[0] ? tlsMsg : "-", (unsigned)ESP.getFreeHeap());
+
+    if (httpCode != 301 && httpCode != 302 && httpCode != 303 &&
+        httpCode != 307 && httpCode != 308) {
+      break;
+    }
+
+    String loc = http.header("Location");
+    if (loc.length() == 0) break;
+    if (loc.startsWith("/")) {
+      int proto = target.indexOf("://");
+      int slash = proto < 0 ? -1 : target.indexOf('/', proto + 3);
+      loc = (slash < 0 ? target : target.substring(0, slash)) + loc;
+    }
+    target = loc;
   }
 
   if (httpCode != 200) {

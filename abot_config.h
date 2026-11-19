@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.52.2"
+#define FW_VERSION "3.52.3"
 
 #define OTA_SIMULATION_MODE 0
 
@@ -12,6 +12,8 @@
 // ---------------------------------------------------------------------------
 SemaphoreHandle_t stateMutex = nullptr;
 SemaphoreHandle_t mqttMutex = nullptr;
+// true selama OTA: MQTT TLS dilepas supaya heap cukup untuk TLS unduhan.
+volatile bool otaHoldMqtt = false;
 
 struct StateLock {
   StateLock() {

@@ -46,6 +46,7 @@ void mqttHeartbeat() {
 
 void mqttUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
+  if (otaHoldMqtt) return;
 
   if (mqttClient.connected()) {
     if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
@@ -195,17 +196,28 @@ static void otaLaunch(const String& url, const String& id, const String& ver, co
   otaLaunched = true;
   markUserActivity();
 
+  otaHoldMqtt = true;
+  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    if (mqttClient.connected()) mqttClient.disconnect();
+    xSemaphoreGive(mqttMutex);
+  }
+  delay(500);  // beri waktu blok TLS MQTT benar-benar dilepas
+  abotLog("INFO", "OTA: MQTT dilepas, heap=%u", (unsigned)ESP.getFreeHeap());
+
   BaseType_t r = xTaskCreatePinnedToCore([](void* pv) {
     OtaParams* p = (OtaParams*)pv;
     startOTAUpdate(p->url, p->id, p->ver, p->sha);
     delete p;
     otaLaunched = false;  // hanya tercapai kalau OTA gagal (sukses = restart)
+    otaHoldMqtt = false;
+    mqttLastReconnectAttempt = 0;
     vTaskDelete(NULL);
   },
                                          "OtaTask", 16384, params, 1, NULL, 0);
   if (r != pdPASS) {
     delete params;
     otaLaunched = false;
+    otaHoldMqtt = false;
     otaSendErr(id, "no_memory", "Gagal membuat task OTA");
   }
 }
