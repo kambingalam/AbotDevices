@@ -42,7 +42,7 @@
 // ---------------------------------------------------------------------------
 constexpr uint8_t MUS_STOPPED = 0, MUS_LOADING = 1, MUS_PLAYING = 2, MUS_PAUSED = 3;
 constexpr uint8_t MCMD_NONE = 0, MCMD_PLAY = 1, MCMD_TOGGLE = 2, MCMD_PAUSE = 3,
-                  MCMD_RESUME = 4, MCMD_NEXT = 5, MCMD_STOP = 6;
+                  MCMD_RESUME = 4, MCMD_NEXT = 5, MCMD_STOP = 6, MCMD_PLAY_URL = 7;
 
 constexpr int           MUSIC_MAX_TRACKS        = 10;
 constexpr unsigned long MUSIC_LOAD_TIMEOUT_MS   = 20000UL;
@@ -72,6 +72,7 @@ static volatile bool    musicEof       = false;   // diset audio_eof_stream()
 static volatile uint8_t musicReqCmd = MCMD_NONE;
 static String           musicReqQuery = "";
 static String           musicReqGenre = "";
+static String           musicReqUrl   = "";
 
 static char musicTitleBuf[48]  = "";
 static char musicArtistBuf[32] = "";
@@ -474,6 +475,17 @@ static void musicRequestPost(uint8_t cmd, const String& query, const String& gen
   if (voiceTaskHandle) xTaskNotify(voiceTaskHandle, 0x02, eSetBits);
 }
 
+// Putar satu URL audio langsung, tanpa pencarian Audius/Jamendo.
+static void musicRequestUrl(const String& url) {
+  {
+    StateLock lock;
+    musicReqCmd = MCMD_PLAY_URL;
+    musicReqUrl = url;
+  }
+  markUserActivity();
+  if (voiceTaskHandle) xTaskNotify(voiceTaskHandle, 0x02, eSetBits);
+}
+
 static void musicPostFromAct(const String& cmdStr, const String& query, const String& genre) {
   uint8_t cmd = MCMD_PLAY;
   if      (cmdStr == "pause")  cmd = MCMD_PAUSE;
@@ -488,15 +500,17 @@ static void musicPostFromAct(const String& cmdStr, const String& query, const St
 
 static void musicServiceRequest() {
   uint8_t cmd;
-  String  q, g;
+  String  q, g, u;
   {
     StateLock lock;
     cmd = musicReqCmd;
     q   = musicReqQuery;
     g   = musicReqGenre;
+    u   = musicReqUrl;
     musicReqCmd   = MCMD_NONE;
     musicReqQuery = "";
     musicReqGenre = "";
+    musicReqUrl   = "";
   }
   if (cmd == MCMD_NONE) return;
   musicAbortFlag = false;
@@ -510,6 +524,36 @@ static void musicServiceRequest() {
   if (WiFi.status() != WL_CONNECTED) {
     sfxPlay(SFX_ERROR);
     musicSay("Koneksi internet lagi putus, musiknya belum bisa diputar.");
+    return;
+  }
+
+  if (cmd == MCMD_PLAY_URL) {
+    if (u.length() < 10) {
+      sfxPlay(SFX_ERROR);
+      musicSay("Linknya belum ada. Kirim URL file audio ya.");
+      return;
+    }
+    audioI2S.stopSong();
+    musicCount = 1;
+    musicIndex = 0;
+    musicList[0].title    = "Link";
+    musicList[0].artist   = "";
+    musicList[0].url      = u;
+    musicList[0].duration = 0;
+    musicSetDisplay("Memutar link...", "", 0);
+    {
+      StateLock lock;
+      musicState       = MUS_LOADING;
+      musicHasStarted  = false;
+      musicLoadStartMs = millis();
+    }
+    delay(100);
+    // shortcut: link harus direct audio (mp3/aac), redirect tidak di-resolve
+    if (!audioI2S.connecttohost(u.c_str())) {
+      musicOnTrackFail();
+      return;
+    }
+    sfxPlay(SFX_MUSIC);
     return;
   }
 
