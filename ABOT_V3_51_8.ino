@@ -169,3 +169,18 @@ void startOTAUpdate(const String& url, const String& requestId = "",
                     const String& targetVersion = "",
                     const String& expectedSha256 = "");
 void updateDisplay();
+
+// ===== MODUL KODE: satu .ino utama, modul di-include berurutan =====
+#include "a_ai.h"
+#include "b_voice.h"
+#include "c_comm.h"
+#include "d_ota.h"
+#include "e_navigation.h"
+#include "f_personality.h"
+#include "g_system.h"
+#include "h_map.h"
+#include "i_companion.h"
+#include "j_ui.h"
+#include "k_commands.h"
+#include "l_ble.h"
+#include "z_main.h"
