@@ -434,6 +434,19 @@ void linkDispatchLine(const String& line) {
   else if (strcmp(t, "trip_end") == 0) onLinkTripEnd();
   else if (strcmp(t, "reset") == 0) onLinkReset();
   else if (strcmp(t, "ping") == 0) onLinkPing();
+  else if (strcmp(t, "play") == 0) {
+    const String url = String((const char*)(doc["url"] | ""));
+    if (url.length() < 10) {
+      linkSend("{\"t\":\"nack\",\"why\":\"bad_url\"}");
+    } else {
+      musicRequestUrl(url);
+      linkSend("{\"t\":\"ack\",\"for\":\"play\"}");
+    }
+  }
+  else if (strcmp(t, "music_stop") == 0) {
+    musicRequestPost(MCMD_STOP, "", "");
+    linkSend("{\"t\":\"ack\",\"for\":\"music_stop\"}");
+  }
   else if (strcmp(t, "ota_start") == 0) {
     const String rid = String((const char*)(doc["id"] | ""));
     const char* targetVersion = doc["ver"] | "";
