@@ -91,7 +91,7 @@ enum DestinationStage : unsigned char;
 // ---------------------------------------------------------------------------
 // Build flags
 // ---------------------------------------------------------------------------
-#define FW_VERSION "3.51.6"
+#define FW_VERSION "3.51.8"
 
 #define OTA_SIMULATION_MODE 0
 
@@ -121,6 +121,8 @@ struct VoiceAct {
 // Forward decls
 // ---------------------------------------------------------------------------
 void linkSend(const String& json);
+void bleBegin();
+void bleSend(const String& json);
 extern TaskHandle_t voiceTaskHandle;
 
 // ---------------------------------------------------------------------------
@@ -2610,6 +2612,7 @@ void linkBegin() {
 void linkSend(const String& json) {
   Serial.print("[HP] ");
   Serial.println(json);
+  bleSend(json);  // link cadangan BLE (l_ble.h)
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     if (mqttClient.connected()) {
@@ -6072,6 +6075,8 @@ void oledProbeAddress() {
   Wire.end();
 }
 
+#include "l_ble.h"
+
 void setup() {
   stateMutex = xSemaphoreCreateRecursiveMutex();
   mqttMutex = xSemaphoreCreateMutex();
@@ -6139,6 +6144,7 @@ void setup() {
   audioBegin();
   linkBegin();
   mqttBegin();
+  bleBegin();
 
   systemState = STATE_WIFI_CONNECTING;
   WiFi.mode(WIFI_STA);
