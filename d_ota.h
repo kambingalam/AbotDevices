@@ -1,5 +1,6 @@
 // Tab .ino tidak boleh diawali preprocessor directive (bug ##line Arduino IDE).
 #include <Arduino.h>
+#include <memory>
 // ===========================================================================
 //  OTA (BENERAN)
 // ===========================================================================
@@ -110,26 +111,71 @@ void startOTAUpdate(const String& url, const String& requestId,
   };
 
   linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":0}");
+  abotLog("INFO", "OTA heap awal %u", (unsigned)ESP.getFreeHeap());
 
-  WiFiClientSecure secureClient;
-  secureClient.setCACert(ROOT_CA_BUNDLE);
-  WiFiClient plainClient;
-
+  // Redirect diikuti manual: satu client baru per hop, tiap langkah dicatat.
+  // Percobaan kedua memakai TLS tanpa verifikasi CA (integritas tetap dijaga
+  // sha256 dari manifest), supaya OTA tidak gagal hanya karena CA kedaluwarsa.
+  std::unique_ptr<WiFiClientSecure> secureClient;
+  std::unique_ptr<WiFiClient> plainClient;
   HTTPClient http;
   http.setTimeout(30000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  String target = url;
+  int httpCode = -1;
+  int tlsErr = 0;
+  bool insecureTls = false;
 
-  bool begun = url.startsWith("https")
-                 ? http.begin(secureClient, url)
-                 : http.begin(plainClient, url);
-  if (!begun) {
-    sendError("download_failed", "begin gagal");
-    return;
+  for (int attempt = 0; attempt < 2 && httpCode != 200; attempt++) {
+    insecureTls = (attempt == 1);
+    if (insecureTls) abotLog("WARN", "OTA TLS tanpa verifikasi CA; sha256 tetap dicek");
+    target = url;
+
+    for (int hop = 0; hop < 4; hop++) {
+      http.end();
+      secureClient.reset();
+      plainClient.reset();
+
+      bool begun = false;
+      if (target.startsWith("https")) {
+        secureClient.reset(new WiFiClientSecure());
+        if (insecureTls) secureClient->setInsecure();
+        else secureClient->setCACert(ROOT_CA_BUNDLE);
+        secureClient->setHandshakeTimeout(30);
+        begun = http.begin(*secureClient, target);
+      } else {
+        plainClient.reset(new WiFiClient());
+        begun = http.begin(*plainClient, target);
+      }
+      if (!begun) {
+        httpCode = -1;
+        break;
+      }
+
+      httpCode = http.GET();
+      tlsErr = secureClient ? secureClient->lastError() : 0;
+      abotLog("INFO", "OTA hop=%d code=%d err=%d heap=%u", hop, httpCode, tlsErr,
+              (unsigned)ESP.getFreeHeap());
+
+      if (httpCode != 301 && httpCode != 302 && httpCode != 303 &&
+          httpCode != 307 && httpCode != 308) {
+        break;
+      }
+
+      String loc = http.header("Location");
+      if (loc.length() == 0) break;
+      if (loc.startsWith("/")) {
+        int proto = target.indexOf("://");
+        int slash = proto < 0 ? -1 : target.indexOf('/', proto + 3);
+        loc = (slash < 0 ? target : target.substring(0, slash)) + loc;
+      }
+      target = loc;
+    }
   }
 
-  int httpCode = http.GET();
   if (httpCode != 200) {
-    sendError("download_failed", "HTTP " + String(httpCode));
+    sendError("download_failed", "HTTP " + String(httpCode) + " err " + String(tlsErr) +
+                                   " heap " + String(ESP.getFreeHeap()));
     http.end();
     return;
   }
