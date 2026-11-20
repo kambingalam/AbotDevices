@@ -1,17 +1,16 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.52.2",
+  "version": "3.52.4",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_2/ABOT_V3_52_2.ino.bin",
-  "size": 2436192,
-  "sha256": "95459051f4850f0fd59d41a1ab319f109d6aa97afae78b5a9f19e8103668c59c",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_4/ABOT_V3_52_4.ino.bin",
+  "size": 2435488,
+  "sha256": "1e96af3ef9d5b59eab752cbadb887ae7785af469f61510298388253d33b42e6c",
   "min_battery": 30,
-  "released": "2026-11-19",
+  "released": "2026-11-20",
   "notes": [
-    "Animasi tidur baru: z-zz-zzz posisi tetap di pojok atas, mata tertutup",
-    "Hapus animasi gelembung pecah dan kotak hitam",
-    "OTA fix: redirect manual + log hop/err, fallback TLS (sha256 tetap dicek)",
-    "Musik dari link (play url) + music_stop"
+    "Animasi tidur baru: mata terpejam bernapas + dua Z melayang halus",
+    "OTA: MQTT TLS dilepas saat unduh, TLS tanpa CA (sha256 tetap dicek)",
+    "Perbaikan kegagalan unduhan (SSL memory allocation) di 3.52.1"
   ]
 }
