@@ -112,6 +112,11 @@ void startOTAUpdate(const String& url, const String& requestId,
 
   linkSend(String("{\"t\":\"ota_progress\",\"id\":\"") + requestId + "\",\"stage\":\"download\",\"progress\":0}");
   abotLog("INFO", "OTA heap awal %u", (unsigned)ESP.getFreeHeap());
+  // Blok TLS 16 KB per arah sulit didapat saat heap terfragmentasi.
+  if (ESP.getFreeHeap() < 45000) {
+    sendError("low_heap", "heap " + String(ESP.getFreeHeap()));
+    return;
+  }
 
   // Redirect diikuti manual: satu client baru per hop, tiap langkah dicatat.
   // TLS tanpa CA: integritas dijaga sha256 dari manifest yang dikirim lewat MQTT
@@ -136,6 +141,9 @@ void startOTAUpdate(const String& url, const String& requestId,
       secureClient.reset(new WiFiClientSecure());
       secureClient->setInsecure();
       secureClient->setHandshakeTimeout(30);
+      // Buffer TLS 4 KB/1 KB, bukan 16 KB per arah: cukup untuk unduh firmware
+      // dan jauh lebih mudah dialokasikan di heap yang terpecah.
+      secureClient->setBufferSizes(4096, 1024);
       begun = http.begin(*secureClient, target);
     } else {
       plainClient.reset(new WiFiClient());
