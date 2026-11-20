@@ -14,11 +14,12 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-extern static BLEServer* bleServer;
-extern static BLECharacteristic* bleTxChar;
-extern static SemaphoreHandle_t bleMutex;
-extern static volatile bool bleClientConnected;
-extern static String bleRxBuffer;
+// Satu translation unit (.ino saja), jadi definisi static di header aman.
+static BLEServer* bleServer = nullptr;
+static BLECharacteristic* bleTxChar = nullptr;
+static SemaphoreHandle_t bleMutex = nullptr;
+static volatile bool bleClientConnected = false;
+static String bleRxBuffer;
 
 class BleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
