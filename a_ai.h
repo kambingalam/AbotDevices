@@ -1,3 +1,4 @@
+#pragma once
 // Tab .ino tidak boleh diawali preprocessor directive (bug ##line Arduino IDE).
 #include <Arduino.h>
 

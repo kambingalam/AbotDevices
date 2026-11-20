@@ -1,3 +1,4 @@
+#pragma once
 /*
   ============================================================================
    ABOT BUZZER SFX (buzzer AKTIF, non-blocking)  -  dipakai oleh ABOT V3.51

@@ -1,3 +1,4 @@
+#pragma once
 void setup() {
   stateMutex = xSemaphoreCreateRecursiveMutex();
   mqttMutex = xSemaphoreCreateMutex();

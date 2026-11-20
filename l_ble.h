@@ -1,3 +1,4 @@
+#pragma once
 // Tab .ino tidak boleh diawali preprocessor directive (bug ##line Arduino IDE).
 #include <Arduino.h>
 // ===========================================================================
@@ -13,11 +14,11 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-static BLEServer* bleServer = nullptr;
-static BLECharacteristic* bleTxChar = nullptr;
-static SemaphoreHandle_t bleMutex = nullptr;
-static volatile bool bleClientConnected = false;
-static String bleRxBuffer;
+extern static BLEServer* bleServer;
+extern static BLECharacteristic* bleTxChar;
+extern static SemaphoreHandle_t bleMutex;
+extern static volatile bool bleClientConnected;
+extern static String bleRxBuffer;
 
 class BleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {

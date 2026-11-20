@@ -1,3 +1,4 @@
+#pragma once
 /*
   ============================================================================
    ABOT MUSIC PLAYER (Audius + Jamendo)  -  dipakai oleh ABOT V3.51

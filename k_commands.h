@@ -1,3 +1,4 @@
+#pragma once
 void printHelp() {
   Serial.println();
   Serial.println("========================================");
