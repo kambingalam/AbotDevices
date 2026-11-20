@@ -185,9 +185,11 @@ public:
     gfxFillTriangle(x0, y0, x1, y1, x2, y2, (uint8_t)color);
   }
   void display() {
-    if (overlayListening) drawListeningOverlay();
+    if (overlaySleep) {
+      gfx_->clearBuffer();  // buang mata RoboEyes, ganti adegan tidur
+      drawSleepScene();
+    } else if (overlayListening) drawListeningOverlay();
     else if (overlayThinking) drawThinkingOverlay();
-    else if (overlaySleep) drawSleepOverlay();
     gfx_->sendBuffer();
   }
 
@@ -212,34 +214,37 @@ private:
     }
   }
 
-  // Satu huruf Z dari 3 garis; s = panjang sisi.
-  static void drawSleepZ(int x, int y, int s) {
+  // Satu Z dari 3 garis; s = panjang sisi.
+  static void drawZ(int x, int y, int s) {
     gfxLine(x, y, x + s, y);
     gfxLine(x + s, y, x, y + s);
     gfxLine(x, y + s, x + s, y + s);
   }
 
-  // Mode tidur: dua kelopak mata terpejam yang naik-turun pelan (napas), plus
-  // tiga Z statis menanjak di kanan atas. Tanpa bulan, bintang, atau mulut:
-  // layar tenang, tidak ramai, cocok untuk pengguna remaja sampai dewasa.
-  static void drawSleepOverlay() {
-    constexpr unsigned long BREATH_MS = 4200;
-    constexpr int EYE_Y = 34;
-    const unsigned long bt = millis() % BREATH_MS;
-    const unsigned long half = BREATH_MS / 2;
-    const int lift = (int)((bt < half ? bt : BREATH_MS - bt) * 3 / half);
+  // Mode tidur: mata terpejam melengkung yang naik-turun pelan seperti napas,
+  // dua Z kecil melayang bergantian ke kanan atas.
+  static void drawSleepScene() {
+    const unsigned long t = millis();
+    const float breath = sinf((float)(t % 5000UL) * (6.2831853f / 5000.0f));  // -1..1
+    const int cy = 34 + (int)(breath + 1.5f);  // geser 0..2 px
 
+    // (‿ ‿) kelopak terpejam, dua busur supaya tebalnya 2 px
+    u8g2.setDrawColor(COLOR_WHITE);
+    const int eyeX[2] = { 41, 87 };
     for (int i = 0; i < 2; i++) {
-      const int cx = (i == 0) ? 42 : 86;
-      u8g2.drawEllipse(cx, EYE_Y + lift, 15, 4 + lift,
+      u8g2.drawEllipse(eyeX[i], cy, 16, 6,
                        U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
-      u8g2.drawEllipse(cx, EYE_Y + lift + 1, 15, 5 + lift,
+      u8g2.drawEllipse(eyeX[i], cy, 16, 7,
                        U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
     }
 
-    drawSleepZ(98, 40, 5);
-    drawSleepZ(108, 30, 7);
-    drawSleepZ(118, 18, 9);
+    // dua Z melayang pelan ke kanan atas, bergantian
+    constexpr unsigned long CYCLE = 4400UL;
+    for (int i = 0; i < 2; i++) {
+      const float p = (float)((t + i * (CYCLE / 2)) % CYCLE) / (float)CYCLE;
+      if (p > 0.9f) continue;  // jeda sebelum muncul lagi
+      drawZ(100 + (int)(p * 10.0f), 24 - (int)(p * 20.0f), 4 + (int)(p * 4.0f));
+    }
   }
 
   static void drawThinkingOverlay() {
