@@ -141,9 +141,8 @@ void startOTAUpdate(const String& url, const String& requestId,
       secureClient.reset(new WiFiClientSecure());
       secureClient->setInsecure();
       secureClient->setHandshakeTimeout(30);
-      // Buffer TLS 4 KB/1 KB, bukan 16 KB per arah: cukup untuk unduh firmware
-      // dan jauh lebih mudah dialokasikan di heap yang terpecah.
-      secureClient->setBufferSizes(4096, 1024);
+      // Buffer TLS diset via setInsecure() + setHandshakeTimeout(30) saja.
+      // setBufferSizes() tidak tersedia di ESP32 core 3.3.12.
       begun = http.begin(*secureClient, target);
     } else {
       plainClient.reset(new WiFiClient());
