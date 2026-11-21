@@ -111,10 +111,9 @@ void linkSend(const String& json) {
   bleSend(json);
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
-    if (mqttClient.connected()) {
-      bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
-      if (!ok) Serial.println("[MQTT] Publish status gagal");
-    }
+    if (!mqttClient.connected()) mqttClient.connect();
+    bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
+    if (!ok) Serial.println("[MQTT] Publish status gagal");
     xSemaphoreGive(mqttMutex);
   }
 }
