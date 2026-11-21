@@ -1,16 +1,15 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.52.5",
+  "version": "3.52.6",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_5/ABOT_V3_52_5.ino.bin",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_6/ABOT_V3_52_6.ino.bin",
   "size": 2435744,
-  "sha256": "4aebe2c448e34955a6f8419ac5f7117309a514e57e5cd75accd9755678d8498a",
+  "sha256": "7409575485cc532a8f543f895355ef8faedb616e8501bfd9f3b311927cd38f59",
   "min_battery": 30,
-  "released": "2026-11-20",
+  "released": "2026-11-21",
   "notes": [
-    "Partition table baru app0/app1 3 MB: rilis ini wajib flash USB sekali",
-    "BLE satu translation unit: l_ble.cpp dihapus, sketsa duplikat dibuang",
-    "OTA: buffer TLS 4K/1K, unduhan ditolak kalau heap di bawah 45 KB"
+    "Bump versi untuk uji jalur OTA, tanpa perubahan fungsional",
+    "Partition app0/app1 3 MB aktif sejak 3.52.5, OTA diterima langsung"
   ]
 }
