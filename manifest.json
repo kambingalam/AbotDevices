@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "device": "abot-esp32s3",
-  "version": "3.52.7",
+  "version": "3.52.8",
   "min_version": "3.51.0",
-  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_7/ABOT_V3_52_7.ino.bin",
-  "size": 2435936,
-  "sha256": "af36c72a894b0a401f5d810ddcd69e08faa14bbe251e728127d45ac084f22a9c",
+  "url": "https://github.com/kambingalam/AbotDevices/releases/download/V3_52_8/ABOT_V3_52_8.ino.bin",
+  "size": 2436016,
+  "sha256": "c7fbdfbdc90dc9d0c7425a9cc9045d1b4d7d64eef26bc9e8dfea007e27de7136",
   "min_battery": 30,
   "released": "2026-11-24",
   "notes": [
-    "mqttEnsureConnected(): satu jalur connect MQTT untuk mqttUpdate dan linkSend",
-    "ota_error kini sampai ke app walau MQTT sempat terputus saat unduh"
+    "collectHeaders(Location): redirect 302 GitHub kini diikuti, unduhan OTA tidak lagi berhenti di HTTP 302",
+    "mqttEnsureConnected(): satu jalur connect MQTT untuk mqttUpdate dan linkSend"
   ]
 }
