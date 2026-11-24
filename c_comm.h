@@ -45,6 +45,37 @@ void mqttHeartbeat() {
   }
 }
 
+// Satu-satunya jalur connect MQTT: dipakai mqttUpdate() dan linkSend().
+bool mqttEnsureConnected() {
+  if (mqttClient.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  char clientId[40];
+  snprintf(clientId, sizeof(clientId), "ABOT-V3500-%08lx%04x",
+           (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF),
+           (unsigned)random(0xFFFF));
+
+  const char* willMsg = "{\"t\":\"device\",\"online\":false}";
+  Serial.print("[MQTT] Connecting to ");
+  Serial.println(MQTT_HOST);
+
+  if (!mqttClient.connect(clientId, MQTT_TOPIC_STATUS, 0, true, willMsg)) {
+    Serial.print("[MQTT] Connect failed, state=");
+    Serial.println(mqttClient.state());
+    mqttBackoffMs = (mqttBackoffMs * 2 > 60000UL) ? 60000UL : mqttBackoffMs * 2;
+    return false;
+  }
+
+  Serial.println("[MQTT] Connected");
+  mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
+  if (!mqttClient.subscribe(MQTT_TOPIC_COMMAND, 0)) {
+    Serial.println("[MQTT] Subscribe FAILED");
+  }
+  String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") + otaReportedVersion + "\"}";
+  mqttClient.publish(MQTT_TOPIC_STATUS, onlineMsg.c_str(), true);
+  return true;
+}
+
 void mqttUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (otaHoldMqtt) return;
@@ -70,29 +101,7 @@ void mqttUpdate() {
   unsigned long now = millis();
   if (now - mqttLastReconnectAttempt < mqttBackoffMs) return;
   mqttLastReconnectAttempt = now;
-
-  char clientId[40];
-  snprintf(clientId, sizeof(clientId), "ABOT-V3500-%08lx%04x",
-           (unsigned long)(ESP.getEfuseMac() & 0xFFFFFFFF),
-           (unsigned)random(0xFFFF));
-
-  const char* willMsg = "{\"t\":\"device\",\"online\":false}";
-  Serial.print("[MQTT] Connecting to ");
-  Serial.println(MQTT_HOST);
-
-  if (mqttClient.connect(clientId, MQTT_TOPIC_STATUS, 0, true, willMsg)) {
-    Serial.println("[MQTT] Connected");
-    mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
-    if (!mqttClient.subscribe(MQTT_TOPIC_COMMAND, 0)) {
-      Serial.println("[MQTT] Subscribe FAILED");
-    }
-    String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") + otaReportedVersion + "\"}";
-    mqttClient.publish(MQTT_TOPIC_STATUS, onlineMsg.c_str(), true);
-  } else {
-    Serial.print("[MQTT] Connect failed, state=");
-    Serial.println(mqttClient.state());
-    mqttBackoffMs = (mqttBackoffMs * 2 > 60000UL) ? 60000UL : mqttBackoffMs * 2;
-  }
+  mqttEnsureConnected();
 }
 
 // ===========================================================================
@@ -111,7 +120,7 @@ void linkSend(const String& json) {
   bleSend(json);
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
-    if (!mqttClient.connected()) mqttClient.connect();
+    if (!mqttClient.connected()) mqttEnsureConnected();
     bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
     if (!ok) Serial.println("[MQTT] Publish status gagal");
     xSemaphoreGive(mqttMutex);
