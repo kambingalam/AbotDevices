@@ -418,6 +418,7 @@ Preferences otaPrefs;
 bool pendingOtaVerification = false;
 String otaTargetVersion = "";
 unsigned long bootTimeMs = 0;
+const char* bootResetReason = "?";   // alasan reset boot ini (untuk heartbeat)
 
 String otaReportedVersion = FW_VERSION;
 

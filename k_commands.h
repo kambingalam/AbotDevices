@@ -17,6 +17,7 @@ void printHelp() {
   Serial.println("  SET ssid=NamaWiFi | SET pass=PasswordWiFi");
   Serial.println("  SET groq=gsk_xxx | SET auth=tokenRahasia | SET topic=abot/acak123456");
   Serial.println("  CFG?  |  CFG CLEAR");
+  Serial.println("DIAGNOSA (Serial only): TLS? = tes jam + sertifikat + heap");
   Serial.println("========================================");
 }
 

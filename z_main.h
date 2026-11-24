@@ -133,10 +133,41 @@ void setup() {
 
   // --- CEK APAKAH INI BOOT PERTAMA SETELAH OTA ---
   bootTimeMs = millis();
-  otaPrefs.begin("ota", true);
+  bootResetReason = resetReasonName(esp_reset_reason());
+  Serial.printf("[BOOT] reset reason: %s\n", bootResetReason);
+
+  otaPrefs.begin("ota", false);
   pendingOtaVerification = otaPrefs.getBool("pending", false);
   otaTargetVersion = otaPrefs.getString("target", "");
-  otaPrefs.end();
+  if (pendingOtaVerification) {
+    // Safeguard bootloop: firmware baru yang belum terverifikasi dan sudah
+    // 3x boot tanpa lolos 30 detik -> paksa balik ke slot OTA sebelumnya.
+    int tries = otaPrefs.getInt("tries", 0) + 1;
+    otaPrefs.putInt("tries", tries);
+    Serial.printf("[OTA] boot ke-%d firmware belum terverifikasi\n", tries);
+    if (tries > 3) {
+      const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+      otaPrefs.putBool("pending", false);
+      otaPrefs.putInt("tries", 0);
+      otaPrefs.putString("target", "");
+      otaPrefs.putString("le_id", "");
+      otaPrefs.putString("le_code", "rolled_back");
+      otaPrefs.putString("le_msg", String("bootloop di ") + FW_VERSION + ", kembali ke slot lama");
+      otaPrefs.putBool("le_pend", true);
+      otaPrefs.end();
+      if (other != NULL && esp_ota_set_boot_partition(other) == ESP_OK) {
+        Serial.println("[OTA] BOOTLOOP terdeteksi -> kembali ke firmware sebelumnya");
+        delay(300);
+        ESP.restart();
+      }
+      Serial.println("[OTA] rollback gagal (slot lain tidak valid)");
+      pendingOtaVerification = false;
+    } else {
+      otaPrefs.end();
+    }
+  } else {
+    otaPrefs.end();
+  }
 
   if (pendingOtaVerification) {
     Serial.printf("[OTA] Menunggu verifikasi untuk versi %s...\n", otaTargetVersion.c_str());
@@ -222,19 +253,22 @@ void loop() {
     // batalkan slot baru dan reboot ke firmware lama.
     otaPrefs.begin("ota", false);
     otaPrefs.putBool("pending", false);
+    otaPrefs.putInt("tries", 0);
     otaPrefs.putString("target", "");
     otaPrefs.end();
     pendingOtaVerification = false;
 
+    // Firmware sudah hidup stabil 30 detik -> tandai valid apa pun hasil cek versi.
+    esp_ota_mark_app_valid_cancel_rollback();
     if (String(FW_VERSION) == otaTargetVersion) {
-      esp_ota_mark_app_valid_cancel_rollback();
       linkSend(String("{\"t\":\"ota_result\",\"ok\":true,\"ver\":\"") + FW_VERSION + "\"}");
       abotLog("INFO", "OTA Sukses terverifikasi (v%s)", FW_VERSION);
     } else {
-      linkSend(String("{\"t\":\"ota_result\",\"ok\":false,\"ver\":\"") + FW_VERSION + "\",\"rolled_back\":true}");
-      abotLog("ERR", "OTA Gagal! Versi sekarang %s, target %s", FW_VERSION, otaTargetVersion.c_str());
-      delay(200);
-      esp_ota_mark_app_invalid_rollback_and_reboot();
+      // Hanya lapor: firmware jalan normal, jadi JANGAN rollback (biasanya
+      // FW_VERSION lupa dinaikkan / tidak sama dengan manifest).
+      linkSend(String("{\"t\":\"ota_result\",\"ok\":true,\"ver\":\"") + FW_VERSION +
+               "\",\"version_mismatch\":true,\"target\":\"" + otaTargetVersion + "\"}");
+      abotLog("WARN", "OTA jalan, tapi versi %s != target %s (cek FW_VERSION/manifest)", FW_VERSION, otaTargetVersion.c_str());
     }
   }
 }

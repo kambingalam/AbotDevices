@@ -28,16 +28,66 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   mqttPendingDispatch.trim();
 }
 
+// ---- Error OTA yang disimpan ke NVS, dikirim ulang saat MQTT tersambung lagi ----
+// (MQTT sengaja diputus selama unduh, jadi error di tengah unduh tidak sampai
+//  ke aplikasi. Disimpan dulu, dikirim begitu MQTT kembali.)
+static void otaSaveLastError(const String& id, const char* code, const String& msg) {
+  otaPrefs.begin("ota", false);
+  otaPrefs.putString("le_id", id);
+  otaPrefs.putString("le_code", code);
+  otaPrefs.putString("le_msg", msg.substring(0, 120));
+  otaPrefs.putBool("le_pend", true);
+  otaPrefs.end();
+}
+
+// Dipanggil hanya dari mqttEnsureConnected() (mutex MQTT sudah dipegang pemanggil
+// atau jalur single-thread), jadi pakai mqttClient.publish langsung.
+static void otaFlushLastError() {
+  otaPrefs.begin("ota", true);
+  bool pend = otaPrefs.getBool("le_pend", false);
+  String id = pend ? otaPrefs.getString("le_id", "") : String("");
+  String code = pend ? otaPrefs.getString("le_code", "") : String("");
+  String msg = pend ? otaPrefs.getString("le_msg", "") : String("");
+  otaPrefs.end();
+  if (!pend) return;
+
+  String j = String("{\"t\":\"ota_error\",\"id\":\"") + jsonEscape(id) + "\",\"code\":\"" +
+             jsonEscape(code) + "\",\"message\":\"" + jsonEscape(msg) + "\",\"late\":true}";
+  if (mqttClient.publish(MQTT_TOPIC_STATUS, j.c_str())) {
+    otaPrefs.begin("ota", false);
+    otaPrefs.putBool("le_pend", false);
+    otaPrefs.end();
+    Serial.println("[OTA] error tertunda dikirim ke aplikasi");
+  }
+}
+
+static const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_SW: return "sw";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default: return "other";
+  }
+}
+
 void mqttHeartbeat() {
   static unsigned long last = 0;
   if (millis() - last < 10000UL) return;
   last = millis();
 
-  char buf[220];
+  char buf[320];
   snprintf(buf, sizeof(buf),
-           "{\"t\":\"hb\",\"ver\":\"%s\",\"up\":%lu,\"heap\":%u,\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
+           "{\"t\":\"hb\",\"ver\":\"%s\",\"up\":%lu,\"heap\":%u,\"minheap\":%u,\"psram\":%u,"
+           "\"rssi\":%d,\"rst\":\"%s\",\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
            otaReportedVersion.c_str(), millis() / 1000UL,
-           (unsigned)ESP.getFreeHeap(), routeReady ? 1 : 0, tripActive ? 1 : 0);
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)ESP.getFreePsram(), (int)WiFi.RSSI(), bootResetReason,
+           routeReady ? 1 : 0, tripActive ? 1 : 0);
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     mqttClient.publish(MQTT_TOPIC_STATUS, buf);
@@ -49,6 +99,18 @@ void mqttHeartbeat() {
 bool mqttEnsureConnected() {
   if (mqttClient.connected()) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
+  if (otaHoldMqtt) return false;  // selama OTA, jangan buka TLS MQTT (hemat heap)
+
+  // TLS memverifikasi masa berlaku sertifikat -> butuh jam valid (NTP).
+  // Tanpa ini, connect gagal "sertifikat belum berlaku" dan backoff membengkak.
+  if (time(nullptr) < 1700000000L) {
+    static unsigned long lastNtpLog = 0;
+    if (millis() - lastNtpLog > 10000UL) {
+      lastNtpLog = millis();
+      Serial.println("[MQTT] Tunggu sinkron jam (NTP) sebelum TLS...");
+    }
+    return false;
+  }
 
   char clientId[40];
   snprintf(clientId, sizeof(clientId), "ABOT-V3500-%08lx%04x",
@@ -73,6 +135,7 @@ bool mqttEnsureConnected() {
   }
   String onlineMsg = String("{\"t\":\"device\",\"online\":true,\"ver\":\"") + otaReportedVersion + "\"}";
   mqttClient.publish(MQTT_TOPIC_STATUS, onlineMsg.c_str(), true);
+  otaFlushLastError();
   return true;
 }
 
@@ -121,8 +184,10 @@ void linkSend(const String& json) {
 
   if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
     if (!mqttClient.connected()) mqttEnsureConnected();
-    bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
-    if (!ok) Serial.println("[MQTT] Publish status gagal");
+    if (mqttClient.connected()) {
+      bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
+      if (!ok) Serial.println("[MQTT] Publish status gagal");
+    }
     xSemaphoreGive(mqttMutex);
   }
 }
@@ -383,7 +448,48 @@ void cfgHandleLine(String line) {
   }
 }
 
+// Self-test TLS (Serial saja): cek jam, sertifikat tiap host, dan heap.
+static void tlsSelfTest() {
+  Serial.println("[TLS] ===== SELF TEST =====");
+  time_t now = time(nullptr);
+  Serial.printf("[TLS] jam valid: %s (epoch=%ld)\n", now > 1700000000L ? "YA" : "TIDAK", (long)now);
+  Serial.printf("[TLS] heap=%u minheap=%u wifi=%s rssi=%d\n", (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMinFreeHeap(), WiFi.status() == WL_CONNECTED ? "ok" : "putus", (int)WiFi.RSSI());
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("[TLS] WiFi putus, batal."); return; }
+  if (networkIsBusy() || otaActive || otaLaunched) { Serial.println("[TLS] perangkat sibuk, coba lagi nanti."); return; }
+  if (ESP.getFreeHeap() < 60000) { Serial.println("[TLS] heap < 60000, batal."); return; }
+
+  struct T { const char* host; uint16_t port; };
+  static const T tests[] = {
+    { MQTT_HOST, MQTT_PORT },
+    { "api.groq.com", 443 },
+    { "github.com", 443 },
+    { "raw.githubusercontent.com", 443 },
+  };
+  for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+    NetworkClientSecure c;
+    c.setCACert(ROOT_CA_BUNDLE);
+    c.setTimeout(8);
+    unsigned long t0 = millis();
+    bool ok = c.connect(tests[i].host, tests[i].port);
+    unsigned long dt = millis() - t0;
+    char err[100] = "";
+    if (!ok) c.lastError(err, sizeof(err));
+    Serial.printf("[TLS] %-28s %s  %lums  heap=%u %s\n", tests[i].host, ok ? "OK  " : "GAGAL",
+                  dt, (unsigned)ESP.getFreeHeap(), err);
+    c.stop();
+    delay(100);
+    esp_task_wdt_reset();
+  }
+  Serial.println("[TLS] Catatan: unduh OTA memakai setInsecure() + SHA256 wajib.");
+  Serial.println("[TLS] ===== SELESAI =====");
+}
+
 void linkDispatchLine(const String& line) {
+  if (line == "TLS?" && !dispatchFromMqtt) {
+    tlsSelfTest();
+    return;
+  }
   // Provisioning lewat Serial atau BLE (SET/CFG? dirutekan ke cfgHandleLine).
   if (line.startsWith("SET ") || line == "CFG?" || line == "CFG CLEAR") {
     cfgHandleLine(line);

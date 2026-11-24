@@ -80,6 +80,7 @@ void startOTAUpdate(const String& url, const String& requestId,
   otaPrefs.begin("ota", false);
   otaPrefs.putString("target", effectiveTarget);
   otaPrefs.putBool("pending", true);
+  otaPrefs.putInt("tries", 0);   // hitungan boot gagal untuk safeguard bootloop
   otaPrefs.end();
 
   linkSend(String("{\"t\":\"ota_accepted\",\"id\":\"") + requestId + "\",\"from\":\"" + otaReportedVersion + "\",\"to\":\"" + effectiveTarget + "\"}");
@@ -93,6 +94,8 @@ void startOTAUpdate(const String& url, const String& requestId,
     if (msg.length() > 0) errMsg += ",\"message\":\"" + jsonEscape(msg) + "\"";
     errMsg += "}";
     linkSend(errMsg);
+    // MQTT sedang diputus selama unduh -> simpan, kirim ulang saat MQTT kembali.
+    if (String(code) != "cancelled") otaSaveLastError(requestId, code, msg);
 
     if (!flashed) {
       // Belum sempat Update.end(true). Aman hapus pending supaya boot
@@ -154,12 +157,8 @@ void startOTAUpdate(const String& url, const String& requestId,
       break;
     }
 
-    // WAJIB: tanpa collectHeaders, http.header("Location") selalu kosong, jadi
-    // redirect GitHub (302 -> release-assets) tidak pernah diikuti dan OTA gagal
-    // dengan "HTTP 302". Harus dipanggil setelah begin() dan sebelum GET().
     static const char* kHdr[] = { "Location" };
-    http.collectHeaders(kHdr, 1);
-
+    http.collectHeaders(kHdr, 1);  // wajib: tanpa ini header Location kosong
     httpCode = http.GET();
     tlsMsg[0] = 0;
     if (secureClient) secureClient->lastError(tlsMsg, sizeof(tlsMsg));
