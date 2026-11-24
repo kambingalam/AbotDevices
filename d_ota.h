@@ -154,6 +154,12 @@ void startOTAUpdate(const String& url, const String& requestId,
       break;
     }
 
+    // WAJIB: tanpa collectHeaders, http.header("Location") selalu kosong, jadi
+    // redirect GitHub (302 -> release-assets) tidak pernah diikuti dan OTA gagal
+    // dengan "HTTP 302". Harus dipanggil setelah begin() dan sebelum GET().
+    static const char* kHdr[] = { "Location" };
+    http.collectHeaders(kHdr, 1);
+
     httpCode = http.GET();
     tlsMsg[0] = 0;
     if (secureClient) secureClient->lastError(tlsMsg, sizeof(tlsMsg));
@@ -166,7 +172,10 @@ void startOTAUpdate(const String& url, const String& requestId,
     }
 
     String loc = http.header("Location");
-    if (loc.length() == 0) break;
+    if (loc.length() == 0) {
+      Serial.printf("[OTA] redirect %d tanpa header Location\n", httpCode);
+      break;
+    }
     if (loc.startsWith("/")) {
       int proto = target.indexOf("://");
       int slash = proto < 0 ? -1 : target.indexOf('/', proto + 3);
