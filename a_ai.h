@@ -592,83 +592,198 @@ static String homeWeatherSentence() {
   return String("Cuaca di ") + HOME_CITY + " sekarang " + c + ", suhunya sekitar " + String(weatherData.temperature, 0) + " derajat. Hari ini antara " + String(weatherData.tempMin, 0) + " sampai " + String(weatherData.tempMax, 0) + " derajat.";
 }
 
+// ---------------------------------------------------------------------------
+//  Pencocokan perintah lokal per KATA UTUH (V3.53.0)
+//  Sebelumnya indexOf() mencocokkan potongan kata: "selamat petang" membuka
+//  peta, "cuaca di Bandung" dijawab cuaca Medan, "introvert" memutar intro.
+// ---------------------------------------------------------------------------
+
+// Huruf kecil, tanda baca/UTF-8 jadi pemisah, diapit spasi: " cuaca di bandung ".
+static String normalizeCommand(const String& raw) {
+  String out = " ";
+  out.reserve(raw.length() + 2);
+  bool lastSpace = true;
+  for (size_t i = 0; i < raw.length(); i++) {
+    const unsigned char c = (unsigned char)raw[i];
+    if (c < 128 && isalnum(c)) {
+      out += (char)tolower(c);
+      lastSpace = false;
+    } else if (!lastSpace) {
+      out += ' ';
+      lastSpace = true;
+    }
+  }
+  if (!lastSpace) out += ' ';
+  return out;
+}
+
+static bool hasPhrase(const String& norm, const char* phrase) {
+  String p = " ";
+  p += phrase;
+  p += " ";
+  return norm.indexOf(p) >= 0;
+}
+
+static bool hasAnyPhrase(const String& norm, const char* const* phrases, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (hasPhrase(norm, phrases[i])) return true;
+  }
+  return false;
+}
+
+// true kalau SEMUA kata di kalimat ada di daftar. Dipakai supaya kalimat yang
+// membawa info tambahan (nama kota, "besok", dsb.) tetap dijawab LLM.
+static bool onlyWords(const String& norm, const char* const* allowed, size_t count) {
+  int pos = 1;
+  while (pos < (int)norm.length()) {
+    const int end = norm.indexOf(' ', pos);
+    if (end < 0) break;
+    const String word = norm.substring(pos, end);
+    pos = end + 1;
+    if (word.length() == 0) continue;
+    bool found = false;
+    for (size_t i = 0; i < count && !found; i++) found = (word == allowed[i]);
+    if (!found) return false;
+  }
+  return true;
+}
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+static const char* const FILLER_WORDS[] = {
+  "abot", "dong", "coba", "tolong", "ya", "yuk", "deh", "sih", "kamu", "aku", "bisa", "mau", "please"
+};
+
+static bool onlyWordsWithFiller(const String& norm, const char* const* allowed, size_t count) {
+  const char* merged[48];
+  size_t n = 0;
+  for (size_t i = 0; i < count && n < ARRAY_LEN(merged); i++) merged[n++] = allowed[i];
+  for (size_t i = 0; i < ARRAY_LEN(FILLER_WORDS) && n < ARRAY_LEN(merged); i++) merged[n++] = FILLER_WORDS[i];
+  return onlyWords(norm, merged, n);
+}
+
 static bool voiceLocalCommand(String t, String& say, bool allowContent) {
-  t.toLowerCase();
+  const String n = normalizeCommand(t);
   say = "";
   StateLock lock;
   markUserActivity();
   voiceTextActive = false;
 
-  if (t.indexOf("diam") >= 0 || t.indexOf("mute") >= 0 || t.indexOf("bisu") >= 0) {
-    audioToggleMute();
-    say = (volumeLevel > 0) ? "Oke, suara aktif lagi." : "";
+  // --- Suara: mute / unmute (tidak lagi toggle buta) ---
+  static const char* const UNMUTE_WORDS[] = { "unmute", "nyalakan", "hidupkan", "aktifkan", "bunyikan" };
+  static const char* const MUTE_WORDS[] = { "diam", "mute", "bisu", "senyap" };
+  static const char* const SOUND_ALLOWED[] = { "diam", "mute", "unmute", "bisu", "senyap", "suara", "suaranya",
+                                                "matikan", "nyalakan", "hidupkan", "aktifkan", "bunyikan",
+                                                "lagi", "sebentar", "dulu" };
+  const bool wantsUnmute = hasAnyPhrase(n, UNMUTE_WORDS, ARRAY_LEN(UNMUTE_WORDS)) && hasPhrase(n, "suara");
+  const bool wantsMute = hasAnyPhrase(n, MUTE_WORDS, ARRAY_LEN(MUTE_WORDS)) || hasPhrase(n, "matikan suara");
+  if ((wantsUnmute || wantsMute || hasPhrase(n, "unmute")) &&
+      onlyWordsWithFiller(n, SOUND_ALLOWED, ARRAY_LEN(SOUND_ALLOWED))) {
+    if (wantsUnmute || hasPhrase(n, "unmute")) {
+      if (volumeLevel == 0) audioSetVolume(volumeBeforeMute > 0 ? volumeBeforeMute : 3);
+      say = "Oke, suara aktif lagi.";
+    } else if (volumeLevel > 0) {
+      audioSetVolume(0);
+    }
     voiceTextActive = true;
     return true;
   }
-  if (t.indexOf("volume naik") >= 0 || t.indexOf("lebih keras") >= 0) {
+
+  // --- Volume ---
+  static const char* const VOL_UP[] = { "volume naik", "naikkan volume", "naikin volume", "lebih keras", "keraskan" };
+  static const char* const VOL_DOWN[] = { "volume turun", "turunkan volume", "turunin volume", "lebih pelan", "pelankan", "kecilkan" };
+  if (hasAnyPhrase(n, VOL_UP, ARRAY_LEN(VOL_UP))) {
     audioVolumeStep(+1);
     say = "Volume dinaikkan.";
     voiceTextActive = true;
     return true;
   }
-  if (t.indexOf("volume turun") >= 0 || t.indexOf("lebih pelan") >= 0) {
+  if (hasAnyPhrase(n, VOL_DOWN, ARRAY_LEN(VOL_DOWN))) {
     audioVolumeStep(-1);
     say = "Volume diturunkan.";
     voiceTextActive = true;
     return true;
   }
-  if (t.indexOf("peta") >= 0 || t.indexOf("navigasi") >= 0) {
+
+  // --- Peta ---
+  static const char* const MAP_ALLOWED[] = { "peta", "petanya", "navigasi", "rute", "rutenya", "tampilkan", "lihat",
+                                             "liat", "buka", "mana", "tunjukkan" };
+  if ((hasPhrase(n, "peta") || hasPhrase(n, "petanya") || hasPhrase(n, "navigasi")) &&
+      onlyWordsWithFiller(n, MAP_ALLOWED, ARRAY_LEN(MAP_ALLOWED))) {
     handleCommand('M');
     say = "Oke, ini petanya.";
     return true;
   }
-  if (t.indexOf("cuaca") >= 0) {
+
+  // --- Cuaca kota asal (kota lain / "besok" -> LLM) ---
+  static const char* const WEATHER_ALLOWED[] = { "cuaca", "cuacanya", "gimana", "bagaimana", "sekarang", "hari", "ini",
+                                                 "lagi", "apa", "berapa", "suhu", "suhunya", "di", "sini", "medan",
+                                                 "info", "kabar", "panas", "hujan", "nggak", "gak", "tidak", "tampilkan" };
+  if ((hasPhrase(n, "cuaca") || hasPhrase(n, "cuacanya")) &&
+      onlyWordsWithFiller(n, WEATHER_ALLOWED, ARRAY_LEN(WEATHER_ALLOWED))) {
     showWeatherView(false);
     say = homeWeatherSentence();
     return true;
   }
-  if (t == "jam" || t.indexOf("jam berapa") >= 0 || t.indexOf("sekarang jam") >= 0) {
+
+  // --- Jam ---
+  static const char* const TIME_ALLOWED[] = { "jam", "pukul", "waktu", "berapa", "sekarang", "ini", "udah", "sudah",
+                                              "lagi", "tampilkan" };
+  if ((hasPhrase(n, "jam") || hasPhrase(n, "pukul")) &&
+      (n == " jam " || hasPhrase(n, "berapa") || hasPhrase(n, "sekarang")) &&
+      onlyWordsWithFiller(n, TIME_ALLOWED, ARRAY_LEN(TIME_ALLOWED))) {
     startInfoMode();
     say = timeSentence();
     return true;
   }
-  if (t.indexOf("lagu berikutnya") >= 0 || t.indexOf("lagu selanjutnya") >= 0 || t.indexOf("ganti lagu") >= 0 || t.indexOf("skip") >= 0) {
+
+  // --- Musik ---
+  static const char* const MUSIC_NEXT[] = { "lagu berikutnya", "lagu selanjutnya", "ganti lagu", "skip", "next" };
+  static const char* const MUSIC_STOP[] = { "stop musik", "stop lagu", "matikan musik", "matikan lagu", "berhenti musik",
+                                            "hentikan musik", "hentikan lagu" };
+  static const char* const MUSIC_RESUME[] = { "lanjut musik", "lanjutkan musik", "lanjut lagu", "lanjutkan lagu", "putar lagi" };
+  if (hasAnyPhrase(n, MUSIC_NEXT, ARRAY_LEN(MUSIC_NEXT))) {
     musicRequestPost(MCMD_NEXT, "", "");
     say = "Oke, lagu berikutnya.";
     return true;
   }
-  if (t.indexOf("stop musik") >= 0 || t.indexOf("matikan musik") >= 0 || t.indexOf("matikan lagu") >= 0 || t.indexOf("berhenti musik") >= 0) {
+  if (hasAnyPhrase(n, MUSIC_STOP, ARRAY_LEN(MUSIC_STOP))) {
     musicRequestPost(MCMD_STOP, "", "");
     say = "Oke, musiknya kumatikan.";
     return true;
   }
-  if (t.indexOf("lanjut musik") >= 0 || t.indexOf("lanjutkan musik") >= 0 || t.indexOf("lanjut lagu") >= 0 || t.indexOf("putar lagi") >= 0) {
+  if (hasAnyPhrase(n, MUSIC_RESUME, ARRAY_LEN(MUSIC_RESUME))) {
     musicRequestPost(MCMD_RESUME, "", "");
     say = "Siap, kulanjutkan.";
     return true;
   }
-  if (t.indexOf("intro") >= 0) {
+
+  // --- Intro ---
+  static const char* const INTRO_ALLOWED[] = { "intro", "ulang", "ulangi", "mulai", "lagi", "putar", "tampilkan" };
+  if (hasPhrase(n, "intro") && onlyWordsWithFiller(n, INTRO_ALLOWED, ARRAY_LEN(INTRO_ALLOWED))) {
     voiceShowIntro();
     say = "Oke, kita mulai dari awal.";
     return true;
   }
+
+  // --- Konten (hanya cadangan saat LLM gagal) ---
   if (allowContent) {
-    if (t.indexOf("kuis") >= 0 || t.indexOf("quiz") >= 0) {
+    if (hasPhrase(n, "kuis") || hasPhrase(n, "quiz")) {
       handleCommand('Q');
       say = "Oke, ini kuisnya.";
       return true;
     }
-    if (t.indexOf("trivia") >= 0) {
+    if (hasPhrase(n, "trivia")) {
       handleCommand('T');
       say = "Oke, ini trivia buat kamu.";
       return true;
     }
-    if (t.indexOf("humor") >= 0 || t.indexOf("lawak") >= 0) {
+    if (hasPhrase(n, "humor") || hasPhrase(n, "lawak") || hasPhrase(n, "lelucon")) {
       handleCommand('H');
       say = "Oke, siap-siap ketawa ya.";
       return true;
     }
-    if (t.indexOf("cerita") >= 0) {
+    if (hasPhrase(n, "cerita") || hasPhrase(n, "dongeng")) {
       handleCommand('S');
       say = "Oke, aku ceritakan ya.";
       return true;
@@ -676,4 +791,3 @@ static bool voiceLocalCommand(String t, String& say, bool allowContent) {
   }
   return false;
 }
-

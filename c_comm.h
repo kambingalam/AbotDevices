@@ -5,6 +5,7 @@
 //  MQTT
 // ===========================================================================
 void mqttBegin() {
+  if (mqttRxQueue == nullptr) mqttRxQueue = xQueueCreate(MQTT_RX_QUEUE_LEN, sizeof(char*));
   mqttNetworkClient.setCACert(ROOT_CA_BUNDLE);
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
@@ -22,10 +23,42 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(topic, MQTT_TOPIC_COMMAND) != 0) return;
   if (length == 0 || length >= LINK_LINE_MAX) return;
   if (payload[0] != '{') return;
-  mqttPendingDispatch = "";
-  mqttPendingDispatch.reserve(length + 1);
-  for (unsigned int i = 0; i < length; i++) mqttPendingDispatch += (char)payload[i];
-  mqttPendingDispatch.trim();
+  if (mqttRxQueue == nullptr) return;
+
+  // Salin ke heap (PSRAM bila ada); dibebaskan oleh mqttDrainInbox().
+  char* copy = (char*)heap_caps_malloc(length + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (copy == nullptr) copy = (char*)malloc(length + 1);
+  if (copy == nullptr) {
+    Serial.println("[MQTT] OOM, pesan masuk dibuang");
+    return;
+  }
+  memcpy(copy, payload, length);
+  copy[length] = 0;
+
+  if (xQueueSend(mqttRxQueue, &copy, 0) != pdTRUE) {
+    // Antrean penuh: buang pesan TERLAMA supaya data terbaru (mis. gps) tetap masuk.
+    char* oldest = nullptr;
+    if (xQueueReceive(mqttRxQueue, &oldest, 0) == pdTRUE) free(oldest);
+    if (xQueueSend(mqttRxQueue, &copy, 0) != pdTRUE) free(copy);
+    Serial.println("[MQTT] antrean penuh, pesan terlama dibuang");
+  }
+}
+
+// Proses semua pesan MQTT yang mengantre (dipanggil dari loop()).
+static void mqttDrainInbox() {
+  if (mqttRxQueue == nullptr) return;
+  char* raw = nullptr;
+  for (int handled = 0; handled < MQTT_RX_QUEUE_LEN; handled++) {
+    if (xQueueReceive(mqttRxQueue, &raw, 0) != pdTRUE) break;
+    String msg(raw);
+    free(raw);
+    msg.trim();
+    if (msg.length() == 0) continue;
+    // Tandai bahwa baris ini datang dari MQTT, supaya ota_start butuh konfirmasi tombol.
+    dispatchFromMqtt = true;
+    linkDispatchLine(msg);
+    dispatchFromMqtt = false;
+  }
 }
 
 // ---- Error OTA yang disimpan ke NVS, dikirim ulang saat MQTT tersambung lagi ----
@@ -40,8 +73,8 @@ static void otaSaveLastError(const String& id, const char* code, const String& m
   otaPrefs.end();
 }
 
-// Dipanggil hanya dari mqttEnsureConnected() (mutex MQTT sudah dipegang pemanggil
-// atau jalur single-thread), jadi pakai mqttClient.publish langsung.
+// Dipanggil hanya dari mqttEnsureConnected(); mutex MQTT sudah dipegang
+// mqttUpdate(), jadi pakai mqttClient.publish langsung.
 static void otaFlushLastError() {
   otaPrefs.begin("ota", true);
   bool pend = otaPrefs.getBool("le_pend", false);
@@ -83,9 +116,10 @@ void mqttHeartbeat() {
   char buf[320];
   snprintf(buf, sizeof(buf),
            "{\"t\":\"hb\",\"ver\":\"%s\",\"up\":%lu,\"heap\":%u,\"minheap\":%u,\"psram\":%u,"
-           "\"rssi\":%d,\"rst\":\"%s\",\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
+           "\"maxblk\":%u,\"rssi\":%d,\"rst\":\"%s\",\"route\":%d,\"trip\":%d,\"batt\":100,\"chg\":1}",
            otaReportedVersion.c_str(), millis() / 1000UL,
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
            (unsigned)ESP.getFreePsram(), (int)WiFi.RSSI(), bootResetReason,
            routeReady ? 1 : 0, tripActive ? 1 : 0);
 
@@ -95,7 +129,8 @@ void mqttHeartbeat() {
   }
 }
 
-// Satu-satunya jalur connect MQTT: dipakai mqttUpdate() dan linkSend().
+// Satu-satunya jalur connect MQTT. V3.53.0: hanya dipanggil mqttUpdate()
+// sambil memegang mqttMutex (linkSend() tidak lagi menyambung ulang).
 bool mqttEnsureConnected() {
   if (mqttClient.connected()) return true;
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -140,6 +175,9 @@ bool mqttEnsureConnected() {
 }
 
 void mqttUpdate() {
+  // Pesan yang sudah diterima tetap diproses walau koneksi baru saja putus.
+  mqttDrainInbox();
+
   if (WiFi.status() != WL_CONNECTED) return;
   if (otaHoldMqtt) return;
 
@@ -148,15 +186,7 @@ void mqttUpdate() {
       mqttClient.loop();
       xSemaphoreGive(mqttMutex);
     }
-
-    if (mqttPendingDispatch.length() > 0) {
-      String msg = mqttPendingDispatch;
-      mqttPendingDispatch = "";
-      // Tandai bahwa baris ini datang dari MQTT, supaya ota_start bisa ditolak.
-      dispatchFromMqtt = true;
-      linkDispatchLine(msg);
-      dispatchFromMqtt = false;
-    }
+    mqttDrainInbox();
     mqttHeartbeat();
     return;
   }
@@ -164,7 +194,12 @@ void mqttUpdate() {
   unsigned long now = millis();
   if (now - mqttLastReconnectAttempt < mqttBackoffMs) return;
   mqttLastReconnectAttempt = now;
-  mqttEnsureConnected();
+  // Mutex dipegang selama connect supaya linkSend() dari task lain tidak
+  // publish di tengah handshake; linkSend() hanya menunggu sebentar lalu lewat.
+  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    mqttEnsureConnected();
+    xSemaphoreGive(mqttMutex);
+  }
 }
 
 // ===========================================================================
@@ -182,14 +217,19 @@ void linkSend(const String& json) {
   Serial.println(json);
   bleSend(json);
 
-  if (mqttMutex != nullptr && xSemaphoreTake(mqttMutex, portMAX_DELAY) == pdTRUE) {
-    if (!mqttClient.connected()) mqttEnsureConnected();
-    if (mqttClient.connected()) {
-      bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
-      if (!ok) Serial.println("[MQTT] Publish status gagal");
-    }
-    xSemaphoreGive(mqttMutex);
+  // V3.53.0: linkSend() tidak lagi menyambung ulang MQTT. Handshake TLS bisa
+  // makan beberapa detik, padahal fungsi ini sering dipanggil sambil memegang
+  // StateLock (layar & tombol ikut membeku). Sambung ulang hanya di mqttUpdate().
+  if (mqttMutex == nullptr || otaHoldMqtt) return;
+  if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(LINK_MQTT_LOCK_WAIT_MS)) != pdTRUE) {
+    Serial.println("[MQTT] sibuk (connect), pesan ke HP dilewati");
+    return;
   }
+  if (mqttClient.connected()) {
+    bool ok = mqttClient.publish(MQTT_TOPIC_STATUS, json.c_str());
+    if (!ok) Serial.println("[MQTT] Publish status gagal");
+  }
+  xSemaphoreGive(mqttMutex);
 }
 
 void linkUpdate() {
@@ -443,7 +483,8 @@ void cfgHandleLine(String line) {
   // Terapkan WiFi baru: putuskan, ensureWiFiConnected() akan menyambung ulang
   if (cfgWifiChanged && cfgWifiSsid.length() > 0) {
     cfgWifiChanged = false;
-    lastWiFiAttempt = 0;
+    wifiRetryMs = WIFI_RETRY_MIN_MS;
+    wifiForceReconnect = true;  // ensureWiFiConnected() langsung pakai kredensial baru
     WiFi.disconnect();
   }
 }

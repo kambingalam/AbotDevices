@@ -68,7 +68,7 @@ static int        musicIndex = -1;
 static volatile uint8_t musicState     = MUS_STOPPED;
 static volatile bool    musicStopReq   = false;
 static volatile bool    musicAbortFlag = false;
-static volatile bool    musicEof       = false;   // diset audio_eof_stream()
+static volatile bool    musicEof       = false;   // diset audioInstallCallbacks() (evt_eof)
 
 static volatile uint8_t musicReqCmd = MCMD_NONE;
 static String           musicReqQuery = "";
@@ -89,13 +89,6 @@ static unsigned long musicLastRunningMs  = 0; // <--- FIX: Untuk mendeteksi buff
 
 static inline bool musicScreenWanted() { return musicState != MUS_STOPPED; }
 static inline bool musicHasSession()   { return musicState != MUS_STOPPED; }
-
-// Callback ESP32-audioI2S (dipanggil di dalam audioI2S.loop()).
-// Aman didefinisikan walau versi library tidak memanggilnya.
-void audio_eof_stream(const char* info) {
-  Serial.printf("[MUSIC] EOF stream: %s\n", info ? info : "");
-  musicEof = true;
-}
 
 // ---------------------------------------------------------------------------
 //  Helper

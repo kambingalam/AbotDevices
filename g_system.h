@@ -101,6 +101,7 @@ void ensureWiFiConnected() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!wifiConnected) {
       wifiConnected = true;
+      wifiRetryMs = WIFI_RETRY_MIN_MS;
       configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
       abotLog("INFO", "WiFi tersambung");
       sfxPlay(SFX_WIFI_UP);
@@ -111,26 +112,56 @@ void ensureWiFiConnected() {
     wifiConnected = false;
     abotLog("WARN", "WiFi koneksi terputus");
     sfxPlay(SFX_WIFI_DOWN);
+    // Beri kesempatan auto-reconnect bawaan dulu sebelum intervensi manual.
+    lastWiFiAttempt = millis();
   }
-  if (millis() - lastWiFiAttempt < WIFI_RETRY_INTERVAL_MS) return;
-  lastWiFiAttempt = millis();
   if (cfgWifiSsid.length() == 0) return;  // belum diprovisioning
-  Serial.println("[WIFI] Mencoba reconnect...");
+
+  // V3.53.0: sebelumnya disconnect+begin tiap 5 s, sehingga asosiasi/DHCP di
+  // sinyal lemah tidak pernah sempat selesai. Sekarang jeda 15 s -> 60 s.
+  const bool due = wifiForceReconnect || lastWiFiAttempt == 0 ||
+                   millis() - lastWiFiAttempt >= wifiRetryMs;
+  if (!due) return;
+  wifiForceReconnect = false;
+  lastWiFiAttempt = millis();
+  Serial.printf("[WIFI] Mencoba reconnect (jeda berikutnya %lus)...\n", wifiRetryMs / 1000UL);
   WiFi.disconnect();
   WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
+  wifiRetryMs = (wifiRetryMs * 2 > WIFI_RETRY_MAX_MS) ? WIFI_RETRY_MAX_MS : wifiRetryMs * 2;
 }
 
 void checkHeapHealth() {
   if (voicePipelineActive || ttsActive || otaActive) return;
   if (millis() - lastHeapCheck < HEAP_CHECK_INTERVAL_MS) return;
   lastHeapCheck = millis();
-  uint32_t freeHeap = ESP.getFreeHeap();
-  Serial.printf("[HEAP] Free: %u bytes\n", freeHeap);
-  if (freeHeap < HEAP_CRITICAL_BYTES) {
-    abotLog("ERR", "HEAP KRITIS -> restart terkontrol");
-    delay(200);
-    ESP.restart();
+  const uint32_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  Serial.printf("[HEAP] internal free=%u blok_terbesar=%u min=%u\n",
+                (unsigned)freeHeap, (unsigned)largest, (unsigned)ESP.getMinFreeHeap());
+
+  // V3.53.0: fragmentasi juga dihitung (TLS butuh blok utuh, bukan total).
+  const bool critical = freeHeap < HEAP_CRITICAL_BYTES || largest < HEAP_LARGEST_BLOCK_MIN;
+  if (!critical) {
+    heapCriticalSince = 0;
+    return;
   }
+  if (heapCriticalSince == 0) heapCriticalSince = millis();
+
+  const bool emergency = freeHeap < HEAP_EMERGENCY_BYTES;
+  const bool busy = tripActive || listeningActive || musicState != MUS_STOPPED;
+  if (busy && !emergency) {
+    static unsigned long lastWarn = 0;
+    if (lastWarn == 0 || millis() - lastWarn > 60000UL) {
+      lastWarn = millis();
+      abotLog("WARN", "Heap rendah (free=%u blok=%u), restart ditunda", (unsigned)freeHeap, (unsigned)largest);
+    }
+    return;
+  }
+  if (!emergency && millis() - heapCriticalSince < HEAP_CRITICAL_GRACE_MS) return;
+
+  abotLog("ERR", "HEAP KRITIS (free=%u blok=%u) -> restart terkontrol", (unsigned)freeHeap, (unsigned)largest);
+  delay(200);
+  ESP.restart();
 }
 
 // ===========================================================================

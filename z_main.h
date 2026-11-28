@@ -1,4 +1,27 @@
 #pragma once
+
+// ESP32-audioI2S 4.x: event (info, eof, vu, ...) lewat satu std::function.
+// Dipanggil dari dalam audioI2S.loop() di voiceTask.
+static void audioInstallCallbacks() {
+  Audio::audio_info_callback = [](Audio::msg_t m) {
+    switch (m.e) {
+      case Audio::evt_eof:
+        if (ttsActive) {
+          ttsEof = true;
+        } else {
+          musicEof = true;
+          Serial.printf("[MUSIC] EOF stream: %s\n", m.msg ? m.msg : "");
+        }
+        break;
+      case Audio::evt_info:
+        if (m.msg) Serial.printf("[AUDIO] %s\n", m.msg);
+        break;
+      default:
+        break;
+    }
+  };
+}
+
 void setup() {
   stateMutex = xSemaphoreCreateRecursiveMutex();
   mqttMutex = xSemaphoreCreateMutex();
@@ -64,11 +87,14 @@ void setup() {
   Serial.println("[ROBOEYES] OK");
 
   audioBegin();
+  audioInstallCallbacks();
   linkBegin();
   mqttBegin();  // BLE start otomatis saat WiFi mati (bleUpdate)
 
   systemState = STATE_WIFI_CONNECTING;
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);  // stack WiFi menyambung ulang sendiri; lihat ensureWiFiConnected()
   if (cfgWifiSsid.length() > 0) {
     WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
     Serial.println("[WIFI] Connecting...");

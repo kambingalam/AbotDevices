@@ -66,12 +66,9 @@ volatile bool ttsEof = false;
 volatile bool ttsStop = false;
 volatile bool speakAborted = false;
 
-void audio_info(const char* info) {
-  Serial.printf("[AUDIO] %s\n", info);
-}
-void audio_eof_speech(const char* info) {
-  ttsEof = true;
-}
+// CATATAN V3.53.0: ESP32-audioI2S 4.x tidak lagi memanggil fungsi bebas
+// audio_info()/audio_eof_speech()/audio_eof_stream(). Semua event masuk lewat
+// Audio::audio_info_callback yang dipasang audioInstallCallbacks() di z_main.h.
 
 // ===========================================================================
 //  I2S DRIVER INIT (MIC)

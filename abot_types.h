@@ -149,9 +149,17 @@ const unsigned long WEATHER_RETRY_MS = 60UL * 1000UL;
 const unsigned long OSRM_RETRY_MS = 10000;
 const int OSRM_MAX_RETRIES = 3;
 const unsigned long WIFI_CHECK_INTERVAL_MS = 2000;
-const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
+// V3.53.0: jeda reconnect manual bertahap (auto-reconnect stack WiFi dicoba dulu).
+const unsigned long WIFI_RETRY_MIN_MS = 15000;
+const unsigned long WIFI_RETRY_MAX_MS = 60000;
 const unsigned long HEAP_CHECK_INTERVAL_MS = 10000;
 const uint32_t HEAP_CRITICAL_BYTES = 15000;
+// Blok internal terbesar di bawah ini = TLS (buffer 16 KB) praktis gagal.
+const uint32_t HEAP_LARGEST_BLOCK_MIN = 10000;
+// Di bawah ini restart walau trip aktif (crash lebih buruk daripada restart).
+const uint32_t HEAP_EMERGENCY_BYTES = 8000;
+// Kondisi kritis harus bertahan selama ini sebelum restart (abaikan lonjakan sesaat).
+const unsigned long HEAP_CRITICAL_GRACE_MS = 30000;
 
 const unsigned long CHARACTER_REACTION_HAPPY_MS = 1200;
 const unsigned long CHARACTER_REACTION_CONFUSED_MS = 1400;
@@ -309,6 +317,9 @@ unsigned long lastOsrmAttempt = 0;
 
 unsigned long lastWiFiCheck = 0;
 unsigned long lastWiFiAttempt = 0;
+unsigned long wifiRetryMs = WIFI_RETRY_MIN_MS;
+volatile bool wifiForceReconnect = false;  // diset saat SSID/password diganti
+unsigned long heapCriticalSince = 0;
 unsigned long lastHeapCheck = 0;
 
 RoutePoint routePoints[MAX_ROUTE_POINTS];
@@ -357,7 +368,11 @@ unsigned long lastWeatherAttempt = 0;
 
 WiFiClientSecure mqttNetworkClient;
 PubSubClient mqttClient(mqttNetworkClient);
-String mqttPendingDispatch = "";
+// V3.53.0: antrean pesan masuk (sebelumnya satu slot String yang bisa tertimpa).
+constexpr int MQTT_RX_QUEUE_LEN = 8;
+QueueHandle_t mqttRxQueue = nullptr;
+// Lama tunggu mutex MQTT di linkSend() sebelum pesan dilewati.
+constexpr unsigned long LINK_MQTT_LOCK_WAIT_MS = 100;
 unsigned long mqttLastReconnectAttempt = 0;
 unsigned long mqttBackoffMs = MQTT_RECONNECT_INTERVAL_MS;
 
